@@ -101,17 +101,6 @@ async function installDirectMessagesApi(page: Page) {
     const path = new URL(request.url()).pathname;
     const method = request.method();
 
-    // The existing messages page now also loads account-owned system mail.
-    // A direct-message regression fixture needs the real empty inbox shape;
-    // the generic API mock's bare {} is not a valid PersonalEventPage.
-    if (path === "/api/personal-events" && method === "GET") {
-      return route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        body: JSON.stringify({ items: [], unread_count: 0, has_more: false }),
-      });
-    }
-
     if (path === "/api/direct-conversations" && method === "GET") {
       return route.fulfill({
         status: 200,

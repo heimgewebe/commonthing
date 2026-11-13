@@ -75,42 +75,6 @@ class FakeElement {
   alt = "";
   draggable = false;
   private _className = "";
-  textContent = "";
-  focused = false;
-  removed = false;
-  private listeners = new Map<string, Set<(event: any) => void>>();
-
-  focus() {
-    this.focused = true;
-  }
-
-  get firstElementChild(): FakeElement | null {
-    return this.children[0] ?? null;
-  }
-
-  replaceChildren(...children: FakeElement[]) {
-    this.children = children;
-  }
-
-  addEventListener(type: string, listener: (event: any) => void) {
-    const listeners = this.listeners.get(type) ?? new Set();
-    listeners.add(listener);
-    this.listeners.set(type, listeners);
-  }
-
-  removeEventListener(type: string, listener: (event: any) => void) {
-    this.listeners.get(type)?.delete(listener);
-  }
-
-  fire(type: string) {
-    const event = { stopPropagation: vi.fn(), preventDefault: vi.fn() };
-    for (const listener of this.listeners.get(type) ?? []) listener(event);
-    return event;
-  }
-
-  remove() {
-    this.removed = true;
-  }
 
   set className(value: string) {
     this._className = value;
@@ -436,45 +400,6 @@ describe("NodesOverlay native dense-entity layer", () => {
     map.emit("moveend", {});
     expect(overlay.getActiveMarker("home-b")).toBeUndefined();
     expect(source.setDataCalls).toBe(initialSetDataCalls);
-    overlay.destroy();
-  });
-
-  it("lists every authorized collapsed household member beside a native node", () => {
-    const { map, overlay, onActivate } = setup();
-    Object.assign(map, {
-      project: ([lon, lat]: [number, number]) => ({
-        x: lon * 100,
-        y: lat * 100,
-      }),
-    });
-    const first = exactHouseholdMember("home-a", 10);
-    const second = exactHouseholdMember("home-b", 10);
-    overlay.update([...points(101), first, second], true);
-    expect(map.source()?.data.features).toHaveLength(101);
-    expect(overlay.getActiveMarker(first.id)).toBeUndefined();
-    expect(overlay.getActiveMarker(second.id)).toBeDefined();
-
-    map.hitIds.add("node-0");
-    map.emitLayer("click", NATIVE_ENTITY_LAYER_ID, {
-      features: [{ properties: { id: "node-0" } }],
-    });
-    const chooser = map.container.children.find(
-      (element) => element.dataset.testid === "map-object-chooser",
-    );
-    expect(
-      chooser?.children[1].children.map((button) => button.textContent),
-    ).toEqual([
-      "Knoten: Node 0",
-      "Garnrolle: Garnrolle home-b",
-      "Garnrolle: Garnrolle home-a",
-    ]);
-    const selected = chooser?.children[1].children[2];
-    selected?.fire("click");
-    expect(onActivate).toHaveBeenCalledWith(
-      first,
-      overlay.getActiveMarker(second.id)?.element,
-    );
-    expect(chooser?.removed).toBe(true);
     overlay.destroy();
   });
 

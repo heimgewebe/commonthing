@@ -575,16 +575,6 @@ async fn require_conversation_read_access(
         ));
     };
 
-    // System events are account-private and only exposed through
-    // /personal-events, never the generic conversation endpoint.
-    if conversation_type == "account_event" {
-        return Err(ConversationApiError::new(
-            StatusCode::NOT_FOUND,
-            "conversation_not_found",
-            "the conversation does not exist",
-        ));
-    }
-
     if visibility == "public" {
         if conversation_type == "node" {
             if let Some(node_id) = node_id.as_deref() {

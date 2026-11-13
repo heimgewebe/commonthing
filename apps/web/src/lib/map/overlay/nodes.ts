@@ -48,9 +48,6 @@ export type MarkerConstructor = new (options?: MarkerOptions) => Marker;
 export const MARKER_GEO_ANCHOR = "center" as const;
 const WEAVE_DETAIL_ZOOM = 13.5;
 const MARKER_SCALE_WRITE_EPSILON = 0.001;
-/** Two 44px pointer hit boxes collide while their screen centers are closer than 44px. */
-const MARKER_HIT_SIZE_PX = 44;
-const MARKER_CHOOSER_PAGE_SIZE = 20;
 export const NATIVE_ENTITY_LAYER_MIN_COUNT = 100;
 const FULL_DOM_MARKER_LIMIT = NATIVE_ENTITY_LAYER_MIN_COUNT;
 export const NATIVE_ENTITY_SOURCE_ID = "commonthing-map-entities";
@@ -97,16 +94,6 @@ type NativeEntityFeatureCollection = {
 type NativeLayerClickEvent = {
   features?: Array<{ properties?: Record<string, unknown> | null }>;
 };
-
-type ScreenPoint = { x: number; y: number };
-
-/** Display-only collision detection. Coordinates and Faden anchors never move. */
-export function screenHitBoxesOverlap(a: ScreenPoint, b: ScreenPoint): boolean {
-  return (
-    Math.abs(a.x - b.x) < MARKER_HIT_SIZE_PX &&
-    Math.abs(a.y - b.y) < MARKER_HIT_SIZE_PX
-  );
-}
 
 type MapObjectScaleOwnership = {
   owners: Set<symbol>;
@@ -187,7 +174,6 @@ export class NodesOverlay {
   private expandedHouseholdPage = 0;
   private householdCloseButton: HTMLButtonElement | null = null;
   private householdPager: HTMLElement | null = null;
-  private objectChooser: HTMLElement | null = null;
   private suppressClickId: string | null = null;
   private suppressClickUntil = 0;
   private markerSpatialIndex: MarkerSpatialIndex | null = null;
@@ -198,7 +184,6 @@ export class NodesOverlay {
   private mapScaleContainer: HTMLElement | null = null;
   private readonly mapScaleOwner = Symbol("nodes-overlay-map-scale");
   private readonly handleZoom = () => {
-    this.closeObjectChooser();
     if (this.map) this.updateZoom(this.map.getZoom());
   };
   private readonly handleHouseholdResize = () => {
@@ -213,20 +198,12 @@ export class NodesOverlay {
     this.reconcileMarkers(this.latestPoints, this.latestShowNodes, false);
   };
   private readonly handleHouseholdKeyDown = (event: KeyboardEvent) => {
-    if (event.key !== "Escape") return;
-    if (this.objectChooser) {
-      event.preventDefault();
-      event.stopPropagation();
-      this.closeObjectChooser(true);
-      return;
-    }
-    if (!this.expandedHouseholdKey) return;
+    if (event.key !== "Escape" || !this.expandedHouseholdKey) return;
     event.preventDefault();
     event.stopPropagation();
     this.closeHousehold();
   };
   private readonly handleMoveEnd = () => {
-    this.closeObjectChooser(); // Screen-space collisions are invalid after camera movement.
     if (this.nativeLayerEnabled) {
       // Stacked households use DOM markers even in the dense native layer.
       // Reconcile on pan without resending the ordinary GeoJSON features.
@@ -255,19 +232,14 @@ export class NodesOverlay {
     const id = event.features?.[0]?.properties?.id;
     if (typeof id !== "string") return;
     const item = this.pointById(id);
-    if (!item) return;
-    if (this.openObjectChooserIfOverlapping(item)) return;
-    this.onEntityActivate?.(item);
+    if (item) this.onEntityActivate?.(item);
   };
 
   constructor(
     private map: MapLibreMap | null,
     private MarkerClass: MarkerConstructor,
     private readonly runtime: WeaveRuntime = weaveRuntime,
-    private readonly onEntityActivate?: (
-      item: MapEntityViewModel,
-      focusReturnTarget?: HTMLElement | null,
-    ) => void,
+    private readonly onEntityActivate?: (item: MapEntityViewModel) => void,
   ) {
     if (this.map && typeof this.map.getContainer === "function") {
       const container = this.map.getContainer();
@@ -310,7 +282,6 @@ export class NodesOverlay {
   public setGarnrollePlacementMode(active: boolean): void {
     if (this.garnrollePlacementMode === active) return;
     this.garnrollePlacementMode = active;
-    if (active) this.closeObjectChooser();
     for (const marker of this.activeMarkers.values()) {
       marker.element.inert = active;
     }
@@ -367,262 +338,6 @@ export class NodesOverlay {
     const index = this.markerSpatialIndex?.indexById.get(id);
     if (index !== undefined) return this.latestPoints[index];
     return this.latestPoints.find((item) => item.id === id);
-  }
-
-  private closeObjectChooser(restoreFocus = false): void {
-    if (!this.objectChooser) return;
-    const triggerId = this.objectChooser.dataset.triggerId;
-    this.objectChooser.remove();
-    this.objectChooser = null;
-    if (restoreFocus && triggerId)
-      this.activeMarkers.get(triggerId)?.element.focus();
-  }
-
-  /** Position used by the UI, not the geographic Faden anchor. */
-  private displayedObjectPoint(item: MapEntityViewModel): ScreenPoint | null {
-    const map = this.map;
-    if (!map || typeof map.project !== "function") return null;
-    const point = map.project([item.lon, item.lat]);
-    const household = this.households.byAccountId.get(item.id);
-    if (!household || household.key !== this.expandedHouseholdKey) return point;
-    const members = this.householdPageMembers(household);
-    const index = members.findIndex((member) => member.id === item.id);
-    if (index < 0) return null; // A member on a different page is not displayed.
-    const offset = householdMemberOffset(
-      index,
-      members.length,
-      this.mapScaleContainer?.clientWidth ?? 320,
-    );
-    return { x: point.x + offset.x, y: point.y + offset.y };
-  }
-
-  /**
-   * Look up colliding *screen hit boxes*, not rounded geographic positions.
-   * All candidates come from the already-authorized map projection. In dense
-   * scenes, use MapLibre's existing rendered-feature index instead of scanning
-   * the global list or creating thousands of buttons.
-   */
-  private overlappingObjects(item: MapEntityViewModel): MapEntityViewModel[] {
-    const map = this.map;
-    if (!map || typeof map.project !== "function") return [item];
-    const center = this.displayedObjectPoint(item);
-    if (!center || !Number.isFinite(center.x) || !Number.isFinite(center.y))
-      return [item];
-    const potential = new Map<string, MapEntityViewModel>();
-    potential.set(item.id, item);
-    if (this.nativeLayerEnabled && map.getLayer(NATIVE_ENTITY_LAYER_ID)) {
-      try {
-        const area: [[number, number], [number, number]] = [
-          [center.x - MARKER_HIT_SIZE_PX, center.y - MARKER_HIT_SIZE_PX],
-          [center.x + MARKER_HIT_SIZE_PX, center.y + MARKER_HIT_SIZE_PX],
-        ];
-        for (const feature of map.queryRenderedFeatures(area, {
-          layers: [NATIVE_ENTITY_LAYER_ID],
-        })) {
-          const id = feature.properties?.id;
-          if (typeof id !== "string") continue;
-          const candidate = this.pointById(id);
-          if (candidate) potential.set(candidate.id, candidate);
-        }
-      } catch {
-        // Style swaps can briefly remove the native layer. DOM markers are
-        // still available below; never synthesize an unauthorized candidate.
-      }
-      for (const entry of this.activeMarkers.values()) {
-        potential.set(entry.item.id, entry.item);
-        // The native GeoJSON layer intentionally excludes household accounts.
-        // A collapsed stack renders only its front DOM marker: expand its
-        // already-authorized member list as candidates, without creating pins.
-        const household = this.households.byAccountId.get(entry.item.id);
-        if (household && household.key !== this.expandedHouseholdKey) {
-          for (const member of household.members)
-            potential.set(member.id, member);
-        }
-      }
-    } else {
-      // <= 100 ordinary DOM markers; the wider native scene never full-scans.
-      for (const candidate of this.latestPoints)
-        potential.set(candidate.id, candidate);
-    }
-    const results: MapEntityViewModel[] = [item];
-    for (const candidate of potential.values()) {
-      if (candidate.id === item.id || !hasRenderableMapPosition(candidate))
-        continue;
-      const projected = this.displayedObjectPoint(candidate);
-      if (projected && screenHitBoxesOverlap(center, projected))
-        results.push(candidate);
-    }
-    return results;
-  }
-
-  private openObjectChooserIfOverlapping(
-    item: MapEntityViewModel,
-    explicitChoice = false,
-  ): boolean {
-    const map = this.map;
-    if (
-      this.garnrollePlacementMode ||
-      !this.mapScaleContainer ||
-      !map ||
-      typeof map.project !== "function"
-    )
-      return false;
-    const overlapping = this.overlappingObjects(item);
-    // Nearby Garnrollen stay directly clickable when their actual 44px
-    // hit-box centers do not cover one another. At an indistinguishable
-    // on-screen point, touch users must still be able to pick either spool.
-    const onlySpools =
-      item.type === "garnrolle" &&
-      overlapping.every((candidate) => candidate.type === "garnrolle");
-    const origin = this.displayedObjectPoint(item);
-    const spoolCenterCovered =
-      onlySpools &&
-      overlapping.some((candidate) => {
-        if (candidate.id === item.id) return false;
-        const other = this.displayedObjectPoint(candidate);
-        return (
-          origin !== null &&
-          other !== null &&
-          Math.abs(other.x - origin.x) < MARKER_HIT_SIZE_PX / 2 &&
-          Math.abs(other.y - origin.y) < MARKER_HIT_SIZE_PX / 2
-        );
-      });
-    if (
-      overlapping.length < 2 ||
-      (onlySpools && !explicitChoice && !spoolCenterCovered)
-    ) {
-      this.closeObjectChooser();
-      return false;
-    }
-    this.closeObjectChooser();
-    const chooser = document.createElement("section");
-    chooser.className = "map-object-chooser";
-    chooser.dataset.testid = "map-object-chooser";
-    chooser.dataset.triggerId = item.id;
-    chooser.setAttribute("role", "group");
-    chooser.setAttribute(
-      "aria-label",
-      "Überlagerte Kartenobjekte einzeln auswählen",
-    );
-    this.isolateHouseholdControl(chooser);
-    const header = document.createElement("div");
-    header.className = "map-object-chooser__header";
-    const heading = document.createElement("span");
-    heading.textContent = `Objekte an dieser Stelle · ${overlapping.length}`;
-    const dismiss = document.createElement("button");
-    dismiss.type = "button";
-    dismiss.textContent = "Schließen ×";
-    dismiss.setAttribute("aria-label", "Objektauswahl schließen");
-    dismiss.addEventListener("click", (event) => {
-      event.stopPropagation();
-      this.closeObjectChooser(true);
-    });
-    header.append(heading, dismiss);
-    const list = document.createElement("div");
-    list.className = "map-object-chooser__list";
-    const pager = document.createElement("div");
-    pager.className = "map-object-chooser__pager";
-    let page = 0;
-    const pages = Math.ceil(overlapping.length / MARKER_CHOOSER_PAGE_SIZE);
-    const renderPage = () => {
-      list.replaceChildren();
-      for (const candidate of overlapping.slice(
-        page * MARKER_CHOOSER_PAGE_SIZE,
-        (page + 1) * MARKER_CHOOSER_PAGE_SIZE,
-      )) {
-        const button = document.createElement("button");
-        button.type = "button";
-        button.className = "map-object-chooser__item";
-        button.dataset.testid = `choose-map-object-${candidate.id}`;
-        const type =
-          candidate.type === "node"
-            ? "Knoten"
-            : candidate.type === "garnrolle"
-              ? "Garnrolle"
-              : "Gemeinschaftszentrum";
-        button.textContent = `${type}: ${candidate.title}`;
-        if (candidate.id === this.selectedMarkerId)
-          button.setAttribute("aria-current", "true");
-        button.addEventListener("click", (event) => {
-          event.stopPropagation();
-          // This click does not reach the map route's delegated marker handler.
-          // Preserve a connected marker (or the map canvas for native dots)
-          // so the route can restore keyboard focus after closing the panel.
-          const focusReturnTarget =
-            this.activeMarkers.get(candidate.id)?.element ??
-            this.activeMarkers.get(item.id)?.element ??
-            overlapping
-              .map((other) => this.activeMarkers.get(other.id)?.element)
-              .find((element) => element !== undefined) ??
-            (typeof map.getCanvas === "function" ? map.getCanvas() : null);
-          this.closeObjectChooser();
-          this.onEntityActivate?.(candidate, focusReturnTarget);
-        });
-        list.append(button);
-      }
-      pager.replaceChildren();
-      if (pages > 1) {
-        const previous = document.createElement("button");
-        previous.type = "button";
-        previous.textContent = "Zurück";
-        previous.disabled = page === 0;
-        previous.addEventListener("click", (event) => {
-          event.stopPropagation();
-          page -= 1;
-          renderPage();
-          (list.firstElementChild as HTMLElement | null)?.focus();
-        });
-        const count = document.createElement("span");
-        count.textContent = `Seite ${page + 1} von ${pages}`;
-        const next = document.createElement("button");
-        next.type = "button";
-        next.textContent = "Weiter";
-        next.disabled = page >= pages - 1;
-        next.addEventListener("click", (event) => {
-          event.stopPropagation();
-          page += 1;
-          renderPage();
-          (list.firstElementChild as HTMLElement | null)?.focus();
-        });
-        pager.append(previous, count, next);
-      }
-    };
-    renderPage();
-    chooser.append(header, list, pager);
-    this.mapScaleContainer.append(chooser);
-    this.objectChooser = chooser;
-    (list.firstElementChild as HTMLElement | null)?.focus();
-    return true;
-  }
-
-  private handleObjectMarkerClick(id: string, event: MouseEvent): void {
-    if (this.garnrollePlacementMode) return;
-    // A keyboard activation or scripted click has no pointer hit point to
-    // disambiguate. Keep its focused/explicit marker action direct; a physical
-    // pointer click still opens the chooser for genuinely overlapped hit boxes.
-    // Alt+Enter explicitly requests the chooser from the keyboard.
-    if (event.detail === 0 && !event.altKey) return;
-    // Existing direct actions take precedence: a highlighted or selected knot
-    // reopens its detail, and an expanded household member opens its profile.
-    // Alt+click still exposes all overlapping objects on these markers.
-    const marker = this.activeMarkers.get(id)?.element;
-    const household = this.households.byAccountId.get(id);
-    if (
-      !event.altKey &&
-      (marker?.classList.contains("search-highlight") ||
-        marker?.classList.contains("is-selected") ||
-        household)
-    ) {
-      this.closeObjectChooser();
-      return;
-    }
-    const item = this.pointById(id);
-    if (!item || !this.openObjectChooserIfOverlapping(item, event.altKey))
-      return;
-    // The map page's normal click handler must not independently activate
-    // the stacked top marker while the explicit chooser is open.
-    event.preventDefault();
-    event.stopPropagation();
   }
 
   private nativeEntityColor(item: MapEntityViewModel): string {
@@ -1559,9 +1274,6 @@ export class NodesOverlay {
           element.setAttribute("aria-current", "true");
         }
 
-        const chooseOnClick = (event: MouseEvent) =>
-          this.handleObjectMarkerClick(item.id, event);
-        element.addEventListener?.("click", chooseOnClick);
         const cleanupGesture =
           item.type === "garnrolle" &&
           this.households.byAccountId.has(item.id) &&
@@ -1575,7 +1287,6 @@ export class NodesOverlay {
           weaveRoot,
           weaveSignature,
           cleanup: () => {
-            element.removeEventListener?.("click", chooseOnClick);
             cleanupGesture();
             marker.remove();
           },
@@ -1592,7 +1303,6 @@ export class NodesOverlay {
   }
 
   public update(points: MapEntityViewModel[], showNodes: boolean): void {
-    this.closeObjectChooser(); // Changed entitlements/projection must not leave stale choices.
     this.latestPoints = points;
     this.latestShowNodes = showNodes;
     this.households = indexHouseholdStacks(points);
@@ -1711,7 +1421,6 @@ export class NodesOverlay {
   }
 
   public destroy() {
-    this.closeObjectChooser();
     if (this.map && typeof this.map.off === "function") {
       this.map.off("zoom", this.handleZoom);
       this.map.off("moveend", this.handleMoveEnd);

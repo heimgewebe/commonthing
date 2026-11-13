@@ -328,6 +328,7 @@
         case 429:
           return "Du hast die Höchstzahl eigener Knoten erreicht. Der Eintrag bleibt unverändert öffentlich.";
         case 400:
+        case 503:
           return "Der Umzug ist derzeit nicht möglich. Nichts wurde geändert; der Eintrag bleibt öffentlich.";
       }
       if (!isUncertainMoveFailure(error)) {
@@ -337,10 +338,10 @@
     return "Unklar, ob der Umzug abgeschlossen wurde. „Erneut versuchen“ wiederholt genau dieselbe Aktion, ohne eine zweite Ressource anzulegen.";
   }
 
-  /** Network and gateway errors, including 503, may follow a commit. */
+  /** Network errors and 5xx (except an explicit 503) may have committed. */
   function isUncertainMoveFailure(error: unknown): boolean {
     if (!(error instanceof ApiRequestError)) return true;
-    return error.status >= 500;
+    return error.status >= 500 && error.status !== 503;
   }
 
   function scopeLabel(scope: string): string {

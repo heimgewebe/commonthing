@@ -12,7 +12,6 @@ pub mod machine;
 pub mod meta;
 pub mod node_audience;
 pub mod nodes;
-pub mod personal_events;
 mod query;
 pub mod search;
 pub mod webgemeindezentren;
@@ -47,7 +46,7 @@ use self::{
     },
     circles::{
         accept_invitation, create_circle, invite_account, leave_circle, list_circle_members,
-        list_my_circles, withdraw_invitation,
+        list_my_circles,
     },
     collective_write_guard::{
         create_node_serialized, delete_node_serialized, patch_node_serialized,
@@ -65,7 +64,6 @@ use self::{
     },
     node_audience::{get_node_audience, set_node_audience},
     nodes::{get_node, list_nodes},
-    personal_events::{list_personal_events, mark_personal_event_read},
     search::search_nodes,
     webgemeindezentren::{
         get_ortsweberei, get_webgemeindezentrum, list_ortswebereien, list_webgemeindezentren,
@@ -98,7 +96,6 @@ fn sensitive_domain_read(path: &str) -> bool {
         "/conversations",
         "/direct-conversations",
         "/circles",
-        "/personal-events",
     ]
     .iter()
     .any(|prefix| {
@@ -153,18 +150,6 @@ pub fn api_router() -> Router<ApiState> {
         .route(
             "/circles/{id}/membership",
             axum::routing::delete(leave_circle).route_layer(from_fn(require_authenticated)),
-        )
-        .route(
-            "/circles/{id}/invitations/{account_id}",
-            axum::routing::delete(withdraw_invitation).route_layer(from_fn(require_authenticated)),
-        )
-        .route(
-            "/personal-events",
-            get(list_personal_events).route_layer(from_fn(require_authenticated)),
-        )
-        .route(
-            "/personal-events/{id}/read",
-            post(mark_personal_event_read).route_layer(from_fn(require_authenticated)),
         )
         .route("/search", get(search_nodes))
         // Compatibility alias for node-oriented clients; `/search` is canonical.

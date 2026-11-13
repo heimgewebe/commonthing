@@ -5,7 +5,6 @@ export interface AudienceCircle {
   name: string;
   state: "forming" | "active" | "inactive";
   membership_status: "invited" | "active";
-  invitation_created_at?: string | null;
 }
 
 export interface AudienceCircleMember {
@@ -84,16 +83,10 @@ export const createHousehold = (inviteeAccountId: string) =>
     }),
   });
 
-const invitationQuery = (createdAt: string) =>
-  `expected_invitation_created_at=${encodeURIComponent(createdAt)}`;
-
-export const acceptCircle = (id: string, createdAt: string) =>
-  request<AudienceCircle>(
-    `/api/circles/${encodeURIComponent(id)}/accept?${invitationQuery(createdAt)}`,
-    {
-      method: "POST",
-    },
-  );
+export const acceptCircle = (id: string) =>
+  request<AudienceCircle>(`/api/circles/${encodeURIComponent(id)}/accept`, {
+    method: "POST",
+  });
 
 export const inviteToCircle = (id: string, accountId: string) =>
   request<void>(`/api/circles/${encodeURIComponent(id)}/invitations`, {
@@ -105,22 +98,3 @@ export const leaveCircle = (id: string) =>
   request<void>(`/api/circles/${encodeURIComponent(id)}/membership`, {
     method: "DELETE",
   });
-
-/** Reject only if the actor is still invited; never withdraw an accepted
- * membership because a second tab shows an outdated decline button. */
-export const declineCircle = (id: string, createdAt: string) =>
-  request<void>(
-    `/api/circles/${encodeURIComponent(id)}/membership?expected_status=invited&${invitationQuery(createdAt)}`,
-    { method: "DELETE" },
-  );
-
-/** Inviter-only withdrawal; applies only to a still pending invitation. */
-export const withdrawCircleInvitation = (
-  id: string,
-  accountId: string,
-  createdAt: string,
-) =>
-  request<void>(
-    `/api/circles/${encodeURIComponent(id)}/invitations/${encodeURIComponent(accountId)}?${invitationQuery(createdAt)}`,
-    { method: "DELETE" },
-  );

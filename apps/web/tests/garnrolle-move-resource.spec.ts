@@ -365,32 +365,6 @@ test.describe("Gespeicherten Profil-Tag als eigene Ressource", () => {
     expect(state.tags).not.toContain("skill:Fahrrad reparieren");
   });
 
-  test("treats HTTP 503 as uncertain and retries the identical resource move", async ({
-    page,
-  }) => {
-    const state = newState();
-    state.moveStatuses = [503];
-    const section = await openSettings(page, state);
-    const move = await openEditor(section);
-    await move.getByTestId("garnrolle-move-tag").selectOption("good:Leiter");
-
-    const submit = move.getByTestId("garnrolle-move-submit");
-    await submit.click();
-    const error = move.getByTestId("garnrolle-move-error");
-    await expect(error).toContainText("Unklar");
-    await expect(error).not.toContainText(
-      /unverändert|bleibt öffentlich|Nichts wurde geändert/,
-    );
-    await expect(submit).toHaveText("Erneut versuchen");
-
-    await submit.click();
-    await expect(move.getByTestId("garnrolle-move-success")).toContainText(
-      "nur für dich",
-    );
-    expect(state.moves).toHaveLength(2);
-    expect(state.moves[1].operation_id).toBe(state.moves[0].operation_id);
-  });
-
   test("loads neither editor, circles nor conversion API before the explicit open", async ({
     page,
   }) => {

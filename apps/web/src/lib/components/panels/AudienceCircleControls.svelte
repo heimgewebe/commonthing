@@ -4,7 +4,6 @@
   import {
     acceptCircle,
     createHousehold,
-    declineCircle,
     inviteToCircle,
     leaveCircle,
     listCircleMembers,
@@ -199,28 +198,20 @@
                 {#if circle.state !== "inactive"}
                   <button
                     type="button"
-                    disabled={busy || !circle.invitation_created_at}
+                    disabled={busy}
                     onclick={() =>
                       perform(
-                        () =>
-                          acceptCircle(
-                            circle.id,
-                            circle.invitation_created_at ?? "",
-                          ),
+                        () => acceptCircle(circle.id),
                         "Beitritt bestätigt.",
                       )}>Beitreten</button
                   >
                 {/if}
                 <button
                   type="button"
-                  disabled={busy || !circle.invitation_created_at}
+                  disabled={busy}
                   onclick={() =>
                     perform(
-                      () =>
-                        declineCircle(
-                          circle.id,
-                          circle.invitation_created_at ?? "",
-                        ),
+                      () => leaveCircle(circle.id),
                       "Einladung abgelehnt.",
                     )}>Ablehnen</button
                 >

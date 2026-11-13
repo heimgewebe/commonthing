@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://weltgewebe.org/schemas/domain/conversation.schema.json",
   "title": "Conversation",
-  "description": "A public node/governance conversation, participants-only direct conversation, or private account-owned system-event inbox.",
+  "description": "A canonical public node/governance conversation or a participants-only direct conversation.",
   "type": "object",
   "properties": {
     "id": {
@@ -11,12 +11,7 @@
     },
     "conversation_type": {
       "type": "string",
-      "enum": ["node", "governance_proposal", "direct", "account_event"]
-    },
-    "account_event_owner_id": {
-      "description": "Only account_event conversations have a private mailbox owner. NULL denotes a retired, inaccessible mailbox.",
-      "type": ["string", "null"],
-      "minLength": 1
+      "enum": ["node", "governance_proposal", "direct"]
     },
     "lifecycle_state": {
       "type": "string",
@@ -133,24 +128,6 @@
         "required": ["conversation_type"],
         "properties": {
           "conversation_type": { "const": "direct" }
-        }
-      },
-      "then": {
-        "properties": {
-          "lifecycle_state": { "const": "active" },
-          "node_id": { "type": "null" },
-          "node_id_snapshot": { "type": "null" },
-          "node_title_snapshot": { "type": "null" },
-          "visibility": { "const": "participants" },
-          "archived_at": { "type": "null" }
-        }
-      }
-    },
-    {
-      "if": {
-        "required": ["conversation_type"],
-        "properties": {
-          "conversation_type": { "const": "account_event" }
         }
       },
       "then": {

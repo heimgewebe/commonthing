@@ -5,10 +5,6 @@ import {
   type DirectConversation,
 } from "$lib/api/directMessages";
 import { listProposals, type Proposal } from "$lib/api/governance";
-import {
-  listPersonalEvents,
-  type PersonalEventPage,
-} from "$lib/api/personalEvents";
 import { authStore, type AuthRole, type AuthStatus } from "$lib/auth/store";
 import {
   hasAcceptedWeberApplication,
@@ -24,7 +20,6 @@ export interface AccountAttentionState {
   role: AuthRole;
   weberApplicationState: WeberApplicationState;
   conversations: DirectConversation[];
-  personalEvents: PersonalEventPage;
   proposals: Proposal[];
   proposalsObservedAtMs?: number;
   items: AttentionItem[];
@@ -36,8 +31,6 @@ export interface AccountAttentionControllerDependencies {
   listDirectConversations: (
     signal?: AbortSignal,
   ) => Promise<DirectConversation[]>;
-  /** Optional for test/older clients; production supplies this. */
-  listPersonalEvents?: (signal?: AbortSignal) => Promise<PersonalEventPage>;
   listProposals: (signal?: AbortSignal) => Promise<Proposal[]>;
 }
 
@@ -136,7 +129,6 @@ function initialState(): AccountAttentionState {
     role: "gast",
     weberApplicationState: "unknown",
     conversations: [],
-    personalEvents: { items: [], unread_count: 0, has_more: false },
     proposals: [],
     items: [],
   };
@@ -159,7 +151,6 @@ export function maskAccountAttentionForAuth(
       status.role === "gast" ? state.weberApplicationState : "unknown",
     items: projectTopBarAttention({
       conversations: state.conversations,
-      personalEvents: state.personalEvents,
       proposals: state.proposals,
       accountId,
       role: status.role,
@@ -192,7 +183,6 @@ export function createAccountAttentionController(
       ...state,
       items: projectTopBarAttention({
         conversations: state.conversations,
-        personalEvents: state.personalEvents,
         proposals: state.proposals,
         accountId: state.accountId || undefined,
         role: state.role,
@@ -243,33 +233,14 @@ export function createAccountAttentionController(
     if (!accountId) return;
 
     const revision = ++messageRequestRevision;
-    // Keep the human direct-message projection healthy during rolling API
-    // upgrades: a missing personal-events endpoint may not hide real DMs.
-    const [directResult, eventResult] = await Promise.allSettled([
-      dependencies.listDirectConversations(signal),
-      dependencies.listPersonalEvents
-        ? dependencies.listPersonalEvents(signal)
-        : Promise.resolve({ items: [], unread_count: 0, has_more: false }),
-    ]);
-    if (revision !== messageRequestRevision || !ownsResult(accountId)) return;
-    if (
-      directResult.status !== "fulfilled" &&
-      eventResult.status !== "fulfilled"
-    )
-      return;
-    store.update((state) =>
-      project({
-        ...state,
-        conversations:
-          directResult.status === "fulfilled"
-            ? directResult.value
-            : state.conversations,
-        personalEvents:
-          eventResult.status === "fulfilled"
-            ? eventResult.value
-            : state.personalEvents,
-      }),
-    );
+    try {
+      const conversations = await dependencies.listDirectConversations(signal);
+      if (revision !== messageRequestRevision || !ownsResult(accountId)) return;
+      store.update((state) => project({ ...state, conversations }));
+    } catch {
+      // Preserve the last confirmed projection. A transient failure must never
+      // turn unread work into a false empty state.
+    }
   }
 
   async function refreshProposals(
@@ -345,7 +316,6 @@ const controller = createAccountAttentionController({
   getAuthStatus: () => get(authStore),
   checkAuth: (options) => authStore.checkAuth(options),
   listDirectConversations: (signal) => listDirectConversations(signal),
-  listPersonalEvents: (signal) => listPersonalEvents(signal),
   listProposals: (signal) => listProposals(signal),
 });
 

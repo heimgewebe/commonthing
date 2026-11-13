@@ -1,5 +1,4 @@
 import type { DirectConversation } from "$lib/api/directMessages";
-import type { PersonalEventPage } from "$lib/api/personalEvents";
 import { formatRemaining, type Proposal } from "$lib/api/governance";
 import type { AuthRole } from "$lib/auth/store";
 
@@ -7,7 +6,6 @@ const UNREAD_COUNT_OVERFLOW = 100;
 
 export type AttentionItemKind =
   | "direct_message"
-  | "personal_event"
   | "weber_application"
   | "own_proposal"
   | "waiting_summary"
@@ -33,7 +31,6 @@ export interface AttentionItem {
 
 export interface AttentionProjectionInput {
   conversations: DirectConversation[];
-  personalEvents?: PersonalEventPage;
   proposals: Proposal[];
   accountId?: string;
   role: AuthRole;
@@ -214,7 +211,6 @@ export function unreadMessageAccessibleCount(count: number): string {
 
 export function projectTopBarAttention({
   conversations,
-  personalEvents,
   proposals,
   accountId,
   role,
@@ -225,24 +221,6 @@ export function projectTopBarAttention({
 
   const activeItems: AttentionItem[] = [];
   const waitingProposals: Proposal[] = [];
-
-  // New typed account events share the same personal attention surface as
-  // direct messages, but never impersonate another human sender.
-  const personalUnread = boundedUnreadCount(personalEvents?.unread_count ?? 0);
-  if (personalUnread > 0) {
-    const latestUnread = personalEvents?.items.find((event) => !event.read_at);
-    activeItems.push({
-      id: `personal-events:${accountId}`,
-      kind: "personal_event",
-      meaning:
-        latestUnread?.event_kind === "circle_invited" ? "available" : "new",
-      label: "Persönliche Nachrichten",
-      detail: unreadMessageAccessibleCount(personalUnread),
-      href: "/nachrichten#ereignisse",
-      occurredAt: latestUnread?.created_at,
-      count: personalUnread,
-    });
-  }
 
   for (const conversation of conversations) {
     const unread = boundedUnreadCount(conversation.unread_count);

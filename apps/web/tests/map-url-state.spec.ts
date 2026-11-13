@@ -322,7 +322,7 @@ test.describe("Map URL addressing", () => {
             id: "fresh-moved-node",
             title: "Fresh moved viewport",
             kind: "Event",
-            location: { lat: 60.5, lon: 11.5 },
+            location: { lat: 52.5, lon: 11.5 },
             summary: "Belongs to the latest viewport.",
             tags: [],
             modules: [],
@@ -341,10 +341,7 @@ test.describe("Map URL addressing", () => {
     await page.waitForFunction(() => Boolean((window as any).__TEST_MAP__));
     await page.evaluate(() => {
       (window as any).__TEST_MAP__.jumpTo({
-        // The z5 Germany startup BBOX can already contain the old 52.5N
-        // destination. Move *outside* that coverage to exercise the
-        // in-flight request replacement contract rather than cached reuse.
-        center: [11.5, 60.5],
+        center: [11.5, 52.5],
         zoom: 8,
       });
     });
