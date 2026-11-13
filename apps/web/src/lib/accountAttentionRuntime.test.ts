@@ -306,6 +306,24 @@ describe("accountAttentionRuntime", () => {
       role: "weber",
       weberApplicationState: "unknown",
       conversations: [conversation("private-a", 2, "2026-08-17T07:00:00Z")],
+      personalEvents: {
+        unread_count: 1,
+        has_more: false,
+        items: [
+          {
+            id: "private-circle-event-a",
+            event_kind: "circle_invited",
+            invitation_created_at: "2026-11-12T12:00:00Z",
+            content: "Du hast eine Einladung erhalten",
+            created_at: "2026-11-12T12:00:00Z",
+            read_at: null,
+            circle_id: "house-a",
+            circle_name: "Haus A",
+            target_account_id: null,
+            actionable: true,
+          },
+        ],
+      },
       proposals: [],
       items: [
         {
@@ -330,6 +348,7 @@ describe("accountAttentionRuntime", () => {
     ).toMatchObject({
       accountId: "",
       conversations: [],
+      personalEvents: { items: [], unread_count: 0, has_more: false },
       proposals: [],
       items: [],
     });
@@ -338,6 +357,7 @@ describe("accountAttentionRuntime", () => {
     ).toMatchObject({
       accountId: "",
       conversations: [],
+      personalEvents: { items: [], unread_count: 0, has_more: false },
       proposals: [],
       items: [],
     });
@@ -371,6 +391,7 @@ describe("accountAttentionRuntime", () => {
       role: "weber",
       weberApplicationState: "unknown",
       conversations: [],
+      personalEvents: { items: [], unread_count: 0, has_more: false },
       proposals: [proposal],
       items: [
         {

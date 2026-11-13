@@ -278,6 +278,14 @@ async fn csrf_blocks_all_mutating_endpoints_without_origin() -> Result<()> {
             Method::DELETE,
             "/circles/00000000-0000-0000-0000-000000000000/membership",
         ),
+        (
+            Method::DELETE,
+            "/circles/00000000-0000-0000-0000-000000000000/invitations/another-account",
+        ),
+        (
+            Method::POST,
+            "/personal-events/00000000-0000-0000-0000-000000000000/read",
+        ),
         (Method::POST, "/machine/v1/nodes"),
         (Method::PATCH, "/machine/v1/nodes/any-node-id"),
         (Method::PUT, "/machine/v1/nodes/any-node-id"),
@@ -428,6 +436,8 @@ const CSRF_COVERED_MUTATING_ROUTES: &[(&str, &str)] = &[
     ("POST", "/circles/{id}/accept"),
     ("POST", "/circles/{id}/invitations"),
     ("DELETE", "/circles/{id}/membership"),
+    ("DELETE", "/circles/{id}/invitations/{account_id}"),
+    ("POST", "/personal-events/{id}/read"),
     ("POST", "/machine/v1/nodes"),
     ("PATCH", "/machine/v1/nodes/{id}"),
     ("PUT", "/machine/v1/nodes/{id}"),

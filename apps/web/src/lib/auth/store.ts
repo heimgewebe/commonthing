@@ -158,4 +158,15 @@ export const createAuthStore = (options: AuthStoreOptions = {}) => {
 
 export const authStore = createAuthStore();
 
+// E2E-only: exercise authoritative auth refresh in the already mounted inbox.
+// Vite removes this branch from normal production builds; no auth mutation or
+// bypass is exposed, only the existing server-verified checkAuth operation.
+if (browser && (import.meta.env.DEV || import.meta.env.MODE === "test")) {
+  (
+    window as Window & {
+      __commonthingE2ERecheckAuth?: () => Promise<AuthStatus>;
+    }
+  ).__commonthingE2ERecheckAuth = () => authStore.checkAuth({ force: true });
+}
+
 if (browser) void authStore.checkAuth();
