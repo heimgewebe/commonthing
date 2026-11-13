@@ -173,8 +173,10 @@ Bitmap-Fäden nicht dünner machen.
 
 Der Generator entfernt ausschließlich mehr Deckkraft entlang der echten
 Garnkanten, nicht aus den Faserkernen. Die feinere Textfassung verwendet nach
-der bisherigen Reduktion einen zusätzlichen sanften Kantenpass (3/10 statt
-7/10), der die gesamte Alpha-Deckkraft um rund 4 % weiter verringert. Farben, originale Fotopixel, Glyphengrößen,
+der bisherigen Reduktion einen weiteren vollen, aber auf Faserkanten
+begrenzten 7/10-Kantenpass und abschließend den 3/10-Feinpass. Damit sinkt
+die Alpha-Deckkraft gegenüber der vorherigen Textfassung nochmals um rund
+8–10 %, ohne die dichten Wollkerne zu entfernen. Farben, originale Fotopixel, Glyphengrößen,
 Grundlinien, Unterlängen und Zeichenabstände bleiben gleich. Der bereits
 freigegebene Originalfont und die Wortbild-Überschriften sind **bitgenau
 unverändert**. Das gilt auch für die beiden Farbvarianten. Diese Trennung ist
