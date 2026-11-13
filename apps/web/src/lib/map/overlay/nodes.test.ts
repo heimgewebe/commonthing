@@ -13,6 +13,7 @@ import {
   MARKER_GEO_ANCHOR,
   NodesOverlay,
   diffSearchMatchIds,
+  screenHitBoxesOverlap,
   type MarkerConstructor,
 } from "./nodes";
 import {
@@ -92,6 +93,17 @@ class FakeElement {
   private _innerHTML = "";
   private listeners = new Map<string, Set<(event: any) => void>>();
   removed = false;
+  focused = false;
+
+  focus() {
+    this.focused = true;
+  }
+  get firstElementChild(): FakeElement | null {
+    return this.children[0] ?? null;
+  }
+  replaceChildren(...children: FakeElement[]) {
+    this.children = children;
+  }
 
   addEventListener(type: string, listener: (event: any) => void) {
     const set = this.listeners.get(type) ?? new Set();
@@ -1455,5 +1467,270 @@ describe("NodesOverlay Webgemeindezentrum marker", () => {
         .getActiveMarker("shared")
         ?.element.classList.contains("marker-webgemeindezentrum"),
     ).toBe(true);
+  });
+});
+
+describe("one on-demand chooser for overlapping map hit boxes", () => {
+  function projectedOverlay(
+    project: (coords: [number, number]) => { x: number; y: number },
+  ) {
+    const container = new FakeElement();
+    const activate = vi.fn();
+    const map = {
+      getContainer: () => container as unknown as HTMLElement,
+      project,
+    } as unknown as MapLibreMap;
+    vi.stubGlobal("document", { createElement: () => new FakeElement() });
+    return {
+      overlay: new NodesOverlay(
+        map,
+        FakeMarker as unknown as MarkerConstructor,
+        weaveRuntime,
+        activate,
+      ),
+      container,
+      activate,
+    };
+  }
+
+  function chooserOf(container: FakeElement): FakeElement | undefined {
+    return container.children
+      .filter((node) => node.dataset.testid === "map-object-chooser")
+      .at(-1);
+  }
+
+  it("detects screen hit-box collisions, not exact address identity", () => {
+    expect(screenHitBoxesOverlap({ x: 20, y: 20 }, { x: 63, y: 20 })).toBe(
+      true,
+    );
+    expect(screenHitBoxesOverlap({ x: 20, y: 20 }, { x: 64, y: 20 })).toBe(
+      false,
+    );
+    expect(screenHitBoxesOverlap({ x: 20, y: 20 }, { x: 20, y: -23 })).toBe(
+      true,
+    );
+  });
+
+  it("chooses distinct nodes, a Garnrolle and a center at the same public coordinates", () => {
+    const { overlay, container, activate } = projectedOverlay(([lon, lat]) => ({
+      x: lon * 100,
+      y: lat * 100,
+    }));
+    const node = makeNode("a");
+    const second = makeNode("b");
+    const spool = { ...makeAccount("spool"), lat: node.lat, lon: node.lon };
+    const center = { ...makeCenter(), lat: node.lat, lon: node.lon };
+    overlay.update([node, spool, second, center], true);
+    const element = overlay.getActiveMarker(node.id)
+      ?.element as unknown as FakeElement;
+    const click = element.fire("click");
+    expect(click.stopPropagation).toHaveBeenCalledTimes(1);
+    expect(activate).not.toHaveBeenCalled();
+    const chooser = chooserOf(container);
+    expect(chooser).toBeDefined();
+    expect(
+      chooser?.children[1].children.map((button) => button.textContent),
+    ).toEqual([
+      "Knoten: Node a",
+      "Garnrolle: Garnrolle spool",
+      "Knoten: Node b",
+      "Gemeinschaftszentrum: Webgemeindezentrum Hammer Park",
+    ]);
+    const target = chooser?.children[1].children[3] as FakeElement;
+    expect(target.focused).toBe(false);
+    target.fire("click");
+    expect(activate).toHaveBeenCalledWith(
+      center,
+      overlay.getActiveMarker(center.id)?.element,
+    );
+    expect(chooser?.removed).toBe(true);
+    overlay.destroy();
+  });
+
+  it("keeps nearby but distinct coordinates separate when zoom resolves a pixel collision", () => {
+    let scale = 500;
+    const { overlay, container, activate } = projectedOverlay(([lon, lat]) => ({
+      x: lon * scale,
+      y: lat * scale,
+    }));
+    const first = makeNode("one");
+    const second = makeNode("two", { lon: 10.03 });
+    overlay.update([first, second], true);
+    const element = overlay.getActiveMarker(first.id)
+      ?.element as unknown as FakeElement;
+    const overlapped = element.fire("click");
+    expect(overlapped.stopPropagation).toHaveBeenCalled();
+    const firstChooser = chooserOf(container);
+    expect(firstChooser?.children[1].children.length).toBe(2);
+    scale = 3000;
+    const resolved = element.fire("click");
+    expect(resolved.stopPropagation).not.toHaveBeenCalled();
+    expect(firstChooser?.removed).toBe(true);
+    expect(activate).not.toHaveBeenCalled();
+    overlay.destroy();
+  });
+
+  it("keeps ordinary Garnrolle profile clicks direct while Alt+click lists nearby Garnrollen", () => {
+    const { overlay, container } = projectedOverlay(([lon, lat]) => ({
+      x: lon * 100,
+      y: lat * 100,
+    }));
+    const first = makeAccount("visible");
+    const fuzzy = {
+      ...makeAccount("fuzzy"),
+      lat: first.lat,
+      lon: first.lon + 0.23, // 23px separation: each marker center remains clickable.
+      map_state: "radius" as const,
+    };
+    overlay.update([first, fuzzy], true);
+    const marker = overlay.getActiveMarker(first.id)
+      ?.element as unknown as FakeElement;
+    const direct = marker.fire("click", { detail: 1 });
+    expect(direct.stopPropagation).not.toHaveBeenCalled();
+    expect(chooserOf(container)).toBeUndefined();
+    const alternatives = marker.fire("click", { detail: 1, altKey: true });
+    expect(alternatives.stopPropagation).toHaveBeenCalledOnce();
+    expect(chooserOf(container)?.children[1].children).toHaveLength(2);
+    overlay.destroy();
+  });
+
+  it("opens a touch-reachable chooser for an exact Garnrolle and a same-point radius Garnrolle", () => {
+    const { overlay, container } = projectedOverlay(([lon, lat]) => ({
+      x: lon * 100,
+      y: lat * 100,
+    }));
+    const exact = makeAccount("exact");
+    const radius = {
+      ...makeAccount("radius"),
+      lon: exact.lon,
+      lat: exact.lat,
+      map_state: "radius" as const,
+    };
+    overlay.update([exact, radius], true);
+    const marker = overlay.getActiveMarker(exact.id)
+      ?.element as unknown as FakeElement;
+    const click = marker.fire("click", { detail: 1 });
+    expect(click.stopPropagation).toHaveBeenCalledOnce();
+    expect(chooserOf(container)?.children[1].children).toHaveLength(2);
+    overlay.destroy();
+  });
+
+  it("uses expanded household screen offsets rather than false geographic collisions", () => {
+    const { overlay, container } = projectedOverlay(([lon, lat]) => ({
+      x: lon * 100,
+      y: lat * 100,
+    }));
+    Object.assign(container, { clientWidth: 600, clientHeight: 700 });
+    const anchorNode = makeNode("near-house", { lon: 10.01, lat: 53.51 });
+    const members = Array.from({ length: 4 }, (_, i) => ({
+      ...makeAccount(`resident-${i}`),
+      map_state: "exact" as const,
+    }));
+    overlay.update([anchorNode, ...members], true);
+    (
+      overlay.getActiveMarker(members[3].id)?.element as unknown as FakeElement
+    ).fire("dblclick");
+    expect(overlay.getActiveMarker(members[0].id)).toBeDefined();
+    expect(overlay.getActiveMarker(members[3].id)).toBeDefined();
+    // Displayed x offsets are -102,-34,34,102px (68px spacing).
+    const nodeMarker = overlay.getActiveMarker(anchorNode.id)
+      ?.element as unknown as FakeElement;
+    const click = nodeMarker.fire("click", { detail: 1 });
+    expect(click.stopPropagation).toHaveBeenCalledOnce();
+    const choices = chooserOf(container)?.children[1].children.map(
+      (button) => button.textContent,
+    );
+    expect(choices).toEqual([
+      "Knoten: Node near-house",
+      "Garnrolle: Garnrolle resident-1",
+      "Garnrolle: Garnrolle resident-2",
+    ]);
+    overlay.destroy();
+  });
+
+  it("never turns an unlisted, private or revoked object into a choice", () => {
+    const { overlay, container } = projectedOverlay(([lon, lat]) => ({
+      x: lon,
+      y: lat,
+    }));
+    const visible = makeNode("authorized");
+    // The browser only receives the server-authorized view; an excluded
+    // object is not in latestPoints and must not enter the chooser.
+    const excluded = makeNode("private");
+    overlay.update([visible], true);
+    const click = (
+      overlay.getActiveMarker(visible.id)?.element as unknown as FakeElement
+    ).fire("click");
+    expect(click.stopPropagation).not.toHaveBeenCalled();
+    expect(chooserOf(container)).toBeUndefined();
+    expect(overlay.getActiveMarker(excluded.id)).toBeUndefined();
+    overlay.destroy();
+  });
+
+  it("preserves the existing household stack, Escape and selected context", () => {
+    const { overlay, container, activate } = projectedOverlay(([lon, lat]) => ({
+      x: lon * 100,
+      y: lat * 100,
+    }));
+    const node = makeNode("knoten");
+    const exact = (id: string): MapEntityGarnrolle => ({
+      ...makeAccount(id),
+      lat: node.lat,
+      lon: node.lon,
+      map_state: "exact",
+    });
+    overlay.update([node, exact("left"), exact("right")], true);
+    expect(overlay.getActiveMarker("left")).toBeUndefined();
+    const front = overlay.getActiveMarker("right")
+      ?.element as unknown as FakeElement;
+    expect(front.dataset.householdCount).toBe("2");
+    overlay.updateSelection(node.id);
+    const selected = overlay.getActiveMarker(node.id)
+      ?.element as unknown as FakeElement;
+    const directClick = selected.fire("click");
+    expect(directClick.stopPropagation).not.toHaveBeenCalled();
+    expect(chooserOf(container)).toBeUndefined();
+    const keyboardClick = selected.fire("click", { detail: 0 });
+    expect(keyboardClick.stopPropagation).not.toHaveBeenCalled();
+    expect(chooserOf(container)).toBeUndefined();
+    const chooserClick = selected.fire("click", { altKey: true });
+    expect(chooserClick.stopPropagation).toHaveBeenCalled();
+    expect(chooserOf(container)).toBeDefined();
+    container.fire("keydown", { key: "Escape" });
+    expect(chooserOf(container)?.removed).toBe(true);
+    expect(activate).not.toHaveBeenCalled();
+    overlay.destroy();
+  });
+
+  it("renders only one page of controls even when many hits overlap", () => {
+    const { overlay, container, activate } = projectedOverlay(([lon, lat]) => ({
+      x: lon,
+      y: lat,
+    }));
+    const points = Array.from({ length: 65 }, (_, n) => makeNode(String(n)));
+    overlay.update(points, true);
+    (overlay.getActiveMarker("0")?.element as unknown as FakeElement).fire(
+      "click",
+    );
+    const chooser = chooserOf(container);
+    expect(chooser?.children[1].children.length).toBe(20);
+    const pager = chooser?.children[2] as FakeElement;
+    expect(pager.children.map((x) => x.textContent)).toEqual([
+      "Zurück",
+      "Seite 1 von 4",
+      "Weiter",
+    ]);
+    pager.children[2].fire("click");
+    expect(chooser?.children[1].children.length).toBe(20);
+    expect(chooser?.children[1].children[0].focused).toBe(true);
+    pager.children[2].fire("click");
+    pager.children[2].fire("click");
+    expect(chooser?.children[1].children.length).toBe(5);
+    chooser?.children[1].children[4].fire("click");
+    expect(activate).toHaveBeenCalledWith(
+      points[64],
+      overlay.getActiveMarker(points[64].id)?.element,
+    );
+    overlay.destroy();
   });
 });

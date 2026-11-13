@@ -370,7 +370,9 @@
     // A closed or empty search has no directions to animate. Avoid scheduling
     // a Svelte state write for every MapLibre frame in the ordinary map view.
     if (
-      (!$isSearchOpen || !$searchQuery.trim() || filteredResults.length === 0) &&
+      (!$isSearchOpen ||
+        !$searchQuery.trim() ||
+        filteredResults.length === 0) &&
       searchDirectionIndicators.length === 0
     ) {
       return;
@@ -1055,8 +1057,11 @@
         map,
         maplibregl.Marker,
         undefined,
-        (item) => {
+        (item, focusReturnTarget) => {
           if (get(kompositionDraft)?.mode !== "place-garnrolle") {
+            // Chooser buttons bypass handleMarkerClick. Preserve the selected
+            // marker (or MapLibre canvas for native points) for focus return.
+            if (focusReturnTarget) lastFocusedElement = focusReturnTarget;
             focusAndFlyToPoint(item);
           }
         },

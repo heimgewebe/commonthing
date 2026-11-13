@@ -26,24 +26,29 @@ relations:
 
 # Geltungsbereiche und Hausgemeinschaft
 
-**Stand:** 6. November 2026. **Art:** Aktiver Ausführungsplan; Stufen
-werden separat abgenommen. Das Papier selbst ist kein Produktionsbeleg.
-**Umsetzung (8. November 2026):** P0 über PR #2065, P1-Mitgliedschaft
-über PR #2069 und P2-Knotenfreigaben über PR #2073 in main integriert.
-Öffentlicher API- und Frontend-Readback bestätigt für P2 denselben
-Produktionscommit b83e7e42; negative anonyme Audience-Abfragen liefern 401.
-Echte mehrseitige Authentifizierungs- und physische iPad-Abnahme stehen
-aus. P2b erhält über PR #2078 einen ersten sicheren Profil-zu-Knoten-
-Einstieg für neue Ressourcen. Der Umzug **eines bereits gespeicherten**
-`good:`/`skill:`-Profil-Tags in einen eigenen Knoten (Issue #2081) ist als
-Änderungsentwurf implementiert und lokal gegen eine Wegwerf-PostgreSQL
-getestet, aber weder integriert noch ausgeliefert (siehe „Umsetzung P2b“).
-P3 (Benachrichtigungen) und P4 (große Karte) sind weiterhin offen.
-Für neue einzeln sichtbarkeitsgesteuerte Güter/Fähigkeiten ist das
-vorhandene Knotenmodell mit P2-Sichtbarkeit die einzige sichere
-Speicherung; öffentliche Garnrollen-Tags dürfen **nicht** als private
-Ressourcen missverstanden werden.
-Der frühere Bureau-Kandidat ist nicht publiziert und keine registrierte Aufgabe.
+**Stand:** 12. November 2026. **Art:** Aktiver Umsetzungsplan mit getrennten
+Produktivabnahmen; dieses Dokument ist kein Laufzeitbeleg.
+
+**Bereits in main:** Grundvertrag P0 (#2065), freiwillige Mitgliedschaft P1
+(#2069), Kreisfreigabe an Knoten P2 (#2073), neue Einzelressourcen (#2078)
+und die Überführung vorhandener `good:`-/`skill:`-Tags P2b (#2083).
+Die zusätzlichen PostgreSQL- und HTTP-Mehrrollenregressionen #2089/#2090
+sowie die idempotente 503-Behandlung #2103 wurden ebenfalls integriert.
+Der zuvor in diesem Plan als *nicht integriert* bezeichnete P2b-Entwurf
+ist daher historisch überholt. **Weiter offen:** #2081 und #1970 für
+authentifizierte Produktions- und reale Safari-Nutzerwege; die PRs #2108
+(Kartenüberlagerung) und #2109 (Push-Fehler) sind am 12.11. noch offen.
+Die hier neu vereinbarten persönlichen Hausgemeinschafts-Ereignisnachrichten
+sind **Plan**, nicht bereits implementierte Postfach-Funktion.
+
+**Unmittelbare Prioritäten:** (1) Mitgliedschaftszuwachs und Rücknahme
+bestehender Freigaben nachvollziehbar regeln; (2) Einladungen, Annahmen,
+Ablehnungen und weitere direkt betreffende Vorgänge als persönliche
+Nachrichten im bestehenden Postfach sichtbar machen; (3) Mehrkonten- und
+iPad-Safari-Abnahme; (4) Kartenbedienbarkeit und Push-Regressionen.
+P4 (weitere Geltungsbereiche/räumliche Adressierung) bleibt danach.
+Der frühere Bureau-Kandidat ist nicht publiziert und keine registrierte
+Aufgabe.
 
 ## 1. Auftrag und Erfolgskriterium
 
@@ -73,7 +78,7 @@ Safari auf dem iPad.
 |---|---|
 | `docs/specs/garnrolle-knoten-faden.md` | Ein Account = eine Garnrolle; Knoten, Urheberbindung, Gespräch, Webungsaktion, Fäden. Dort sind `search_visibility` = `public`/`private`/`hidden`/`revoked` und serverseitige Lesegrenzen beschrieben (teilweise ausdrücklich als Änderungsentwurf). |
 | `docs/specs/privacy-api.md` | `map_state`/`public_pos` regeln **Kartenverortung**, nicht die Zugriffsberechtigung auf Güter oder Hausangelegenheiten. |
-| `docs/specs/private-nachrichten.md` und `apps/api/src/notifications.rs` | Web Push existiert **für private Direktnachrichten**, mit separater Konto-/Gerätefreigabe, Outbox, neutralen Push-Inhalten und idempotenter Zustellung. Kein allgemeiner Ereignis-Push ist damit belegt. |
+| `docs/specs/private-nachrichten.md`, `/nachrichten`, `apps/web/src/lib/accountAttentionRuntime.ts` und `apps/api/src/notifications.rs` | Das vorhandene persönliche Postfach und die Topbar zählen ungelesene **1:1-Nachrichten**; die bestehenden Web-Push-Opt-ins, Outbox und neutralen Push-Inhalte betreffen Direktnachrichten. Hausgemeinschaftsereignisse sind dort heute **nicht** als kanonische persönliche Nachrichten angebunden. Bestehende Zustellung erweitern, nicht ersetzen. |
 | `docs/specs/ortsweberei-webgemeindezentrum.md` | Ortsweberei/Gewebezelle/Webgemeindezentrum haben bereits eigene Zuständigkeit. Eine Hausgemeinschaft ist **keine neue Ortsweberei oder Gewebezelle**. |
 | `docs/specs/map-experience.md` | Bestehende Karte, Filter, Fokuspanel und mobile Interaktionen erhalten. |
 
@@ -100,14 +105,18 @@ Push-Dienst oder Zahlungsverkehr.
    Vorhaben beitreten oder Inhalte bearbeiten? Lesen, Reagieren, Bearbeiten,
    Moderieren und formale Weberrechte bleiben getrennt. Mitgliedschaft
    vergibt **niemals** automatisch fremde Schreib-/Weberrechte.
-4. **Benachrichtigung / Abonnement:** Soll ein zulässiges, bestätigtes
-   Ereignis überhaupt aktiv zugestellt werden? Nur an aktuell
-   leseberechtigte Abonnenten mit wirksamer Konto- **und** Gerätefreigabe;
-   In-App-Hinweise dürfen unabhängig von Browser-Push existieren.
+4. **Persönliche Nachricht / optionaler Push:** Direkt an eine Person
+   gerichtete oder sie unmittelbar betreffende Vorgänge erzeugen eine
+   **persistente persönliche Nachricht** im vorhandenen Postfach – auch ohne
+   Push-Opt-in. Für allgemeine Ressourcen- und Themenaktivität ist ein
+   freiwilliges Abonnement nötig. Betriebssystem-Push bleibt zusätzlich
+   freiwillig und erfordert Konto- **und** Gerätefreigabe.
 
-Die effektive Empfängermenge lautet sinngemäß:
-
-`Adressierte ∩ aktuell Leseberechtigte ∩ passende Abonnenten ∩ freigegebene Geräte`.
+Empfängermengen unterscheiden sich bewusst: **persönliches Postfach** =
+konkret betroffene, aktiv berechtigte Konten; **abonnierte Ereignisse** =
+adressierte, aktuell leseberechtigte Konten mit passendem Abonnement;
+**Push** = daraus freigegebene Konten und Geräte. Fehlendes Push-Abonnement
+darf eine Einladung oder Ablehnung niemals im Postfach verstecken.
 
 Ein größerer Adressierungskreis hebt Leserechte **nicht** auf. Änderungen der
 Sichtbarkeit erfordern eine ausdrückliche Aktion des verantwortlichen Nutzers.
@@ -172,6 +181,32 @@ Die zugrunde liegende, wiederverwendbare Abstraktion lautet **Kreis
 keine Sonderberechtigung im Karten-Rendering. Andere Kreise müssen sich
 später ohne neue Node- oder Edge-Klassen ergänzen lassen.
 
+### Nachtrag: Aufnahme, Austritt und Begriffsgrenzen (12.11.2026)
+
+**Aktuelle Berechtigungskonsequenz:** Nach Annahme einer Einladung wird ein
+neues aktives Mitglied grundsätzlich auch zum Leser **bereits zuvor**
+kreisfreigegebener Knoten. Ein beliebiges aktives Mitglied kann derzeit
+einladen; die API erlaubt den eigenen Austritt, aber noch keinen geregelten
+Widerruf einer fremden Mitgliedschaft. Diese Regel ist weder als
+Einwilligung der betroffenen Ressourcenbesitzer noch als fertiger
+Konfliktmechanismus zu behandeln.
+
+**Vor Implementierung entscheiden und sichtbar machen:** Welche explizite
+Zustimmung gilt für künftige Mitglieder und für bereits freigegebene
+Inhalte? Minimale Lösung ohne zweite Verwaltung: beim Freigeben die
+Reichweite für **künftige** Mitglieder unmissverständlich erklären,
+Aufnahmen allen Betroffenen im Postfach anzeigen, ein begrenztes Verfahren
+zum Widerspruch/Korrigieren einer fehlerhaften Aufnahme festlegen und
+betroffenen Besitzern einen wirksamen Widerruf ihrer Knotenfreigaben
+ermöglichen. Keine stillschweigende Ausweitung geschützter Bestandsinhalte.
+Eine schwerfällige neue Haus-Governance ist kein Standardziel.
+
+**Begriffe:** Der Kartenstapel exakt übereinanderliegender öffentlicher
+Garnrollen heißt **„Garnrollen an diesem Ort“**, auch wenn niemand
+einer Gemeinschaft beigetreten ist. **„Hausgemeinschaft“** bezeichnet
+nur einen ausdrücklich bestätigten Kreis. Gleiche Koordinaten sind
+niemals Mitglieds- oder Leserechtsbeweis.
+
 ## 5. Flächen, die dieselbe Policy verwenden müssen
 
 Die **serverseitige** Berechtigungsentscheidung gilt für:
@@ -235,6 +270,29 @@ drittes Konto mit identischen Koordinaten erhält keinerlei
 Mitgliedsrechte; Position verschieben und neu laden bewahren den
 korrekten, unabhängig gepflegten Mitgliedschaftszustand.
 
+### P1-Nachtrag – Persönliche Nachrichten für Mitgliedschaftsvorgänge
+
+Die P1-Mitgliedschaft darf nicht nur als Status in der Garnrolle sichtbar sein.
+Bereits **Gründungsvorschlag und Einladung** erscheinen beim Empfänger als
+**ungelesene persönliche Nachricht** in `/nachrichten` und in der vorhandenen
+Topbar-Aufmerksamkeitsanzeige. **Annehmen** und **Ablehnen** sind direkt aus
+dieser Nachricht und weiterhin am bestehenden Garnrollenpanel möglich.
+
+Annahme oder Ablehnung erzeugt nach bestätigter Zustandsänderung eine
+persönliche Ergebnisnachricht an den Einladenden. Bei weiterer Aufnahme,
+Austritt, Rücknahme einer Einladung oder Auflösung erhalten die tatsächlich
+betroffenen bisherigen Mitglieder eine passende persönliche Mitteilung.
+Kein Browser-Push, keine Benachrichtigungserlaubnis und kein Abonnement
+sind nötig, **um die Nachricht im Postfach zu erhalten**; die externe
+Push-Zustellung bleibt optional. Mehr zur Ereignismatrix und technischen
+Realisierung in P3.
+
+**Fertig, wenn:** A lädt B ein; B sieht eine ungelesene Nachricht in
+Postfach und Topbar, kann daraus annehmen oder ablehnen; A sieht das
+jeweilige Ergebnis als neue persönliche Nachricht. Nach Reload oder
+Gerätewechsel bleiben Status und Gelesen-Zustand konsistent. Ein gescheiterter
+Mitgliedschaftswechsel erzeugt keine falsche Erfolgsmeldung.
+
 ### P2 – „Nur Hausgemeinschaft“ an vorhandenen Knoten
 
 #### Umsetzung P2
@@ -277,10 +335,17 @@ Knotenweben funktionieren unverändert.
 hausintern zeigen, ohne Daten zu duplizieren, die übrige
 Garnrolle zu verstecken oder einen neuen Ressourceneditor zu erfinden.
 
-#### Stand P2b: gespeicherten Profil-Tag umziehen (Issue #2081, Entwurf)
+#### P2b: gespeicherten Profil-Tag umziehen (Issue #2081, umgesetzt; Abnahme offen)
 
-Status: im Worktree implementiert und lokal getestet; **nicht** gemergt,
-nicht deployt, keine Produktions- oder iPad-Abnahme.
+**Aktueller Integrationsstand:** Der zuvor nur entworfene Umzug ist
+mit PR #2083 in `main` integriert. #2089 und #2090 ergänzen reale
+PostgreSQL- und HTTP-Cookie-Regressionsbelege, #2103 korrigiert die
+idempotente Wiederholung nach unbekanntem 503-Ergebnis. Der nachfolgende
+Mechanikabschnitt beschreibt daher **implementierten** Code, keine
+ausstehende Änderung. **Offen:** nachgewiesener vollständiger
+authentifizierter Mehrkonten-Nutzerweg auf der aktuell aktiven
+Produktivversion und physischer iPad-Safari-Test; #2081 nicht voreilig
+schließen.
 
 - **API:** `POST /api/accounts/me/profile/resources` mit `tag` (exakt ein
   gespeicherter `good:`/`skill:`-Tag), `scope` (`private` = Nur ich,
@@ -311,7 +376,7 @@ nicht deployt, keine Produktions- oder iPad-Abnahme.
   Rückholbarkeit fremder Kopien. Ungespeicherte andere Eingaben bleiben
   erhalten; bei `409` nur ehrliche Meldung und Tag-Abgleich, kein
   automatisches erneutes Speichern.
-- **Belege (lokal):** `apps/api/tests/db_profile_tag_resource.rs` gegen
+- **Belege (bereits integriert und ausbaubar):** `apps/api/tests/db_profile_tag_resource.rs` gegen
   Wegwerf-PostgreSQL (Atomarität inkl. injiziertem Grant-Fehler, Replay,
   parallele Instanzen, Fremdzugriff, Marker-Kapazität, JSONL-`503`) sowie
   `apps/web/tests/garnrolle-move-resource.spec.ts` (gemockte API; kein
@@ -322,27 +387,134 @@ nicht deployt, keine Produktions- oder iPad-Abnahme.
   ist nur über den Marker abgesichert; echte authentifizierte Mehrkonten-
   und iPad-Abnahme fehlen.
 
-### P3 – Adressierung und freiwillige Hinweise
+### P2-Nachtrag – Datenschutz, Endabnahme und Kartenbedienung
 
-#### Umsetzung P3
+- **P0 Datenschutz:** #2081 (P2b) und #1970 anhand mehrerer *real*
+  authentifizierter Produktionskonten inklusive ehemaligem Mitglied
+  über Karte, BBOX, Suche, Direktlink, Gespräch, Garnrollenaktivität
+  und Cache abnehmen. Die bereits gemergten Tests #2089/#2090 nicht
+  wiederholen, sondern die fehlende echte End-to-End-Gegenprobe ergänzen.
+- **P0 Mitgliedschaftsentscheidung:** vor Freigabe beliebiger neuer
+  Mitglieder den oben beschriebenen Bestandszugriff und den wirksamen
+  Rücknahmeweg anhand eines privaten Knotens A→B→C überprüfen.
+- **P1 Karte:** #2108 zur Auswahl überlagerter, autorisierter Marker
+  abschließen; Kartennamen „Garnrollen an diesem Ort“ gegenüber
+  bestätigter Hausgemeinschaft trennen. Kein Verschieben echter
+  geografischer Anker und keine neue Datenkopie.
+- **P1 Push:** offenen Fix #2109 übernehmen und regressionsprüfen,
+  damit ein fehlgeschlagener Aktivierungsversuch bestehende
+  Geräte-Abonnements nicht löscht. Erst dann den Kanal erweitern.
+- **P2 Skalierung:** #1471 anhand echter Browser- und API-Messungen
+  weiter abnehmen; bekannte Teilbeweise nicht mit Vollabnahme für
+  extrem viele gleichzeitig sichtbare Entitäten verwechseln.
 
-1. Webungsereignis darf gezielt an einen Kreis adressiert werden,
-   ohne Knoten zu kopieren. Adressierung erweitert niemals Leserechte.
-2. Erste In-App-Benachrichtigung/Beobachtung für neue, **lesbare**
-   Haus-Ereignisse mit abonnierbarer Ereignisart; keine Pflichtreaktion.
-3. Erst anschließend optional denselben vorhandenen Web-Push-Kanal
-   erweitern: Konto-Opt-in, pro Gerät Browserfreigabe, Outbox,
-   idempotente Belege, begrenzte Retries und **neutraler Payload**
-   (keine privaten Titel, Namen, Adressen oder Texte).
-4. Rechte und Abonnement beim Erzeugen **und** Zustellen prüfen;
-   unterdrückte/abgemeldete Empfänger nicht später nachbeliefern.
-   Geräteausschaltung/Entzug bricht ausstehende Aufträge ab.
+### P3 – Persönliche Ereignisnachrichten im vorhandenen Postfach
 
-**Fertig, wenn:** Nur abonnierte Mitglieder bekommen einen zulässigen
-Hinweis; Nichtmitglieder, ausgeschiedene Mitglieder und deaktivierte
-Geräte nicht. Browser-Push-Ausfall lässt Knoten und In-App-Zugriff
-unbeeinträchtigt. Bestehende Direktnachrichten-Pushfunktion bleibt
-regressionsfrei.
+**Verbindlicher Produktvertrag:** Persönlich adressierte oder unmittelbar
+betreffende Ereignisse sind **persönliche Nachrichten** und erscheinen
+**dauerhaft lesbar unter `/nachrichten`**, inklusive Ungelesen-Zähler,
+Topbar-Briefsymbol und kontextbezogenem Direktlink. Die Nutzer müssen nicht
+in den Einstellungen nach Einladungen suchen. Das Postfach ist die
+verbindliche Anzeige und Lesestatusquelle für die persönliche Mitteilung;
+der fachliche Mitgliedschafts- oder Ressourcenzustand bleibt die
+maßgebliche Wahrheit. Push weckt nur auf und kann fehlen.
+
+| Ereignis | Persönliche Empfänger | Darstellung / mögliche Aktion |
+|---|---|---|
+| Hausgemeinschaft vorgeschlagen / eingeladen | konkret Eingeladener | „Einladung zur Hausgemeinschaft“; **Annehmen / Ablehnen** |
+| Einladung angenommen / neues Mitglied bestätigt | Einladender und betroffene bisherige Mitglieder, je genau eine Nachricht | „Beitritt bestätigt“ bzw. „Neues Mitglied“; Kreis öffnen |
+| Einladung abgelehnt | Einladender | „Einladung abgelehnt“; als erledigt markieren |
+| Einladung zurückgezogen / gegenstandslos | Eingeladener und betroffene Initiatoren | Korrekturstatus; **keine** wirkungslose Beitrittstaste |
+| Austritt, Ausschluss oder Auflösung | noch betroffene Mitglieder, relevante Besitzer | Änderung des Zugriffsstatus; Kreis/Freigaben prüfen |
+| Eigene Kreisfreigabe geändert oder widerrufen | direkt betroffene, aktuell berechtigte Personen | neutrale persönliche Statusmitteilung; keine privaten Daten nach Widerruf |
+| Direkte Antwort, Erwähnung, persönlich anvertraute Aufgabe oder Entscheidung | direkt adressierte/beteiligte Person | vorhandenen Knoten, Faden, Antrag oder Gespräch öffnen |
+| Neues Angebot/Bedarf, Thema oder allgemeine Kreisaktivität | **nur freiwillige Abonnenten** mit aktuellem Leserecht | abonnierte persönliche Hinweismeldung ohne Antwortpflicht |
+
+Die Aufzählung ist offen für spätere Ereignisarten, **nicht** für
+wahlloses Senden jeder Kartenbewegung, Ansicht, Änderung oder
+öffentlichen Aktivität. Die Regel lautet:
+**Direkte Betroffenheit/Adressierung → persönliche Nachricht;
+allgemeine Aktivität → Opt-in; rein technische Vorgänge → kein Postfach.**
+Ablehnung darf nicht still verschwinden; zugleich dürfen Sender und
+Empfänger nicht zu einem privaten Chat oder einer Antwort verpflichtet
+werden.
+
+**Bisherigen P3-Adressierungsvertrag erhalten:** Eine vorhandene
+Webungsaktion kann gezielt eine bestätigte Gemeinschaft oder einen
+anderen zulässigen Kreis ansprechen, **ohne** Knoten, Fäden oder
+Gespräche zu kopieren. Die Adressierung erweitert nie das Leserecht.
+Die zielgerichtete persönliche Nachricht entsteht nur für tatsächlich
+betroffene Konten; sonst werden aus dem zulässigen Kreis ausschließlich
+freiwillige Abonnenten benachrichtigt. Sichtbarkeit, Adressierung,
+Mitwirkung und Zustellung bleiben getrennte Entscheidungen.
+
+#### Technische Umsetzung – kleinster kompatibler Schnitt
+
+1. Bestehende Nachrichtendomäne `docs/specs/private-nachrichten.md`,
+   `/nachrichten`, `accountAttentionRuntime.ts`, Topbar-Ungelesen-
+   Projektion und transaktionale Outbox auf Erweiterbarkeit prüfen.
+   **Keine zweite Nachrichten-App, kein Haus-Feed, keine parallele
+   Wahrheitsdatenbank.** Der aktuelle `direct`-Vertrag ist auf zwei
+   menschliche Teilnehmer begrenzt: Ereignisse daher als klar
+   gekennzeichnete, **typisierte System-/Ereignisnachrichten** im selben
+   persönlichen Postfach darstellen; kein vorgetäuschter menschlicher
+   Absender und keine künstlich erzeugte 1:1-Konversation.
+2. Fachlicher Ereigniscommit und Nachrichtenauftrag atomar per bestehender
+   Outbox binden. Jede Kombination aus kanonischer Ereignis-ID, Empfänger
+   und Ereignisart erzeugt höchstens **eine** Postfachnachricht.
+   **Ein Beitritt erzeugt für jeden Empfänger höchstens eine
+   Ereignisnachricht**, auch wenn er zugleich Einladender und
+   bestehendes Mitglied ist; Tabellenzeilen für Annahme und neue
+   Mitgliedschaft sind keine zwei Zustellungen.
+   Einladungs-Retry, parallele Annahme/Ablehnung und wiederholte
+   Verarbeitung dürfen weder doppelte Nachrichten noch widersprüchliche
+   Aktionen erzeugen. Fehlende Postfachzustellung darf die fachliche
+   Mitgliedschaftstransaktion nicht verfälschen; Rückstände müssen
+   wiederauffindbar/nachlieferbar sein.
+3. Persistenter, accountgebundener Gelesen-Zustand; ungelesen bis zum
+   tatsächlichen Öffnen, keine automatische Lesebestätigung allein durch
+   Refresh. Bei Konto- oder Rollenwechsel private Projektionsdaten
+   verwerfen. Einladungs-Aktionsknöpfe rufen nur die vorhandene
+   autorisierte API auf, lesen danach Status frisch und bleiben nach
+   Ablehnung, Widerruf oder Annahme nicht fälschlich aktiv.
+   Eine abgelehnte letzte Einladung lässt keinen dauerhaft
+   fälschlich „wartenden“ Gründungsvorschlag stehen; dessen Zustand
+   wird aus der bestehenden Mitgliedschafts- und Kreis-Persistenz
+   eindeutig abgeleitet.
+4. **Zugriff bei Erzeugung, Anzeige, Navigation und optionalem Push
+   erneut prüfen.** Nach Austritt darf ein alter Nachrichtendirektlink
+   keinen früheren Knoten mehr öffnen. Wo berechtigte Historie gezeigt
+   werden darf, nur geeignete Status-/Akteurangaben; keine fremden
+   Knotentitel, Bewohnerlisten, IDs oder Metadaten in verbotenen
+   Projektionen. Servergesteuerte Systemnachrichten nicht durch
+   Benutzer-Blockieren, menschliche Senderlimits oder Nutzer-Imitation
+   erzeugen; Anti-Spam/Rate-Limits für Einladungsvorgänge separat
+   und verhältnismäßig halten.
+5. Bestehendes Briefsymbol zählt private Direktnachrichten **und**
+   persönliche Ereignisnachrichten genau einmal, ohne Doppelanzeige oder
+   Wechsel der Prioritätslogik. Eine unerledigte Einladung wird als
+   **Handlung möglich**, die Ablehnung/Annahme als **neue Information**
+   angezeigt, nicht als Antwortpflicht.
+6. Optionaler Web Push benutzt erst nach bewusster Konto- **und**
+   Gerätefreigabe den bisherigen Kanal mit neutralem Inhalt,
+   idempotenten Zustellbelegen und erneuter Autorisierung. Fehlgeschlagene
+   oder ausgeschaltete Push-Abonnements beeinflussen weder Postfach
+   noch den gespeicherten Vorgang. Vorher #2109 integrieren.
+
+**Fertig, wenn:** Einladung, Ablehnung, Annahme, Rücknahme, Eintritt
+und Austritt revisionsgebunden als echte, ungelesene persönliche
+Postfachnachrichten mit funktionierenden Aktionen und Topbar-Status
+geprüft sind; andere Konten sehen sie nicht. Ein bestätigter Beitritt
+erzeugt für ein zugleich einladendes Mitglied keine doppelte Nachricht;
+abgelehnte Gründungen bleiben nicht künstlich „wartend“.
+Die gezielte Adressierung einer Webungsaktion erweitert weder Leserechte
+noch kopiert sie Objekte. Zusätzlich erhält ein
+berechtigtes Mitglied eine abonnierte Ressourcenmeldung, während
+Nichtmitglied, ehemaliges Mitglied, nicht abonnierter Empfänger und
+ausgeschaltetes Gerät keine unzulässigen Hinweise bekommen.
+Vollständige PostgreSQL/API- und Browserregression einschließlich
+echter Mehrkonten-Produktion und physischem iPad-Safari; Push-Ausfall
+lässt das Postfach funktionsfähig.
 
 ### P4 – Gleiche Reichweite auf großer Karte
 
@@ -390,12 +562,24 @@ tatsächlichen Browserpfad; mindestens:
 5. `hidden`/`revoked` bleiben geschlossen; unveränderte Altobjekte
    behalten ihre ursprüngliche Sichtbarkeit, private Altobjekte
    werden nicht migriert/offengelegt.
-6. Benachrichtigung nur nach Opt-in und Rechteprüfung, kein
-   sensibler Payload, kein Dubletten-Push bei Retry. Gerät aus,
-   Mitglied aus, Push-Provider down: keine unerlaubte Zustellung,
+6. A lädt B ein: die Einladung erscheint sofort als **persönliche,
+   ungelesene Nachricht** in `/nachrichten` und der Topbar.
+   B nimmt aus der Nachricht an oder lehnt ab; A bekommt jeweils
+   genau eine verständliche persönliche Ergebnisnachricht. Ein
+   Wiederholen erzeugt keine Dublette. Rücknahme und Austritt
+   korrigieren Einladungsstatus und Direktlinks.
+7. C wird später aufgenommen: vorhandene Mitglieder sehen die
+   Aufnahme als persönliche Nachricht. Explizit prüfen, welche
+   bisherigen Hausinhalte C nach vereinbarter Bestandsfreigabe
+   lesen darf. Ein fehlerhafter Beitritt muss wirksam korrigierbar sein.
+8. Persönliche Nachrichten sind **ohne Push-Opt-in** abrufbar,
+   abonniertes allgemeines Ressourcengeschehen dagegen nur nach
+   Opt-in und aktueller Rechteprüfung; kein sensibler Push-Payload,
+   kein Dubletten-Push bei Retry. Gerät aus, Mitglied aus,
+   Push-Provider down: keine unerlaubte Zustellung,
    keine verlorene kanonische Webungsaktion.
-7. Safari auf physischem iPad (Mitgliedschaft, Bearbeitung,
-   Sichtbarkeit, Push-Freigabe und Seitenneuladen) sowie
+9. Safari auf physischem iPad (Mitgliedschaft, Postfach, Ablehnung,
+   Bearbeitung, Sichtbarkeit, Push-Freigabe und Seitenneuladen) sowie
    repräsentativer Desktop- und Tastaturfluss. Automatischer
    Touch-Browser-Test ersetzt diese Abnahme **nicht**.
 
@@ -415,15 +599,19 @@ bei Rückfall niemals öffentlich projizieren.
 | P1 | Bestätigte stabile Hausmitgliedschaft am bestehenden Kartenstapel | Ja |
 | P2 | Ein vorhandener Knoten mit „Nur Hausgemeinschaft“ auf **allen** Lesewegen | Ja: erster konkreter Nutzwert |
 | P2b | Einzelne bestehende Garnrollen-Ressourcen mit demselben Leserecht | Ja |
-| P3 | Abonnement + zulässige In-App-/optionale Push-Hinweise | Ja |
+| P1-Nachtrag | Einladungen/Annahmen/Ablehnungen als persönliche Nachrichten im vorhandenen Postfach | Ja: unmittelbarer sozialer Nutzerweg |
+| P2-Nachtrag | Aufnahme- und Bestandsfreigaberegel, authentifizierte Mehrkontenabnahme, Karten-UX | Ja: kontrollierbarer echter Nutzerweg |
+| P3 | Weitere personenbezogene Ereignisse, abonnierte Ressourcenhinweise und optionaler Push | Ja |
 | P4 | Dieselbe Policy für weitere Kreise und öffentliche räumliche Adressierung | Ja |
 
 Pro Schnitt: kleinster kohärenter Diff, DB/API/UI-Tests und negative
 Berechtigungstests, tatsächliche Deploy-Revisionsidentität und manueller
 Nutzerweg. Kein künstlicher PR-Stack, wenn ein kleiner Schnitt bereits
 abgenommen werden kann. P2b nutzt dieselbe Policy und gehört zum gewünschten Ressourcenfall.
-Erst nach sichtbarem Nutzen von P2/P2b die Benachrichtigungs- und
-Reichweitenphase priorisieren.
+Persönliche Nachrichten über Einladungen, Ablehnungen und Annahmen
+sind **unmittelbarer Bestandteil der Hausgemeinschaft**, nicht ein
+optionales spätes Push-Feature. Größere Reichweite, abonnierbare
+Aktivitätsströme und zusätzlicher Push folgen erst danach.
 
 **Kanonisierung:** Dieses Papier ist bewusst ein **Blueprint**. Bevor
 ein neuer Berechtigungszustand produktiv eingeführt wird, den

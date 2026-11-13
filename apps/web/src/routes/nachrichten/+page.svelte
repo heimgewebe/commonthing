@@ -16,6 +16,7 @@
     type DirectConversation,
   } from "$lib/api/directMessages";
   import "$lib/styles/page-system.css";
+  import PersonalEventsInbox from "$lib/components/PersonalEventsInbox.svelte";
 
   let conversations: DirectConversation[] = $state([]);
   let selected: DirectConversation | null = $state(null);
@@ -274,7 +275,7 @@
   <title>Nachrichten · commonThing</title>
   <meta
     name="description"
-    content="Private Nachrichten zwischen zwei angemeldeten commonThing-Konten."
+    content="Private Gespräche und persönliche Nachrichten über Hausgemeinschaften in commonThing."
   />
 </svelte:head>
 
@@ -295,8 +296,9 @@
     </section>
   {:else}
     <p class="privacy-note">
-      Nur die beiden beteiligten Konten können diese Unterhaltung öffnen. Die
-      Nachrichten sind jedoch nicht Ende-zu-Ende verschlüsselt.
+      Private Unterhaltungen gehören nur den beteiligten Konten; persönliche
+      Systemnachrichten nur ihrem Empfänger. Nachrichten sind nicht Ende-zu-Ende
+      verschlüsselt.
     </p>
 
     <div class="message-settings">
@@ -321,12 +323,14 @@
           </button>
         </div>
 
+        <PersonalEventsInbox />
+
         {#if loadingInbox}
           <p class="muted">Lade Unterhaltungen…</p>
         {:else if conversations.length === 0}
           <p class="muted">
-            Noch keine Unterhaltung. Öffne eine Garnrolle auf der Karte und
-            wähle „Private Nachricht“.
+            Noch keine private Unterhaltung. Öffne eine Garnrolle auf der Karte
+            und wähle „Private Nachricht“.
           </p>
         {:else}
           <ul class="conversation-list">

@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://weltgewebe.org/schemas/domain/message.schema.json",
   "title": "Message",
-  "description": "A single message within a conversation.",
+  "description": "A canonical human or system message. System circle events belong to an account_event conversation and carry their typed kind in domain_personal_event_messages, not as a fictitious human direct chat.",
   "type": "object",
   "properties": {
     "id": {
@@ -14,6 +14,7 @@
       "format": "uuid"
     },
     "author_account_id": {
+      "description": "NULL for system-created messages or deleted human authors; never fabricate a person for an automatic event.",
       "type": ["string", "null"]
     },
     "author_title": {
@@ -51,16 +52,16 @@
   "allOf": [
     {
       "if": {
-        "properties": {"deleted_at": {"type": "null"}},
+        "properties": { "deleted_at": { "type": "null" } },
         "required": ["deleted_at"]
       },
       "then": {
         "properties": {
-          "content": {"type": "string", "minLength": 1, "maxLength": 4000}
+          "content": { "type": "string", "minLength": 1, "maxLength": 4000 }
         }
       },
       "else": {
-        "properties": {"content": {"type": "null"}}
+        "properties": { "content": { "type": "null" } }
       }
     }
   ]

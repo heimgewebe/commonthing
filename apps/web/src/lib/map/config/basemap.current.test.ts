@@ -42,8 +42,8 @@ describe("resolveBasemapInitialView", () => {
   it("uses a neutral Germany view for the nationwide sovereign basemap", () => {
     expect(resolveBasemapInitialView("local-sovereign", "germany")).toEqual({
       center: [10.4515, 51.1657],
-      zoom: 7,
-      minZoom: 7,
+      zoom: 5,
+      minZoom: 5,
     });
     expect(
       resolveBasemapInitialView("local-sovereign", "germany").center,
