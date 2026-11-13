@@ -111,6 +111,20 @@ WOOL_TEXT_FINER_FONT_SPECS = {
         "size": 448932,
     },
 }
+# Additional finer text glyphs are an exact, complete replacement pair.
+# Their source, RGB and glyph metrics remain fixed; no generic WOFF admission.
+WOOL_TEXT_FINEST_FONT_SPECS = {
+    "apps/web/static/fonts/garnschrift-c-text-dark.woff": {
+        "blob_sha": "3071036210134188314045b94d227102dd2adc64",
+        "sha256": "cc5216bfcfa22537c4f0f7ede840af4558cdf02d216b1cf0050de10c1b48e42b",
+        "size": 430408,
+    },
+    "apps/web/static/fonts/garnschrift-c-text-light.woff": {
+        "blob_sha": "766e44785350063f1d554fb98da6493ddb6bff3c",
+        "sha256": "dc0d5292b6ee71867b5dfb4c11d2b4c2ad259eb85a5f4238fff99057c3d8ea40",
+        "size": 465684,
+    },
+}
 RISK_ORDER = {"R0": 0, "R1": 1, "R2": 2, "R3": 3}
 REQUIRED_REVIEWS = {"R0": 0, "R1": 1, "R2": 2, "R3": 2}
 AUTHORIZED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
@@ -873,7 +887,7 @@ def _materialized_metadata(path: Path) -> tuple[int, str, str, str, DiffStats]:
                 exact_specs = next(
                     (
                         specs
-                        for specs in (WOOL_TEXT_FONT_SPECS, WOOL_TEXT_FINER_FONT_SPECS)
+                        for specs in (WOOL_TEXT_FONT_SPECS, WOOL_TEXT_FINER_FONT_SPECS, WOOL_TEXT_FINEST_FONT_SPECS)
                         if all(
                             entry["blob_sha"] == specs[entry["path"]]["blob_sha"]
                             for entry in wool_proofs

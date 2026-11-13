@@ -304,6 +304,17 @@ jobs:
             wool_light_spec="${wool_light}|"
             wool_light_spec+='135f95506f756786ba6ae657971ed685b3eb80ab|'
             wool_light_spec+='e16c9e1baae88bd56f46fbe97337991311e0a1cdcb7002a229deeb6613532f9e|399024'
+          elif jq -e --arg dark "${wool_text_dark}" --arg light "${wool_text_light}" --arg dark_blob '3071036210134188314045b94d227102dd2adc64' --arg light_blob '766e44785350063f1d554fb98da6493ddb6bff3c' '
+            any(.[]; .filename == $dark and .status == "modified" and .sha == $dark_blob) and
+            any(.[]; .filename == $light and .status == "modified" and .sha == $light_blob)
+          ' "${RUNNER_TEMP}/files.json" >/dev/null; then
+            wool_mode='modified'
+            wool_dark_spec="${wool_text_dark}|"
+            wool_dark_spec+='3071036210134188314045b94d227102dd2adc64|'
+            wool_dark_spec+='cc5216bfcfa22537c4f0f7ede840af4558cdf02d216b1cf0050de10c1b48e42b|430408'
+            wool_light_spec="${wool_text_light}|"
+            wool_light_spec+='766e44785350063f1d554fb98da6493ddb6bff3c|'
+            wool_light_spec+='dc0d5292b6ee71867b5dfb4c11d2b4c2ad259eb85a5f4238fff99057c3d8ea40|465684'
           elif jq -e --arg dark "${wool_text_dark}" --arg light "${wool_text_light}" '
             any(.[]; .filename == $dark and .status == "modified") and
             any(.[]; .filename == $light and .status == "modified")
