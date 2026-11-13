@@ -145,7 +145,8 @@ export async function mockApiResponses(
   let nextNodeId = 1;
   let nextEdgeId = 1;
 
-  await page.route("**/api/**", async (route) => {
+  // Only REST /api routes; Vite's /src/lib/api/*.ts imports are scripts.
+  await page.route(/^https?:\/\/[^/]+\/api\//, async (route) => {
     const url = route.request().url();
     const method = route.request().method();
 
