@@ -7,6 +7,8 @@ After=network-online.target docker.service
 [Service]
 Type=oneshot
 ExecStart=/usr/local/libexec/weltgewebe-reconcile-production-main
+# 76 is an explicit waiting-for-approval result, not a failed deployment.
+SuccessExitStatus=76
 EnvironmentFile=-/etc/weltgewebe/production-reconciler.env
 UMask=0077
 TimeoutStartSec=7200

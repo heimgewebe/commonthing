@@ -278,6 +278,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--preflight", action="store_true")
+    mode.add_argument("--approved-commit", action="store_true")
     mode.add_argument("--commit")
     parser.add_argument("--image-digest")
     parser.add_argument("--source-repository")
@@ -297,14 +298,19 @@ def main(argv: list[str] | None = None) -> int:
         if (locked_digest is not None and args.image_digest is not None
                 and locked_digest != args.image_digest):
             raise HoldReleaseError("provided OCI digest differs from the exact source commit")
-        read_authorization(
+        authorization = read_authorization(
             expected_commit=args.commit,
             expected_image=locked_digest or args.image_digest,
         )
     except HoldReleaseError as exc:
         print(f"production_hold_release=blocked: {exc}", file=sys.stderr)
         return 1
-    print("production_hold_release=verified")
+    if args.approved_commit:
+        # Commit-only projection of the same root-owned, receipt-validated HOLD.
+        # Never return its internal recovery references or approval metadata.
+        print(authorization["commit"])
+    else:
+        print("production_hold_release=verified")
     return 0
 
 
