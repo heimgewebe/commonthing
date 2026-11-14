@@ -1813,6 +1813,70 @@ async fn t006_search_api_against_postgres_projections() {
             "public",
             vec![1.0],
         ),
+        (
+            "t006-literal-percent",
+            "place",
+            "PrefixPct%Suffix",
+            "{}",
+            "public",
+            vec![1.0, -1.0],
+        ),
+        (
+            "t006-literal-percent-decoy",
+            "place",
+            "PrefixPctXSuffix",
+            "{}",
+            "public",
+            vec![1.0, -1.0],
+        ),
+        (
+            "t006-literal-underscore",
+            "place",
+            "PrefixUnd_Suffix",
+            "{}",
+            "public",
+            vec![1.0, -1.0],
+        ),
+        (
+            "t006-literal-underscore-decoy",
+            "place",
+            "PrefixUndXSuffix",
+            "{}",
+            "public",
+            vec![1.0, -1.0],
+        ),
+        (
+            "t006-literal-backslash",
+            "place",
+            r"PrefixSlash\Suffix",
+            "{}",
+            "public",
+            vec![1.0, -1.0],
+        ),
+        (
+            "t006-literal-backslash-decoy",
+            "place",
+            "PrefixSlashXSuffix",
+            "{}",
+            "public",
+            vec![1.0, -1.0],
+        ),
+        (
+            "t006-literal-mixed",
+            "place",
+            r"PrefixMix%_\Suffix",
+            "{}",
+            "public",
+            vec![1.0, -1.0],
+        ),
+        (
+            "t006-literal-mixed-decoy",
+            "place",
+            "PrefixMixXYSuffix",
+            "{}",
+            "public",
+            vec![1.0, -1.0],
+        ),
     ];
 
     sqlx::query(
@@ -2112,6 +2176,51 @@ async fn t006_search_api_against_postgres_projections() {
             "query {wildcard_query:?} must not rank titles as literal prefix matches"
         );
     }
+
+    // Percent, underscore, backslash, and mixed forms must match only their
+    // literal prefixes. Each decoy would be a false rank-2 hit if LIKE
+    // metacharacters were interpreted rather than escaped.
+    for (literal_prefix, expected_id) in [
+        ("PrefixPct%", "t006-literal-percent"),
+        ("PrefixUnd_", "t006-literal-underscore"),
+        ("PrefixSlash\\", "t006-literal-backslash"),
+        ("PrefixMix%_\\", "t006-literal-mixed"),
+    ] {
+        let candidates =
+            fetch_postgres_candidates(&pool, literal_prefix, &SearchFilters::default(), &anonymous)
+                .await
+                .expect("fetch literal title-prefix candidates")
+                .expect("active T006 generation");
+        let prefix_ids = candidates
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.rank_class == 2)
+            .map(|candidate| candidate.node.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            prefix_ids,
+            vec![expected_id],
+            "query {literal_prefix:?} must match only the literal title prefix"
+        );
+    }
+
+    // Ordinary prefixes still match both titles, without changing rank class.
+    let ordinary =
+        fetch_postgres_candidates(&pool, "PrefixPct", &SearchFilters::default(), &anonymous)
+            .await
+            .expect("fetch ordinary title-prefix candidates")
+            .expect("active T006 generation");
+    let mut ordinary_ids = ordinary
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.rank_class == 2)
+        .map(|candidate| candidate.node.id.as_str())
+        .collect::<Vec<_>>();
+    ordinary_ids.sort_unstable();
+    assert_eq!(
+        ordinary_ids,
+        vec!["t006-literal-percent", "t006-literal-percent-decoy"]
+    );
 
     let saturated_window = fetch_postgres_candidates_for_generation(
         &pool,
