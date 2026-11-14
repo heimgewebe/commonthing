@@ -2,6 +2,7 @@
   import { createEventDispatcher } from "svelte";
   import FilterOverlay from "$lib/components/FilterOverlay.svelte";
   import SearchDirectionIndicators from "$lib/components/SearchDirectionIndicators.svelte";
+  import MapWelcome from "./MapWelcome.svelte";
   import ToolFan from "$lib/components/ToolFan.svelte";
   import type { NodeSearchStatus } from "$lib/api/search";
   import type { KnottingTopic } from "$lib/knottingTopics";
@@ -149,4 +150,5 @@
   totalCount={filterTotalCount}
   {allTopicsCount}
 />
+<MapWelcome />
 <ToolFan />
