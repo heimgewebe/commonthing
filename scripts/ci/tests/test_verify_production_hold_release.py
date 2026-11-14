@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -63,6 +66,18 @@ class HoldReleaseVerificationTests(unittest.TestCase):
         self.assertEqual(self.check()["commit"], COMMIT)
         self.assertEqual(self.check()["schaubild_image_digest"], IMAGE)
         self.assertEqual(self.check(commit=None, image=None)["kind"], verifier.KIND)
+
+    def test_root_validated_approved_commit_projection_exposes_only_sha(self) -> None:
+        approval = self.check(commit=None, image=None)
+        buffer = io.StringIO()
+        with mock.patch.object(verifier.os, "geteuid", return_value=0):
+            with mock.patch.object(verifier, "read_authorization", return_value=approval):
+                with redirect_stdout(buffer):
+                    result = verifier.main(["--approved-commit"])
+        self.assertEqual(result, 0)
+        self.assertEqual(buffer.getvalue(), COMMIT + "\n")
+        self.assertNotIn(IMAGE, buffer.getvalue())
+        self.assertNotIn("restic", buffer.getvalue())
 
     def test_genuine_recovery_only_release_needs_no_formal_ack_hashes(self) -> None:
         for key in verifier.OPTIONAL_RECEIPTS:
