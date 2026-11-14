@@ -1262,6 +1262,21 @@ async fn converted_tag_is_scoped_by_real_http_sessions_and_live_circle_departure
             p2b_http(&app, Method::GET, "/nodes?limit=100", cookie, None).await;
         assert_eq!(list_status, StatusCode::OK, "{label} list: {list}");
         assert_eq!(list.contains(node_id), can_read, "{label} node list");
+        // Even a confirmed circle member must never see a non-public
+        // resource through the explicit public-only discovery contract.
+        let (public_status, public_list) = p2b_http(
+            &app,
+            Method::GET,
+            "/nodes?public_only=true&limit=100",
+            cookie,
+            None,
+        )
+        .await;
+        assert_eq!(public_status, StatusCode::OK, "{label} public-only list");
+        assert!(
+            !public_list.contains(node_id),
+            "{label} public-only discovery exposed a private circle resource"
+        );
         let (account_status, account) =
             p2b_http(&app, Method::GET, &account_path, cookie, None).await;
         assert_eq!(account_status, StatusCode::OK, "{label} account");
@@ -1291,7 +1306,11 @@ async fn converted_tag_is_scoped_by_real_http_sessions_and_live_circle_departure
         StatusCode::NOT_FOUND,
         "former member direct link"
     );
-    for path in ["/nodes?limit=100", account_path.as_str()] {
+    for path in [
+        "/nodes?limit=100",
+        "/nodes?public_only=true&limit=100",
+        account_path.as_str(),
+    ] {
         let (status, body) = p2b_http(&app, Method::GET, path, Some(&member_cookie), None).await;
         assert_eq!(status, StatusCode::OK);
         assert!(!body.contains(title), "former member leaked via {path}");
