@@ -373,7 +373,7 @@ async fn private_owner_lifecycle_is_account_bound_redacted_and_recoverable() {
     assert_eq!(
         candidate_count_as(&pool, Some(&member)).await,
         0,
-        "the same session must lose private search candidates immediately after departure"
+        "the same account identity must lose private search candidates immediately after departure"
     );
     assert_eq!(
         owner_candidate_count(&pool).await,
