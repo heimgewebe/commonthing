@@ -42,6 +42,17 @@
       "format": "uuid",
       "description": "Immutable creator binding assigned by the server. Legacy or anonymized nodes may omit it or expose null."
     },
+    "search_visibility": {
+      "type": "string",
+      "enum": [
+        "public",
+        "private",
+        "hidden",
+        "revoked"
+      ],
+      "default": "public",
+      "description": "Server-owned read and search visibility. public: readable by everyone; private and hidden: readable only by the creator; revoked: not readable through ordinary API projections. Missing means public (legacy records)."
+    },
     "info": {
       "type": [
         "string",
