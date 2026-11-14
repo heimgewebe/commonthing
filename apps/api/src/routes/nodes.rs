@@ -4709,3 +4709,111 @@ mod node_delete_journal_tests {
         assert_no_transaction_files(&in_dir);
     }
 }
+
+#[cfg(test)]
+mod node_contract_wire_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn node_schema() -> Value {
+        serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../contracts/domain/node.schema.json"
+        )))
+        .expect("node schema must be valid JSON")
+    }
+
+    fn property_names(schema: &Value) -> BTreeSet<String> {
+        schema["properties"]
+            .as_object()
+            .expect("schema properties must be an object")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    fn fully_populated_node() -> Node {
+        Node {
+            id: "a6e1f3a4-7b4f-4d2a-9e6f-0a7b4f3a4b1e".to_string(),
+            kind: "place".to_string(),
+            title: "Marktplatz".to_string(),
+            created_at: "2024-01-15T10:00:00Z".to_string(),
+            updated_at: "2024-01-16T14:30:00Z".to_string(),
+            has_authoritative_created_at: true,
+            created_by_account_id: Some("b6a35f2c-dfd7-4c68-8b1b-31dd7a50d4f1".to_string()),
+            search_visibility: SearchVisibility::Private,
+            summary: Some("Kurz".to_string()),
+            info: Some("Lang".to_string()),
+            tags: vec!["geschichte".to_string()],
+            address: Some("Marktplatz 1".to_string()),
+            location: Some(Location {
+                lat: 48.1,
+                lon: 11.5,
+            }),
+        }
+    }
+
+    /// The schema sets `additionalProperties: false`, so every field the API
+    /// serialises for a node must be declared there. This failed before
+    /// `search_visibility` was added to the contract.
+    #[test]
+    fn serialized_node_fields_are_declared_in_the_contract() {
+        let schema = node_schema();
+        assert_eq!(schema["additionalProperties"], json!(false));
+        let declared = property_names(&schema);
+
+        let wire = serde_json::to_value(fully_populated_node()).expect("node serialises");
+        let emitted: BTreeSet<String> = wire
+            .as_object()
+            .expect("node serialises to an object")
+            .keys()
+            .cloned()
+            .collect();
+        let undeclared: Vec<_> = emitted.difference(&declared).collect();
+        assert!(
+            undeclared.is_empty(),
+            "node fields missing from node.schema.json: {undeclared:?}"
+        );
+
+        let location_declared = property_names(&schema["properties"]["location"]);
+        let location_emitted: BTreeSet<String> = wire["location"]
+            .as_object()
+            .expect("location serialises to an object")
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(location_emitted, location_declared);
+    }
+
+    #[test]
+    fn search_visibility_enum_matches_the_contract() {
+        let schema = node_schema();
+        let contract: BTreeSet<&str> = schema["properties"]["search_visibility"]["enum"]
+            .as_array()
+            .expect("search_visibility enum must be an array")
+            .iter()
+            .map(|value| value.as_str().expect("enum values are strings"))
+            .collect();
+        // Adding a variant breaks this match, so the list below cannot go stale.
+        match SearchVisibility::default() {
+            SearchVisibility::Public
+            | SearchVisibility::Private
+            | SearchVisibility::Hidden
+            | SearchVisibility::Revoked => {}
+        }
+        let api: BTreeSet<&str> = [
+            SearchVisibility::Public,
+            SearchVisibility::Private,
+            SearchVisibility::Hidden,
+            SearchVisibility::Revoked,
+        ]
+        .iter()
+        .map(SearchVisibility::as_str)
+        .collect();
+        assert_eq!(api, contract);
+        assert_eq!(
+            schema["properties"]["search_visibility"]["default"],
+            json!(SearchVisibility::default().as_str())
+        );
+    }
+}
