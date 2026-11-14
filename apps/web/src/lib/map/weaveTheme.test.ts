@@ -31,6 +31,19 @@ describe("weaveTopicDisplayLabel", () => {
     expect(familiesInBody).toBeGreaterThan(0);
   });
 
+  it("keeps labels at the limit and keeps long-in-code-units but short-in-graphemes labels whole", () => {
+    const atLimit = "a".repeat(WEAVE_TOPIC_DISPLAY_MAX_LENGTH);
+    expect(weaveTopicDisplayLabel(atLimit)).toBe(atLimit);
+    expect(weaveTopicDisplayLabel(`${atLimit}b`)).toBe(
+      `${"a".repeat(WEAVE_TOPIC_DISPLAY_MAX_LENGTH - 1)}…`,
+    );
+    // 10 family clusters: 10 graphemes, but far more than the limit in UTF-16
+    // units. The code-unit fast path must not shorten it.
+    const families = "👨‍👩‍👧‍👦".repeat(10);
+    expect(families.length).toBeGreaterThan(WEAVE_TOPIC_DISPLAY_MAX_LENGTH);
+    expect(weaveTopicDisplayLabel(families)).toBe(families);
+  });
+
   it("never feeds the shortened form into topic identity", () => {
     const long =
       "Nachbarschaftliche Lebensmittelversorgung Hamburg und Umgebung";

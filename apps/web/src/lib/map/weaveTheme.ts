@@ -61,24 +61,35 @@ function hash(value: string): number {
   return result >>> 0;
 }
 
-function countGraphemes(value: string): number {
-  if (typeof Intl !== "undefined" && "Segmenter" in Intl) {
-    return Array.from(
-      new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(value),
-    ).length;
+// One shared segmenter: constructing an Intl.Segmenter per call dominated the
+// weave projection (hundreds of ms per map load on a throttled mobile CPU).
+// `segment()` keeps no state between calls, so reuse is safe.
+let graphemeSegmenter: Intl.Segmenter | null | undefined;
+
+function getGraphemeSegmenter(): Intl.Segmenter | null {
+  if (graphemeSegmenter === undefined) {
+    graphemeSegmenter =
+      typeof Intl !== "undefined" && "Segmenter" in Intl
+        ? new Intl.Segmenter(undefined, { granularity: "grapheme" })
+        : null;
   }
+  return graphemeSegmenter;
+}
+
+function countGraphemes(value: string): number {
+  const segmenter = getGraphemeSegmenter();
+  if (segmenter) return Array.from(segmenter.segment(value)).length;
   // Fallback: code points, still safer than UTF-16 code units for astral text.
   return Array.from(value).length;
 }
 
 function takeGraphemes(value: string, maxGraphemes: number): string {
   if (maxGraphemes <= 0) return "";
-  if (typeof Intl !== "undefined" && "Segmenter" in Intl) {
+  const segmenter = getGraphemeSegmenter();
+  if (segmenter) {
     let taken = "";
     let count = 0;
-    for (const { segment } of new Intl.Segmenter(undefined, {
-      granularity: "grapheme",
-    }).segment(value)) {
+    for (const { segment } of segmenter.segment(value)) {
       if (count >= maxGraphemes) break;
       taken += segment;
       count += 1;
@@ -138,6 +149,9 @@ export function weaveTopicDisplayLabel(label: string): string {
       ? stripAllowlistedTechnicalNamespace(normalised)
       : controlledLabel;
   const display = withoutNoise || normalised;
+  // A grapheme spans at least one UTF-16 code unit, so a string that is short
+  // in code units is short in graphemes too; only longer labels are segmented.
+  if (display.length <= WEAVE_TOPIC_DISPLAY_MAX_LENGTH) return display;
   if (countGraphemes(display) <= WEAVE_TOPIC_DISPLAY_MAX_LENGTH) return display;
   const body = takeGraphemes(
     display,
