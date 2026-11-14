@@ -51,7 +51,7 @@
         "revoked"
       ],
       "default": "public",
-      "description": "Server-owned read and search visibility. public: readable by everyone; private and hidden: readable only by the creator; revoked: not readable through ordinary API projections. Missing means public (legacy records)."
+      "description": "Server-owned read and search visibility (see docs/specs/garnrolle-knoten-faden.md). public: readable by everyone; private: readable by the creator and by active members of circles with an explicit node grant, while the creator account is active; hidden: readable only by the creator and excluded from semantic search; revoked: not readable through ordinary API projections, not even by the creator. Nodes without a creator binding grant no presumed owner access. Missing means public (legacy records)."
     },
     "info": {
       "type": [
