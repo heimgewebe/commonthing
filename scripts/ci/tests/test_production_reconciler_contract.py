@@ -1172,6 +1172,29 @@ prune_releases
                     self.assertNotEqual(denied.returncode, 0)
                     self.assertIn("Git metadata contains a symlink", denied.stderr)
 
+    def test_unapproved_newer_main_is_pending_before_any_deploy_side_effect(self) -> None:
+        reconciler = self.read("scripts/ops/reconcile-production-main-vps.sh")
+        checker = self.read("scripts/ops/verify_production_hold_release.py")
+        unit = self.read("infra/systemd/system/weltgewebe-production-reconcile.service")
+        self.assertIn("readonly EXIT_APPROVAL_PENDING=76", reconciler)
+        self.assertIn("SuccessExitStatus=76", unit)
+        self.assertIn('mode.add_argument("--approved-commit", action="store_true")', checker)
+        self.assertIn('print(authorization["commit"])', checker)
+        self.assertIn("production_reconcile=awaiting_approval", reconciler)
+        self.assertIn("no_deploy_effects=true", reconciler)
+        self.assertLess(
+            reconciler.index('python3 -I "$AUTHORIZER" --preflight'),
+            reconciler.index('python3 -I "$AUTHORIZER" --approved-commit'),
+        )
+        self.assertLess(
+            reconciler.index('exit "$EXIT_APPROVAL_PENDING"'),
+            reconciler.index('install -d -o root -g root -m 0711 "$STATE_ROOT"'),
+        )
+        self.assertLess(
+            reconciler.index('exit "$EXIT_APPROVAL_PENDING"'),
+            reconciler.index('target_commit="$(fetch_main)"'),
+        )
+
     def test_oci_grant_is_bound_before_all_root_side_effects(self) -> None:
         installer = self.read("scripts/ops/install-production-reconciler.sh")
         activator = self.read("scripts/ops/activate-production-reconciler-from-release.sh")

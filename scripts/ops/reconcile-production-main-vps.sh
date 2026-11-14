@@ -30,6 +30,7 @@ readonly PRODUCTION_LOCK_DOMAIN="weltgewebe-production-deployment-v1"
 readonly PRODUCTION_LOCK_FILE="$STATE_ROOT/production-deployment.lock"
 readonly PRODUCTION_LOCK_FD=9
 readonly EX_TEMPFAIL=75
+readonly EXIT_APPROVAL_PENDING=76
 readonly EXIT_SUPERSEDED_AFTER_MIGRATION=79
 readonly EXIT_SUPERSEDED_AFTER_DEPLOY=80
 ARTIFACT_ROOT="$STATE_ROOT/artifacts"
@@ -1601,8 +1602,24 @@ preflight_main="$(git -C "$SOURCE_CHECKOUT" ls-remote --exit-code origin refs/he
   fail "cannot determine exact remote main before reconciliation"
 [[ "$preflight_main" =~ ^[0-9a-f]{40}$ ]] ||
   fail "preflight remote main is invalid"
-python3 -I "$AUTHORIZER" --commit "$preflight_main" ||
-  fail "production HOLD authorization does not cover live remote main"
+# An unapproved newer main must not poison the scheduler while the previous
+# independently approved release remains untouched. Exit 76 is treated as a
+# non-failed, explicitly pending result by the systemd unit; it is NOT a
+# successful deployment and does not create state, Git refs or Docker effects.
+# Any malformed/withdrawn HOLD remains fatal through the preceding --preflight.
+approval_error=""
+if ! approval_error="$(python3 -I "$AUTHORIZER" --commit "$preflight_main" 2>&1)"; then
+  approved_commit="$(python3 -I "$AUTHORIZER" --approved-commit)" ||
+    fail "production HOLD approval could not be revalidated"
+  [[ "$approved_commit" =~ ^[0-9a-f]{40}$ ]] ||
+    fail "production HOLD approved commit projection is invalid"
+  if [[ "$approved_commit" == "$preflight_main" ]]; then
+    printf '%s\n' "$approval_error" >&2
+    fail "production HOLD rejected its own approved commit"
+  fi
+  echo "production_reconcile=awaiting_approval approved=$approved_commit remote=$preflight_main no_deploy_effects=true"
+  exit "$EXIT_APPROVAL_PENDING"
+fi
 # Admission must bind the OCI digest from immutable source bytes before
 # shared state directories, tracking refs, timers, locks or Docker effects.
 # A new main may require a bounded object-only fetch. It must not write

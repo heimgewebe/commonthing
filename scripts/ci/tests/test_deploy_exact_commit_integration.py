@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 from datetime import datetime, timezone
 import json
 import os
@@ -537,9 +536,15 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
             json.dumps({"commit": self.commit, "version": self.commit[:8]}) + "\n",
             encoding="utf-8",
         )
-        germany_style_sha = hashlib.sha256(
-            (self.source / "map-style/style-germany.json").read_bytes()
-        ).hexdigest()
+        # The source checkout is intentionally root-owned after fixture setup.
+        # Hash it through the test's existing scoped sudo reader instead of
+        # bypassing the ownership boundary or copying the protected file.
+        germany_style_sha = run(
+            self.privileged([
+                "sha256sum", str(self.source / "map-style/style-germany.json")
+            ])
+        ).stdout.split()[0]
+        self.assertRegex(germany_style_sha, r"^[0-9a-f]{64}$")
         if basemap_variant == "germany":
             identity = {
                 "schema_version": 1,
@@ -563,7 +568,11 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
         (tree / "_app/basemap-build.json").write_text(
             json.dumps(identity, sort_keys=True) + "\n", encoding="utf-8"
         )
-        self.artifact.parent.mkdir(parents=True, exist_ok=True)
+        # Artifact storage is also deliberately root-owned in this fixture.
+        run(self.privileged([
+            "install", "-d", "-o", "root", "-g", "root", "-m", "0700",
+            str(self.artifact.parent),
+        ]))
         staged_artifact = self.root / "web-artifact-staging.tar.gz"
         with tarfile.open(staged_artifact, "w:gz") as bundle:
             bundle.add(tree, arcname="build")
@@ -1350,7 +1359,15 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
                     deploy_helper=self.test_deploy_script
                 )
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn("production_hold_release=blocked:", result.stderr)
+                if case == "wrong_commit":
+                    # A valid but different HOLD is a pending release, not a
+                    # failed production deployment or authorization bypass.
+                    self.assertEqual(result.returncode, 76)
+                    self.assertIn("production_reconcile=awaiting_approval", result.stdout)
+                    self.assertIn("no_deploy_effects=true", result.stdout)
+                    self.assertNotIn("production_hold_release=blocked:", result.stderr)
+                else:
+                    self.assertIn("production_hold_release=blocked:", result.stderr)
                 if case == "wrong_digest":
                     self.assertIn("Schaubild OCI digest differs", result.stderr)
                 self.assertFalse((self.root / "weltgewebe-up.log").exists())
