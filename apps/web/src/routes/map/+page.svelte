@@ -1245,23 +1245,16 @@
   // derivations live as pure functions in `$lib/stores/mapView` and are fed the
   // scene together with the ephemeral UI state (filters, search).
   let sceneNodes = $derived.by(() => {
-    let nodes: Node[];
-    if (data.nodeLoadMode !== "viewport") {
-      nodes = data.nodes || [];
-    } else {
-      const byId = new Map<string, Node>();
-      for (const node of viewportNodes) byId.set(node.id, node);
-      // Route data contains at most the exact deep-link node in viewport mode.
-      // Keep that bootstrap anchor only until a successful bbox response includes
-      // it; otherwise an offscreen deep link would become a permanent scene leak.
-      if (!viewportBootstrapReleased) {
-        for (const node of data.nodes || []) byId.set(node.id, node);
-      }
-      nodes = Array.from(byId.values());
+    if (data.nodeLoadMode !== "viewport") return data.nodes || [];
+    const byId = new Map<string, Node>();
+    for (const node of viewportNodes) byId.set(node.id, node);
+    // Route data contains at most the exact deep-link node in viewport mode.
+    // Keep that bootstrap anchor only until a successful bbox response includes
+    // it; otherwise an offscreen deep link would become a permanent scene leak.
+    if (!viewportBootstrapReleased) {
+      for (const node of data.nodes || []) byId.set(node.id, node);
     }
-    return removedNodeIds.size
-      ? nodes.filter((node) => !removedNodeIds.has(node.id))
-      : nodes;
+    return Array.from(byId.values());
   });
   let effectiveResourceStatus = $derived.by(() => {
     const statuses = data.resourceStatus ?? [];
@@ -1276,7 +1269,12 @@
   );
   let scene = $derived.by(() =>
     buildMapScene({
-      nodes: applyNodeUpdateOverrides(sceneNodes, nodeUpdateOverrides),
+      nodes: applyNodeUpdateOverrides(
+        removedNodeIds.size
+          ? sceneNodes.filter((node) => !removedNodeIds.has(node.id))
+          : sceneNodes,
+        nodeUpdateOverrides,
+      ),
       accounts: data.accounts || [],
       edges: removedNodeIds.size
         ? (data.edges || []).filter((edge) => !removedEdgeIds.has(edge.id))
