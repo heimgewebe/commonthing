@@ -126,6 +126,11 @@
   let { data }: Props = $props();
 
   let nodeUpdateOverrides: Record<string, Node> = $state({});
+  // A successful DELETE reports the canonical node/edge cascade in its receipt.
+  // Local tombstones also hide late viewport responses until navigation.
+  let removedNodeIds: ReadonlySet<string> = $state(new Set<string>());
+  // Edge IDs are authoritative; the node tombstone triggers the reactive scene.
+  const removedEdgeIds = new Set<string>();
 
   // T007: node search comes from the authorized T006 server contract. Public
   // non-node structures (Garnrollen and Webgemeindezentren) are searched only
@@ -518,6 +523,17 @@
         ...nodeUpdateOverrides,
         [resolution.node.id]: resolution.node,
       };
+      return;
+    }
+
+    if (resolution.kind === "local-node-removal") {
+      // The resolver can return this case only for the receipt-bearing DELETE event.
+      for (const id of (
+        event.detail as { receipt: { removed_edge_ids: string[] } }
+      ).receipt.removed_edge_ids)
+        removedEdgeIds.add(id);
+      removedNodeIds = new Set(removedNodeIds).add(resolution.id);
+      if (event.detail.action === "deleted") leaveToNavigation();
       return;
     }
 
@@ -1229,16 +1245,23 @@
   // derivations live as pure functions in `$lib/stores/mapView` and are fed the
   // scene together with the ephemeral UI state (filters, search).
   let sceneNodes = $derived.by(() => {
-    if (data.nodeLoadMode !== "viewport") return data.nodes || [];
-    const byId = new Map<string, Node>();
-    for (const node of viewportNodes) byId.set(node.id, node);
-    // Route data contains at most the exact deep-link node in viewport mode.
-    // Keep that bootstrap anchor only until a successful bbox response includes
-    // it; otherwise an offscreen deep link would become a permanent scene leak.
-    if (!viewportBootstrapReleased) {
-      for (const node of data.nodes || []) byId.set(node.id, node);
+    let nodes: Node[];
+    if (data.nodeLoadMode !== "viewport") {
+      nodes = data.nodes || [];
+    } else {
+      const byId = new Map<string, Node>();
+      for (const node of viewportNodes) byId.set(node.id, node);
+      // Route data contains at most the exact deep-link node in viewport mode.
+      // Keep that bootstrap anchor only until a successful bbox response includes
+      // it; otherwise an offscreen deep link would become a permanent scene leak.
+      if (!viewportBootstrapReleased) {
+        for (const node of data.nodes || []) byId.set(node.id, node);
+      }
+      nodes = Array.from(byId.values());
     }
-    return Array.from(byId.values());
+    return removedNodeIds.size
+      ? nodes.filter((node) => !removedNodeIds.has(node.id))
+      : nodes;
   });
   let effectiveResourceStatus = $derived.by(() => {
     const statuses = data.resourceStatus ?? [];
@@ -1255,7 +1278,9 @@
     buildMapScene({
       nodes: applyNodeUpdateOverrides(sceneNodes, nodeUpdateOverrides),
       accounts: data.accounts || [],
-      edges: data.edges || [],
+      edges: removedNodeIds.size
+        ? (data.edges || []).filter((edge) => !removedEdgeIds.has(edge.id))
+        : data.edges || [],
       webgemeindezentren: data.webgemeindezentren || [],
       loadState: resourceSummary.loadState,
       resourceStatus: effectiveResourceStatus,
@@ -1314,7 +1339,10 @@
   );
   let filteredNodeSearchItems = $derived.by(
     () =>
-      evaluateMapContentFilters(nodeSearchItems, $mapContentFilters).entities,
+      evaluateMapContentFilters(
+        nodeSearchItems.filter((item) => !removedNodeIds.has(item.id)),
+        $mapContentFilters,
+      ).entities,
   );
   let filteredResults = $derived.by(() => [
     ...filteredNodeSearchItems,

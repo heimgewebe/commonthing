@@ -36,15 +36,51 @@ describe("resolveMapDomainChange", () => {
   });
 
   it.each(["deleted", "archived"] as const)(
-    "keeps %s on the authoritative reload path",
+    "uses the canonical cascade receipt for a local %s",
     (action) => {
+      const receipt = {
+        node_id: node.id,
+        node_state: "removed" as const,
+        removed_edge_ids: ["edge-1", "edge-2"],
+        conversation:
+          action === "archived"
+            ? {
+                effect: "archived" as const,
+                archive_id: "archive-1",
+                archive_url: "/api/conversations/archive-1",
+              }
+            : { effect: "deleted_empty" as const },
+      };
       expect(
-        resolveMapDomainChange({
-          kind: "node",
-          id: node.id,
-          action,
-        }),
-      ).toEqual({ kind: "reload-domain-data" });
+        resolveMapDomainChange({ kind: "node", id: node.id, action, receipt }),
+      ).toEqual({ kind: "local-node-removal", id: node.id });
     },
   );
+
+  it("reloads for absent, mismatched or unsupported delete receipts", () => {
+    const receipt = {
+      node_id: node.id,
+      node_state: "removed" as const,
+      removed_edge_ids: ["edge-1"],
+      conversation: { effect: "deleted_empty" as const },
+    };
+    expect(
+      resolveMapDomainChange({ kind: "node", id: node.id, action: "deleted" }),
+    ).toEqual({ kind: "reload-domain-data" });
+    expect(
+      resolveMapDomainChange({
+        kind: "node",
+        id: "another-node",
+        action: "deleted",
+        receipt,
+      }),
+    ).toEqual({ kind: "reload-domain-data" });
+    expect(
+      resolveMapDomainChange({
+        kind: "node",
+        id: node.id,
+        action: "visibility_changed",
+      }),
+    ).toEqual({ kind: "reload-domain-data" });
+  });
 });

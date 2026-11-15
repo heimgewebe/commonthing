@@ -292,7 +292,7 @@
         archiveHref = `/archive?id=${encodeURIComponent(receipt.conversation.archive_id)}`;
         action = "archived";
       }
-      dispatch("domainChanged", { kind: "node", id, action });
+      dispatch("domainChanged", { kind: "node", id, action, receipt });
     } catch (error) {
       if (
         error instanceof ApiRequestError &&
