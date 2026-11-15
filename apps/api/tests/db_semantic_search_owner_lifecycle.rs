@@ -192,6 +192,23 @@ async fn owner_candidate_count(pool: &PgPool) -> usize {
     .len()
 }
 
+/// The real candidate SQL must use live account/circle authority for each call.
+async fn candidate_count_as(pool: &PgPool, account: Option<&str>) -> usize {
+    let auth = AuthContext {
+        authenticated: account.is_some(),
+        account_id: account.map(str::to_owned),
+        device_id: None,
+        role: Role::Gast,
+        expires_at: None,
+    };
+    fetch_postgres_candidates(pool, PRIVATE_TITLE, &SearchFilters::default(), &auth)
+        .await
+        .expect("query circle-authorized private candidates")
+        .expect("active search generation")
+        .candidates
+        .len()
+}
+
 async fn process_one(projection_worker: &ProjectionWorker) {
     assert_eq!(
         projection_worker
@@ -260,6 +277,127 @@ async fn private_owner_lifecycle_is_account_bound_redacted_and_recoverable() {
     assert_eq!(active_owner.source_version, 2);
     assert_private(&active_owner);
     assert_eq!(owner_candidate_count(&pool).await, 1);
+
+    // A private projection is stored with owner-only visibility_scopes, but
+    // circle membership may authorize its lexical candidate through the
+    // canonical live SQL ACL. Invitations, location and a previous grant
+    // must never supply search authority.
+    let member = format!("t012-search-member-{}", uuid::Uuid::new_v4());
+    let stranger = format!("t012-search-stranger-{}", uuid::Uuid::new_v4());
+    let circle = uuid::Uuid::new_v4();
+    for id in [&member, &stranger] {
+        sqlx::query("INSERT INTO domain_accounts(id,title,disabled) VALUES($1,$1,FALSE)")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("create independent search reader");
+    }
+    sqlx::query(
+        "INSERT INTO domain_audience_circles(id,kind,name,created_by_account_id)
+         VALUES($1,'household','T012 search membership proof',$2)",
+    )
+    .bind(circle)
+    .bind(OWNER_ID)
+    .execute(&pool)
+    .await
+    .expect("form test circle");
+    sqlx::query(
+        "INSERT INTO domain_audience_circle_members
+           (circle_id,account_id,status,joined_at,invited_by_account_id)
+         VALUES ($1,$2,'active',NOW(),$2),($1,$3,'invited',NULL,$2)",
+    )
+    .bind(circle)
+    .bind(OWNER_ID)
+    .bind(&member)
+    .execute(&pool)
+    .await
+    .expect("owner and invited member");
+    sqlx::query("INSERT INTO domain_node_circle_grants(node_id,circle_id) VALUES($1,$2)")
+        .bind(NODE_ID)
+        .bind(circle)
+        .execute(&pool)
+        .await
+        .expect("explicit owner grant");
+    assert_eq!(
+        candidate_count_as(&pool, Some(&member)).await,
+        0,
+        "invitation is not access"
+    );
+    assert_eq!(
+        candidate_count_as(&pool, Some(&stranger)).await,
+        0,
+        "stranger is not a member"
+    );
+    assert_eq!(
+        candidate_count_as(&pool, None).await,
+        0,
+        "anonymous search stays private"
+    );
+
+    sqlx::query(
+        "UPDATE domain_audience_circle_members
+         SET status='active',joined_at=NOW() WHERE circle_id=$1 AND account_id=$2",
+    )
+    .bind(circle)
+    .bind(&member)
+    .execute(&pool)
+    .await
+    .expect("member confirms invitation");
+    sqlx::query("UPDATE domain_audience_circles SET state='active' WHERE id=$1")
+        .bind(circle)
+        .execute(&pool)
+        .await
+        .expect("activate confirmed circle");
+    assert_eq!(
+        candidate_count_as(&pool, Some(&member)).await,
+        1,
+        "confirmed member search"
+    );
+    assert_eq!(
+        candidate_count_as(&pool, Some(&stranger)).await,
+        0,
+        "stranger still denied"
+    );
+    assert_eq!(
+        candidate_count_as(&pool, None).await,
+        0,
+        "anonymous still denied"
+    );
+
+    sqlx::query("DELETE FROM domain_audience_circle_members WHERE circle_id=$1 AND account_id=$2")
+        .bind(circle)
+        .bind(&member)
+        .execute(&pool)
+        .await
+        .expect("confirmed member leaves circle");
+    assert_eq!(
+        candidate_count_as(&pool, Some(&member)).await,
+        0,
+        "the same account identity must lose private search candidates immediately after departure"
+    );
+    assert_eq!(
+        owner_candidate_count(&pool).await,
+        1,
+        "creator retains access after departure"
+    );
+
+    sqlx::query("DELETE FROM domain_node_circle_grants WHERE node_id=$1")
+        .bind(NODE_ID)
+        .execute(&pool)
+        .await
+        .expect("clean test grant");
+    sqlx::query("DELETE FROM domain_audience_circles WHERE id=$1")
+        .bind(circle)
+        .execute(&pool)
+        .await
+        .expect("clean test circle");
+    for id in [&member, &stranger] {
+        sqlx::query("DELETE FROM domain_accounts WHERE id=$1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("clean disposable test reader");
+    }
 
     // Prove the account-row lock against the dangerous race: a new private
     // projection is inserted but not committed yet while another connection
