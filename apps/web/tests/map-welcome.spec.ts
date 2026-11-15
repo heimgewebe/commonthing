@@ -121,6 +121,9 @@ test("deep-linked search has priority over the introduction", async ({
   await page.goto("/map?lens=search");
   await expect(page.getByTestId("search-overlay")).toBeVisible();
   await expect(page.getByTestId("map-welcome")).toHaveCount(0);
+  expect(await page.evaluate((k) => localStorage.getItem(k), key)).toBeNull();
+  await page.goto("/map");
+  await expect(page.getByTestId("map-welcome")).toBeVisible();
 });
 
 test("anonymous offering reaches the real login page", async ({ page }) => {
