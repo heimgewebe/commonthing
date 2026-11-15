@@ -1799,8 +1799,8 @@ prune_releases
             "https://api.github.com/repos/heimgewebe/schauwerk/actions/workflows",
             convergence_slice,
         )
-        self.assertNotIn("GH_TOKEN: ${{ github.token }}", convergence_slice)
-        self.assertNotIn("Authorization: Bearer", convergence_slice)
+        self.assertIn("GITHUB_TOKEN: " + chr(36) + "{{ github.token }}", convergence_slice)
+        self.assertIn("Authorization: Bearer $GITHUB_TOKEN", convergence_slice)
         self.assertIn("--header 'Accept: application/vnd.github+json'", convergence_slice)
         self.assertIn('payload.get("state") != "current"', workflow[enforcement:])
 

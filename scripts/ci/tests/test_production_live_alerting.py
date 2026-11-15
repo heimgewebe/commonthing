@@ -101,6 +101,20 @@ class AlertWorkflowTest(unittest.TestCase):
         self.assertIn("PRODUCTION_ALERT_ASSIGNEE: alexdermohr", job)
 
 
+    def test_public_schauwerk_producer_lookup_is_authenticated(self) -> None:
+        workflow = (OPS.parents[1] / ".github/workflows/production-live-contract.yml").read_text(
+            encoding="utf-8"
+        )
+        producer = workflow.split(
+            "      - name: Resolve latest accepted Schauwerk Schaubild release\n", 1
+        )[1].split("      - name: Verify public frontend and API identity\n", 1)[0]
+        # A real PR runner proved HTTP 200 with its scoped workflow token.
+        # The previous anonymous request was 403 and generated a false outage.
+        self.assertIn("GITHUB_TOKEN: " + chr(36) + "{{ github.token }}", producer)
+        self.assertIn('Authorization: Bearer $GITHUB_TOKEN', producer)
+        self.assertIn("python scripts/preflight/schauwerk_release_convergence.py", producer)
+        self.assertNotIn("Probe authenticated Schauwerk producer lookup", workflow)
+
     def test_failed_drill_cannot_skip_real_production_alarm(self) -> None:
         workflow = (OPS.parents[1] / ".github/workflows/production-live-contract.yml").read_text(
             encoding="utf-8"
