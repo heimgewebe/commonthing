@@ -223,4 +223,12 @@
     outline: 3px solid var(--accent);
     outline-offset: 2px;
   }
+  /* Initial map markers remain exposed; short landscape keeps the original
+     top-anchored placement and native welcome-card touch scrolling. */
+  @media (max-width: 640px) and (min-height: 541px) {
+    .welcome {
+      top: auto;
+      bottom: calc(170px + env(safe-area-inset-bottom));
+    }
+  }
 </style>
