@@ -250,7 +250,7 @@ test.describe("Topbar — guest role visibility", () => {
     await mockApiResponses(page, { auth: { authenticated: false } });
     await page.goto("/map");
 
-    await expect(page.getByRole("link", { name: "Anmelden" })).toBeVisible();
+    await expect(page.getByRole("link", { name: "Anmelden", exact: true })).toBeVisible();
     await expect(page.getByTestId("topbar-guest-badge")).toHaveCount(0);
     await expect(page.getByTestId("attention-bubbles")).toHaveCount(0);
   });
