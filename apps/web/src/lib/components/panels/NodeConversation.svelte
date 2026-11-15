@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy, onMount } from "svelte";
+  import { onDestroy, onMount, tick } from "svelte";
   import { authStore } from "$lib/auth/store";
   import { formatDate } from "$lib/utils/formatDate";
   import {
@@ -50,6 +50,9 @@
   let editDraft = $state("");
   let savingId = $state("");
   let tombstoningId = $state("");
+  let removalCandidate: ConversationMessage | null = $state(null);
+  let removalDialog: HTMLDialogElement;
+  let removalSourceButton: HTMLButtonElement | null = null;
   let pollTimer: ReturnType<typeof setTimeout> | null = null;
   let pollGeneration = 0;
   let mutationGeneration = 0;
@@ -256,9 +259,36 @@
     }
   }
 
+  async function requestRemoval(
+    message: ConversationMessage,
+    event: MouseEvent,
+  ) {
+    if (tombstoningId) return;
+    removalSourceButton =
+      event.currentTarget instanceof HTMLButtonElement
+        ? event.currentTarget
+        : null;
+    removalCandidate = message;
+    await tick();
+    removalDialog.showModal();
+    removalDialog.querySelector<HTMLButtonElement>(".secondary")?.focus();
+  }
+
+  function removalClosed() {
+    removalCandidate = null;
+    if (removalSourceButton?.isConnected) removalSourceButton.focus();
+    removalSourceButton = null;
+  }
+
+  async function confirmRemoval() {
+    const message = removalCandidate;
+    if (!message || tombstoningId) return;
+    removalDialog.close();
+    await tombstone(message);
+  }
+
   async function tombstone(message: ConversationMessage) {
     if (!conversation || tombstoningId) return;
-    if (!window.confirm("Beitrag wirklich entfernen?")) return;
     tombstoningId = message.id;
     mutationError = "";
     try {
@@ -409,7 +439,7 @@
                 <button
                   type="button"
                   class="link danger-link"
-                  onclick={() => tombstone(message)}
+                  onclick={(event) => void requestRemoval(message, event)}
                   disabled={tombstoningId === message.id}
                   >{tombstoningId === message.id
                     ? "Entfernt…"
@@ -445,6 +475,36 @@
   {:else}<p class="guest-note">
       Melde dich an, um im Gesprächsraum mitzuschreiben.
     </p>{/if}
+  <dialog
+    bind:this={removalDialog}
+    class="removal-dialog"
+    role="alertdialog"
+    aria-label="Beitrag entfernen"
+    onkeydown={(event) => {
+      // Escape closes this dialog, not the underlying map context panel.
+      if (event.key === "Escape") event.stopPropagation();
+    }}
+    onclose={removalClosed}
+  >
+    <h5>Beitrag wirklich entfernen?</h5>
+    <p>
+      Der Inhalt wird durch „Beitrag entfernt.“ ersetzt. Das lässt sich nicht
+      rückgängig machen.
+    </p>
+    <div class="actions">
+      <button
+        type="button"
+        class="secondary"
+        onclick={() => removalDialog.close()}>Abbrechen</button
+      >
+      <button
+        type="button"
+        class="danger-confirm"
+        onclick={() => void confirmRemoval()}
+        disabled={Boolean(tombstoningId)}>Beitrag entfernen</button
+      >
+    </div>
+  </dialog>
 </section>
 
 <style>
@@ -542,6 +602,34 @@
   .danger-link,
   .error {
     color: var(--danger);
+  }
+  .removal-dialog {
+    box-sizing: border-box;
+    width: min(30rem, calc(100vw - 2rem));
+    max-height: calc(100dvh - 2rem);
+    overflow-y: auto;
+    border: 1px solid var(--panel-border-strong);
+    border-radius: 12px;
+    padding: 1.25rem;
+    background: var(--panel-solid);
+    color: var(--text);
+    box-shadow: 0 12px 40px rgb(0 0 0 / 25%);
+  }
+  .removal-dialog::backdrop {
+    background: rgb(0 0 0 / 60%);
+  }
+  .removal-dialog h5 {
+    margin: 0 0 0.75rem;
+    font-size: 1.05rem;
+  }
+  .removal-dialog .actions {
+    justify-content: flex-end;
+    margin-top: 1rem;
+  }
+  .removal-dialog .danger-confirm {
+    background: var(--danger);
+    border-color: var(--danger);
+    color: white;
   }
   .guest-note {
     padding-top: 0.75rem;
