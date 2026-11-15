@@ -39,6 +39,7 @@ async function installConversationApi(
 ) {
   let listRequests = 0;
   let createAttempts = 0;
+  let deleteRequests = 0;
   const idempotencyKeys: string[] = [];
   let releaseDelayedList: (() => void) | null = null;
   let delayedListStarted = false;
@@ -135,6 +136,7 @@ async function installConversationApi(
         ).content;
         message.updated_at = "2026-07-19T10:02:00Z";
       } else {
+        deleteRequests += 1;
         message.content = null;
         message.updated_at = "2026-07-19T10:03:00Z";
         message.deleted_at = message.updated_at;
@@ -151,6 +153,7 @@ async function installConversationApi(
 
   return {
     listRequestCount: () => listRequests,
+    deleteRequestCount: () => deleteRequests,
     delayedListHasStarted: () => delayedListStarted,
     releaseDelayedList: () => releaseDelayedList?.(),
     idempotencyKeys,
@@ -184,9 +187,55 @@ test("Gast veröffentlicht, bearbeitet und entfernt den eigenen Gesprächsbeitra
   await panel.getByRole("button", { name: "Änderung speichern" }).click();
   await expect(panel.getByText("Überarbeiteter Gastbeitrag")).toBeVisible();
 
-  page.once("dialog", async (dialog) => dialog.accept());
   await log.getByRole("button", { name: "Entfernen" }).click();
-  await expect(panel.getByText("Beitrag entfernt.")).toBeVisible();
+  const confirmation = page.getByRole("alertdialog", {
+    name: "Beitrag entfernen",
+  });
+  await expect(confirmation).toBeVisible();
+  await confirmation.getByRole("button", { name: "Beitrag entfernen" }).click();
+  await expect(
+    panel.getByText("Beitrag entfernt.", { exact: true }),
+  ).toBeVisible();
+});
+
+test("Löschdialog bewahrt den Beitrag bei Escape und Abbrechen und gibt den Fokus zurück", async ({
+  page,
+}) => {
+  await mockApiResponses(page, {
+    auth: { authenticated: true, account_id: "e2e-weber", role: "weber" },
+  });
+  const api = await installConversationApi(page, [
+    {
+      id: "f4a7d0c2-9d5a-4f7c-b13a-3d0e7a6c7d4b",
+      conversation_id: CONVERSATION_ID,
+      author_account_id: "e2e-weber",
+      author_title: "Eigene Garnrolle",
+      content: "Bewahrter Beitrag",
+      created_at: "2026-07-19T10:00:00Z",
+      updated_at: "2026-07-19T10:00:00Z",
+      deleted_at: null,
+    },
+  ]);
+  const panel = await openFirstNodeConversation(page);
+  const removeButton = panel.getByRole("button", {
+    name: "Entfernen",
+    exact: true,
+  });
+  const dialog = page.getByRole("alertdialog", { name: "Beitrag entfernen" });
+
+  await removeButton.click();
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByRole("button", { name: "Abbrechen" })).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(dialog).not.toBeVisible();
+  await expect(removeButton).toBeFocused();
+
+  await removeButton.click();
+  await dialog.getByRole("button", { name: "Abbrechen" }).click();
+  await expect(dialog).not.toBeVisible();
+  await expect(removeButton).toBeFocused();
+  await expect(panel.getByText("Bewahrter Beitrag")).toBeVisible();
+  expect(api.deleteRequestCount()).toBe(0);
 });
 
 test("Eine gelöschte Autorzuordnung verleiht Anonymen keine Eigentümeraktionen", async ({
@@ -244,9 +293,15 @@ test("Weber behält Entwürfe, bearbeitet eigene Beiträge und tombstoned sie", 
   await panel.getByRole("button", { name: "Änderung speichern" }).click();
   await expect(panel.getByText("Überarbeiteter Beitrag")).toBeVisible();
 
-  page.once("dialog", async (dialog) => dialog.accept());
   await messageList.getByRole("button", { name: "Entfernen" }).click();
-  await expect(panel.getByText("Beitrag entfernt.")).toBeVisible();
+  const confirmation = page.getByRole("alertdialog", {
+    name: "Beitrag entfernen",
+  });
+  await expect(confirmation).toBeVisible();
+  await confirmation.getByRole("button", { name: "Beitrag entfernen" }).click();
+  await expect(
+    panel.getByText("Beitrag entfernt.", { exact: true }),
+  ).toBeVisible();
   await expect(panel.getByText("Überarbeiteter Beitrag")).toHaveCount(0);
 });
 
