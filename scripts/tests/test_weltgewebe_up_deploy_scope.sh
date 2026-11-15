@@ -37,8 +37,9 @@ new_repo() {
     git init -q
     git config user.name "Weltgewebe Test"
     git config user.email "tests@weltgewebe.local"
-    mkdir -p scripts infra/compose
+    mkdir -p scripts/ops infra/compose
     cp "$SCRIPT_SOURCE" scripts/weltgewebe-up
+    cp "$REPO_ROOT/scripts/ops/check_ingress_proxy_trust.py" scripts/ops/
     chmod +x scripts/weltgewebe-up
     cat > .env << 'ENV'
 DATABASE_URL=postgres://example
@@ -90,10 +91,18 @@ fi
 
 if [[ "${1:-}" == "inspect" ]]; then
   format=""
-  if [[ "${2:-}" == "--format" ]]; then
+  if [[ "${2:-}" == "--format" || "${2:-}" == "-f" ]]; then
     format="${3:-}"
   fi
   case "$format" in
+    *'json .NetworkSettings.Networks'* )
+      # Running Caddy attachment, as the bounded-scope ingress gate reads it.
+      if [[ "${MOCK_CADDY_OFF_INGRESS:-0}" == "1" ]]; then
+        echo '{"weltgewebe_default":{"IPAddress":"172.18.0.5"}}'
+      else
+        echo '{"weltgewebe_ingress":{"IPAddress":"10.231.64.2"}}'
+      fi
+      ;;
     *'.State.Health}}{{.State.Health.Status'* ) echo healthy ;;
     *'.State.Health}}yes'* ) echo yes ;;
     *'.State.Health.Status'* ) echo healthy ;;
@@ -122,13 +131,13 @@ if [[ "$joined" == *" config --services "* ]]; then
 fi
 if [[ "$joined" == *" config --format json "* ]]; then
   # Like Compose, drop the API alias when an override resets or replaces it.
-  api_json='{"networks":{"default":{"aliases":["weltgewebe-api"]}}}'
+  api_json='{"environment":{"AUTH_TRUSTED_PROXIES":"10.231.64.2/32"},"networks":{"default":{"aliases":["weltgewebe-api"]},"ingress":null}}'
   for ((i = 0; i < ${#args[@]} - 1; i++)); do
     if [[ "${args[$i]}" == "-f" ]] && grep -Eq '!(reset|override)' "${args[$i + 1]}"; then
-      api_json='{"networks":{"default":null}}'
+      api_json='{"environment":{"AUTH_TRUSTED_PROXIES":"10.231.64.2/32"},"networks":{"default":null,"ingress":null}}'
     fi
   done
-  printf '{"services":{"api":%s,"db":{},"nats":{},"schaubild":{"image":"ghcr.io/heimgewebe/schauwerk-schaubild@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","pull_policy":"missing","read_only":true,"ports":[],"expose":["8765"],"command":["python","-m","schauwerk.visual.standalone_editor","serve","--bind-host","0.0.0.0","--trusted-reverse-proxy","--trusted-proxy-source-cidr","172.16.0.0/12","--public-base-path","/schaubild","--port","8765"]},"caddy":{}}}\n' "$api_json"
+  printf '{"services":{"api":%s,"db":{},"nats":{},"schaubild":{"image":"ghcr.io/heimgewebe/schauwerk-schaubild@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","pull_policy":"missing","read_only":true,"ports":[],"expose":["8765"],"command":["python","-m","schauwerk.visual.standalone_editor","serve","--bind-host","0.0.0.0","--trusted-reverse-proxy","--trusted-proxy-source-cidr","10.231.64.2/32","--public-base-path","/schaubild","--port","8765"],"networks":{"ingress":null}},"caddy":{"networks":{"ingress":{"ipv4_address":"10.231.64.2"}}}},"networks":{"default":{"name":"weltgewebe_default"},"ingress":{"name":"weltgewebe_ingress","ipam":{"config":[{"subnet":"10.231.64.0/28","gateway":"10.231.64.1","ip_range":"10.231.64.8/29"}]}}}}\n' "$api_json"
   exit 0
 fi
 if [[ "$joined" == *" config "* ]]; then
@@ -323,6 +332,21 @@ set -e
 [[ ! -s "$state_api_no_caddy/mutation.log" ]] || fail "API scope without Caddy still mutated compose"
 assert_contains "$out_api_no_caddy" "requires the protected caddy service"
 echo "PASS: API scope still rejects a missing VPS Caddy before mutation"
+
+# A Caddy from before the ingress network would reach the new API from an
+# address its allowlist no longer trusts: refuse the bounded deploy.
+repo_api_old_caddy="$(new_repo api-old-caddy)"
+state_api_old_caddy="$WORK_ROOT/api-old-caddy-state"
+mkdir -p "$state_api_old_caddy"
+mock_bin_api_old_caddy="$(setup_mocks "$state_api_old_caddy")"
+set +e
+out_api_old_caddy="$( (cd "$repo_api_old_caddy" && PATH="$mock_bin_api_old_caddy:/usr/bin:/bin" MOCK_STATE="$state_api_old_caddy" WELTGEWEBE_DEPLOY_LOCK_FILE="$state_api_old_caddy/deploy.lock" MOCK_CADDY_OFF_INGRESS=1 REPO_DIR="$repo_api_old_caddy" ENV_FILE="$repo_api_old_caddy/.env" DEPLOY_TARGET=vps WELTGEWEBE_STATE_DIR="$repo_api_old_caddy/.ops" bash scripts/weltgewebe-up --no-pull --no-build --deploy-scope api) 2>&1)"
+rc_api_old_caddy=$?
+set -e
+[[ "$rc_api_old_caddy" -ne 0 ]] || fail "API scope with a pre-ingress Caddy should fail"
+[[ ! -s "$state_api_old_caddy/mutation.log" ]] || fail "API scope with a pre-ingress Caddy still mutated compose"
+assert_contains "$out_api_old_caddy" "needs a running Caddy on the pinned ingress address"
+echo "PASS: API scope rejects a running Caddy without the pinned ingress address"
 
 # A failed migration-active API start must still attempt an API-only verify-applied restore.
 repo_migration_failure="$(new_repo migration-failure)"

@@ -123,7 +123,7 @@ elif [[ "$1" == "compose" ]]; then
          if [[ "$ARGS" == *"--format json"* ]]; then
              # Render the Schaubild service the way Compose interpolates it from the
              # bindings weltgewebe-up exports, so the full-scope runtime contract holds.
-             printf '{"services": {"api": {"networks": {"default": {"aliases": ["weltgewebe-api"]}}}, "caddy": {}, "schaubild": {"image": "%s", "pull_policy": "missing", "read_only": true, "ports": [], "expose": ["8765"], "command": ["--bind-host", "0.0.0.0", "--trusted-reverse-proxy", "--trusted-proxy-source-cidr", "%s", "--public-base-path", "/schaubild"]}}}\n' \
+             printf '{"services": {"api": {"environment": {"AUTH_TRUSTED_PROXIES": "10.231.64.2/32"}, "networks": {"default": {"aliases": ["weltgewebe-api"]}, "ingress": null}}, "caddy": {"networks": {"ingress": {"ipv4_address": "10.231.64.2"}}}, "schaubild": {"image": "%s", "pull_policy": "missing", "read_only": true, "ports": [], "expose": ["8765"], "networks": {"ingress": null}, "command": ["--bind-host", "0.0.0.0", "--trusted-reverse-proxy", "--trusted-proxy-source-cidr", "%s", "--public-base-path", "/schaubild"]}}, "networks": {"ingress": {"name": "weltgewebe_ingress", "ipam": {"config": [{"subnet": "10.231.64.0/28", "gateway": "10.231.64.1", "ip_range": "10.231.64.8/29"}]}}}}\n' \
                  "${SCHAUWERK_SCHAUBILD_IMAGE:-}" "${SCHAUWERK_SCHAUBILD_TRUSTED_PROXY_CIDR:-}"
          else
              echo "services: {}"

@@ -62,29 +62,51 @@ def test_ip_rate_limits_are_paired_with_a_trusted_proxy_declaration(
     )
 
 
-@pytest.mark.parametrize(
-    "compose_file", OVERRIDES_WITH_IP_RATE_LIMITS, ids=lambda path: path.name
-)
-def test_trusted_proxy_default_covers_the_compose_bridge_network(
-    compose_file: Path,
-) -> None:
-    declaration = api_environment(compose_file)[TRUSTED_PROXIES_KEY]
+def test_heimserver_trusted_proxy_default_covers_the_compose_bridge_network() -> None:
+    declaration = api_environment(HEIMSERVER_OVERRIDE)[TRUSTED_PROXIES_KEY]
 
     # Interpolation shape: an operator override wins, the baked-in fallback must
     # still trust the bridge network Caddy reaches the API from.
     assert declaration.startswith("${AUTH_TRUSTED_PROXIES:-"), (
-        f"{compose_file.name} must let the operator override the proxy allowlist, "
-        f"got: {declaration}"
+        f"{HEIMSERVER_OVERRIDE.name} must let the operator override the proxy "
+        f"allowlist, got: {declaration}"
     )
     fallback = declaration[len("${AUTH_TRUSTED_PROXIES:-") : -1]
 
     assert "172.16.0.0/12" in fallback, (
-        f"{compose_file.name} fallback must trust the Docker bridge range "
+        f"{HEIMSERVER_OVERRIDE.name} fallback must trust the Docker bridge range "
         f"(Caddy's peer address), got: {fallback}"
     )
     assert "127.0.0.1" in fallback, (
-        f"{compose_file.name} fallback must keep trusting loopback, got: {fallback}"
+        f"{HEIMSERVER_OVERRIDE.name} fallback must keep trusting loopback, got: {fallback}"
     )
+
+
+CADDY_INGRESS_IPV4 = "${WELTGEWEBE_INGRESS_CADDY_IPV4:-10.231.64.2}"
+
+
+def vps_document() -> dict:
+    return yaml.safe_load(VPS_OVERRIDE.read_text(encoding="utf-8"))
+
+
+def test_vps_trusts_exactly_the_pinned_caddy_address() -> None:
+    """Audit B3: on the VPS no sibling container may spoof X-Forwarded-For.
+
+    172.16.0.0/12 plus loopback trusted db, nats, schaubild and the ollama /
+    search-worker processes that share the API network namespace. The VPS
+    override now trusts only Caddy's pinned ingress address.
+    """
+    declaration = api_environment(VPS_OVERRIDE)[TRUSTED_PROXIES_KEY]
+    assert declaration == "${AUTH_TRUSTED_PROXIES:-" + CADDY_INGRESS_IPV4 + "/32}"
+
+    services = vps_document()["services"]
+    assert services["caddy"]["networks"] == {"ingress": {"ipv4_address": CADDY_INGRESS_IPV4}}
+    assert services["schaubild"]["networks"] == ["ingress"]
+    assert set(services["api"]["networks"]) == {"default", "ingress"}
+    assert services["api"]["networks"]["default"]["aliases"] == ["weltgewebe-api"]
+    command = services["schaubild"]["command"]
+    cidr = command[command.index("--trusted-proxy-source-cidr") + 1]
+    assert cidr == "${SCHAUWERK_SCHAUBILD_TRUSTED_PROXY_CIDR:-" + CADDY_INGRESS_IPV4 + "/32}"
 
 
 def test_base_prod_compose_does_not_bake_a_permissive_default() -> None:
@@ -168,3 +190,143 @@ def test_deploy_vps_shim_keeps_vps_caddy_and_static_web_guards() -> None:
     assert "WEB_UPSTREAM_URL" not in vps_override
     assert "root * /srv/weltgewebe-web" in caddy_vps
     assert 'X-Weltgewebe-Build "{$WELTGEWEBE_BUILD}"' in caddy_vps
+
+
+# --- scripts/ops/check_ingress_proxy_trust.py -------------------------------
+
+CHECKER = REPO / "scripts" / "ops" / "check_ingress_proxy_trust.py"
+
+
+def _load_checker():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("check_ingress_proxy_trust", CHECKER)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def _rendered(**overrides) -> dict:
+    cfg = {
+        "services": {
+            "api": {
+                "environment": {"AUTH_TRUSTED_PROXIES": "10.231.64.2/32"},
+                "networks": {"default": {"aliases": ["weltgewebe-api"]}, "ingress": None},
+            },
+            "caddy": {"networks": {"ingress": {"ipv4_address": "10.231.64.2"}}},
+            "schaubild": {
+                "networks": {"ingress": None},
+                "command": ["serve", "--trusted-proxy-source-cidr", "10.231.64.2/32"],
+            },
+        },
+        "networks": {
+            "ingress": {
+                "name": "weltgewebe_ingress",
+                "ipam": {
+                    "config": [
+                        {
+                            "subnet": "10.231.64.0/28",
+                            "gateway": "10.231.64.1",
+                            "ip_range": "10.231.64.8/29",
+                        }
+                    ]
+                },
+            }
+        },
+    }
+    for path, value in overrides.items():
+        node = cfg
+        *parents, leaf = path.split(".")
+        for key in parents:
+            node = node[key]
+        node[leaf] = value
+    return cfg
+
+
+def test_checker_accepts_the_shipped_contract() -> None:
+    caddy_ip, errors = _load_checker().check_rendered(_rendered())
+    assert (caddy_ip, errors) == ("10.231.64.2", [])
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "needle"),
+    [
+        (
+            "services.api.environment",
+            {"AUTH_TRUSTED_PROXIES": "127.0.0.1,::1,172.16.0.0/12"},
+            "AUTH_TRUSTED_PROXIES",
+        ),
+        (
+            "services.schaubild.command",
+            ["serve", "--trusted-proxy-source-cidr", "172.16.0.0/12"],
+            "--trusted-proxy-source-cidr",
+        ),
+        (
+            "services.caddy.networks",
+            {"ingress": {"ipv4_address": "10.231.64.2"}, "default": None},
+            "ingress network only",
+        ),
+        (
+            "services.caddy.networks",
+            {"ingress": {"ipv4_address": "10.231.64.9"}},
+            "dynamic ip_range",
+        ),
+        ("services.caddy.networks", {"ingress": None}, "pinned ipv4_address"),
+        ("services.schaubild.networks", {"ingress": None, "default": None}, "schaubild"),
+        ("services.api.networks", {"default": None}, "default and ingress"),
+    ],
+)
+def test_checker_rejects_drift(path: str, value, needle: str) -> None:
+    _, errors = _load_checker().check_rendered(_rendered(**{path: value}))
+    assert any(needle in error for error in errors), errors
+
+
+def test_checker_rejects_running_caddy_without_the_pinned_address() -> None:
+    checker = _load_checker()
+    cfg = _rendered()
+    assert checker.check_running_caddy(
+        cfg, "10.231.64.2", {"weltgewebe_ingress": {"IPAddress": "10.231.64.2"}}
+    ) == []
+    errors = checker.check_running_caddy(
+        cfg, "10.231.64.2", {"weltgewebe_default": {"IPAddress": "172.18.0.5"}}
+    )
+    assert errors and "full deploy" in errors[0]
+
+
+def test_checker_accepts_the_real_vps_compose_render() -> None:
+    """Render the shipped files through Compose itself, not a YAML reading."""
+    import json
+    import os
+    import shutil
+    import subprocess
+
+    if shutil.which("docker") is None:
+        pytest.skip("docker CLI not available")
+    env = {
+        **os.environ,
+        "API_VERSION": "test",
+        "GIT_COMMIT_SHA": "0" * 40,
+        "BUILD_TIMESTAMP": "2026-01-01T00:00:00Z",
+        "WELTGEWEBE_BUILD": "test",
+        "SCHAUWERK_SCHAUBILD_IMAGE": "example.invalid/schaubild@sha256:" + "0" * 64,
+        "WELTGEWEBE_ENV_FILE": os.devnull,
+        "REPO_DIR": str(REPO),
+    }
+    for key in list(env):
+        if key.startswith(("AUTH_TRUSTED_PROXIES", "WELTGEWEBE_INGRESS_", "SCHAUWERK_SCHAUBILD_TRUSTED")):
+            env.pop(key)
+    proc = subprocess.run(
+        [
+            "docker", "compose", "-p", "weltgewebe",
+            "-f", str(COMPOSE_DIR / "compose.prod.yml"),
+            "-f", str(VPS_OVERRIDE),
+            "config", "--format", "json",
+        ],
+        capture_output=True, text=True, env=env, check=False,
+    )
+    if proc.returncode != 0 and "is not a docker command" in proc.stderr:
+        pytest.skip("docker compose plugin not available")
+    assert proc.returncode == 0, proc.stderr
+    caddy_ip, errors = _load_checker().check_rendered(json.loads(proc.stdout))
+    assert (caddy_ip, errors) == ("10.231.64.2", [])

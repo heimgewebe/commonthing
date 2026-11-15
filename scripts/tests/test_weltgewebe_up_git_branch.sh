@@ -48,8 +48,9 @@ new_repo() {
     git config user.name "Weltgewebe Test"
     git config user.email "tests@weltgewebe.local"
 
-    mkdir -p infra/compose scripts apps/web/build/_app
+    mkdir -p infra/compose scripts/ops apps/web/build/_app
     cp "$SCRIPT_SOURCE" scripts/weltgewebe-up
+    cp "$(dirname "$SCRIPT_SOURCE")/ops/check_ingress_proxy_trust.py" scripts/ops/
     chmod +x scripts/weltgewebe-up
 
     cat > .env << 'EOF'
@@ -136,6 +137,10 @@ if [[ "$1" == "ps" ]]; then
   exit 0
 fi
 if [[ "$1" == "inspect" ]]; then
+  if [[ "$ARGS" == *"json .NetworkSettings.Networks"* ]]; then
+    echo '{"weltgewebe_ingress":{"IPAddress":"10.231.64.2"}}'
+    exit 0
+  fi
   if [[ "$ARGS" == *"Aliases"* ]]; then
     echo "weltgewebe-api"
     exit 0
@@ -164,7 +169,7 @@ if [[ "$1" == "compose" ]]; then
     if [[ "${MOCK_FAIL_CONFIG_GUARD:-0}" == "1" ]]; then
       echo "{"
     else
-      echo '{"services":{"api":{"ports":[],"networks":{"default":{"aliases":["weltgewebe-api"]}}},"db":{},"nats":{},"caddy":{}}}'
+      echo '{"services":{"api":{"ports":[],"environment":{"AUTH_TRUSTED_PROXIES":"10.231.64.2/32"},"networks":{"default":{"aliases":["weltgewebe-api"]},"ingress":null}},"db":{},"nats":{},"caddy":{"networks":{"ingress":{"ipv4_address":"10.231.64.2"}}}},"networks":{"ingress":{"name":"weltgewebe_ingress","ipam":{"config":[{"subnet":"10.231.64.0/28","gateway":"10.231.64.1","ip_range":"10.231.64.8/29"}]}}}}'
     fi
     exit 0
   fi
