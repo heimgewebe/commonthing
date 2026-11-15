@@ -588,7 +588,7 @@ test.describe("Farbschema", () => {
     await page.goto("/map");
 
     const settings = page.getByRole("link", { name: "Einstellungen öffnen" });
-    const login = page.getByRole("link", { name: "Anmelden" });
+    const login = page.getByRole("link", { name: "Anmelden", exact: true });
     await expect(settings).toBeVisible();
     await expect(login).toBeVisible();
 
@@ -641,7 +641,7 @@ test.describe("Farbschema", () => {
       await page.goto("/map");
 
       const settings = page.getByRole("link", { name: "Einstellungen öffnen" });
-      const login = page.getByRole("link", { name: "Anmelden" });
+      const login = page.getByRole("link", { name: "Anmelden", exact: true });
       await expect(settings).toBeVisible();
       await expect(login).toBeVisible();
 
