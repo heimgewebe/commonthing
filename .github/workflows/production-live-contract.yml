@@ -74,28 +74,6 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag: v7.0.1
-      # Temporary evidence: validate whether the short-lived workflow token
-      # can read this public cross-repo producer without anonymous IP rate limits.
-      - name: Probe authenticated Schauwerk producer lookup
-        if: github.event_name == 'pull_request'
-        shell: bash
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          file="$(mktemp)"
-          trap 'rm -f "$file"' EXIT
-          url='https://api.github.com/repos/heimgewebe/schauwerk/actions/workflows/native-schaubild-image.yml/runs?event=workflow_dispatch&status=success&per_page=2'
-          status="$(curl --silent --show-error --location --proto '=https' --connect-timeout 5 --max-time 20 --header 'Accept: application/vnd.github+json' --header "Authorization: Bearer $GITHUB_TOKEN" --output "$file" --write-out '%{http_code}' "$url")"
-          echo "cross_repo_producer_authenticated_http=$status"
-          test "$status" = 200
-          python - "$file" <<'PY'
-          import json, sys
-          runs = json.load(open(sys.argv[1], encoding="utf-8"))
-          assert isinstance(runs.get("workflow_runs"), list)
-          assert runs["workflow_runs"] and runs["workflow_runs"][0]["conclusion"] == "success"
-          print("cross_repo_producer_payload=verified")
-          PY
       - uses: actions/setup-python@8549b9f8f590ad24eab7482f36f6e1e24d34597b # provenance: untagged (after v7.0.0)
         with:
           python-version-file: ".python-version"
@@ -288,9 +266,12 @@ jobs:
         id: schaubild-convergence
         continue-on-error: true
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # Public cross-repository read: Commonthing's GITHUB_TOKEN is repository-scoped.
+          # Public Schauwerk data; authenticate to avoid the runner's shared
+          # anonymous 60 requests/hour IP limit. No cross-repo write authority.
           workflow_runs_url='https://api.github.com/repos/heimgewebe/schauwerk/actions/workflows'
           workflow_runs_url+='/native-schaubild-image.yml/runs?event=workflow_dispatch'
           workflow_runs_url+='&status=success&per_page=20'
@@ -299,6 +280,7 @@ jobs:
             --connect-timeout 5 \
             --max-time 20 \
             --header 'Accept: application/vnd.github+json' \
+            --header "Authorization: Bearer $GITHUB_TOKEN" \
             "$workflow_runs_url" \
             > schaubild-publish-runs.json; then
             python - <<'PY'
