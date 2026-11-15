@@ -11,7 +11,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." > /dev/null 2>&1 && pwd)"
 BASEMAP_DIR="$REPO_ROOT/build/basemap"
 
 OSM_FILE="schleswig-holstein-260101.osm.pbf"
-OSM_URL="https://download.geofabrik.de/europe/germany/schleswig-holstein-260101.osm.pbf"
+# Unchanged Geofabrik OSM snapshot, published once with SHA-256 under a stable GitHub release.
+OSM_URL="https://github.com/heimgewebe/commonthing/releases/download/basemap-osm-inputs-v1/schleswig-holstein-260101.osm.pbf"
 OSM_SHA256="3e5efb30488daa87a098d61bf1f60155f89cdcf900aeadee5a1cd27910bfd450"
 
 BASEMAP_VERSION="0.1.0"

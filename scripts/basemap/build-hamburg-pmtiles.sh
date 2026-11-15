@@ -10,7 +10,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." > /dev/null 2>&1 && pwd)"
 BASEMAP_DIR="$REPO_ROOT/build/basemap"
 
 OSM_FILE="hamburg-250101.osm.pbf"
-OSM_URL="https://download.geofabrik.de/europe/germany/hamburg-250101.osm.pbf"
+# Unchanged Geofabrik OSM snapshot, published once with SHA-256 under a stable GitHub release.
+OSM_URL="https://github.com/heimgewebe/commonthing/releases/download/basemap-osm-inputs-v1/hamburg-250101.osm.pbf"
 OSM_SHA256="e9beba6f27594a3abe571dd632e752fb43c8a136b2517fa162988fd641f8cdc9"
 
 BASEMAP_VERSION="0.1.0"
