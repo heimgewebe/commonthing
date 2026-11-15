@@ -16,6 +16,11 @@ function overlap(
 
 test.describe("MapLibre control placement", () => {
   test.beforeEach(async ({ page }) => {
+    // This suite measures controls for a returning authenticated user.
+    // First-visit onboarding and its marker hitboxes are tested separately.
+    await page.addInitScript(() =>
+      localStorage.setItem("commonthing.map-welcome.dismissed.v1", "1"),
+    );
     await mockApiResponses(page, {
       auth: { authenticated: true, account_id: "e2e-weber", role: "weber" },
     });
