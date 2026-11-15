@@ -85,7 +85,7 @@ def test_vps_deploy_binds_runtime_lock_before_first_compose_render() -> None:
     lock_path = deploy.index("infra/schauwerk-editor/release-lock.json")
     helper = deploy.index("scripts/preflight/schauwerk_editor_release.py", lock_path)
     proxy_cidr = deploy.index(
-        'SCHAUWERK_RUNTIME_TRUSTED_PROXY_CIDR="${SCHAUWERK_SCHAUBILD_TRUSTED_PROXY_CIDR:-${WELTGEWEBE_INGRESS_CADDY_IPV4:-10.231.64.2}/32}"',
+        'SCHAUWERK_RUNTIME_TRUSTED_PROXY_CIDR="${SCHAUWERK_SCHAUBILD_TRUSTED_PROXY_CIDR:-}"',
         helper,
     )
     proxy_export = deploy.index(

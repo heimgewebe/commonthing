@@ -984,10 +984,14 @@ except Exception as exc:
     generate_failure_bundle "$msg"
     exit 1
   fi
-  # Schaubild trusts exactly Caddy's pinned ingress address (see
-  # compose.vps.override.yml); check_ingress_proxy_trust.py refuses drift.
-  SCHAUWERK_RUNTIME_TRUSTED_PROXY_CIDR="${SCHAUWERK_SCHAUBILD_TRUSTED_PROXY_CIDR:-${WELTGEWEBE_INGRESS_CADDY_IPV4:-10.231.64.2}/32}"
-  if ! SCHAUWERK_RUNTIME_TRUSTED_PROXY_CIDR="$SCHAUWERK_RUNTIME_TRUSTED_PROXY_CIDR" python3 - << 'PY'; then
+  # Schaubild trusts exactly Caddy's pinned ingress address. Its default lives
+  # in compose.vps.override.yml, so Compose resolves it from the shell and the
+  # selected --env-file alike; this script must not shadow it with a
+  # shell-only default. check_ingress_proxy_trust.py then proves the rendered
+  # CIDR equals Caddy's address. An explicit shell value is still validated.
+  SCHAUWERK_RUNTIME_TRUSTED_PROXY_CIDR="${SCHAUWERK_SCHAUBILD_TRUSTED_PROXY_CIDR:-}"
+  if [[ -n "$SCHAUWERK_RUNTIME_TRUSTED_PROXY_CIDR" ]]; then
+    if ! SCHAUWERK_RUNTIME_TRUSTED_PROXY_CIDR="$SCHAUWERK_RUNTIME_TRUSTED_PROXY_CIDR" python3 - << 'PY'; then
 import ipaddress
 import os
 
@@ -999,12 +1003,13 @@ except ValueError:
 if not isinstance(network, ipaddress.IPv4Network) or str(network) != raw:
     raise SystemExit(2)
 PY
-    msg="Schaubild trusted proxy source CIDR is not one canonical IPv4 network."
-    echo "ERROR: $msg" >&2
-    generate_failure_bundle "$msg"
-    exit 1
+      msg="Schaubild trusted proxy source CIDR is not one canonical IPv4 network."
+      echo "ERROR: $msg" >&2
+      generate_failure_bundle "$msg"
+      exit 1
+    fi
+    export SCHAUWERK_SCHAUBILD_TRUSTED_PROXY_CIDR="$SCHAUWERK_RUNTIME_TRUSTED_PROXY_CIDR"
   fi
-  export SCHAUWERK_SCHAUBILD_TRUSTED_PROXY_CIDR="$SCHAUWERK_RUNTIME_TRUSTED_PROXY_CIDR"
   export SCHAUWERK_SCHAUBILD_IMAGE="$SCHAUWERK_RUNTIME_IMAGE_REF"
   SCHAUWERK_RUNTIME_POSTFLIGHT_REQUIRED="1"
   echo "   Schaubild runtime admitted source $SCHAUWERK_RUNTIME_SOURCE_COMMIT ($SCHAUWERK_RUNTIME_IMAGE_DIGEST)."
@@ -1077,7 +1082,9 @@ try:
         "0.0.0.0",
         "--trusted-reverse-proxy",
         "--trusted-proxy-source-cidr",
-        expected_proxy_cidr,
+        # Empty when Compose resolved the default; check_ingress_proxy_trust.py
+        # already bound the rendered value to the Caddy ingress address.
+        *((expected_proxy_cidr,) if expected_proxy_cidr else ()),
         "--public-base-path",
         "/schaubild",
     ):

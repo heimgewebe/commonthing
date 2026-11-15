@@ -330,3 +330,82 @@ def test_checker_accepts_the_real_vps_compose_render() -> None:
     assert proc.returncode == 0, proc.stderr
     caddy_ip, errors = _load_checker().check_rendered(json.loads(proc.stdout))
     assert (caddy_ip, errors) == ("10.231.64.2", [])
+
+
+def _render_vps(tmp_path: Path, env_file_lines: list[str], shell: dict[str, str]):
+    import json
+    import os
+    import shutil
+    import subprocess
+
+    if shutil.which("docker") is None:
+        pytest.skip("docker CLI not available")
+    env_file = tmp_path / "runtime.env"
+    env_file.write_text("\n".join(env_file_lines) + "\n", encoding="utf-8")
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(
+            ("AUTH_TRUSTED_PROXIES", "WELTGEWEBE_INGRESS_", "SCHAUWERK_SCHAUBILD_TRUSTED")
+        )
+    }
+    env.update(
+        {
+            "API_VERSION": "test",
+            "GIT_COMMIT_SHA": "0" * 40,
+            "BUILD_TIMESTAMP": "2026-01-01T00:00:00Z",
+            "WELTGEWEBE_BUILD": "test",
+            "SCHAUWERK_SCHAUBILD_IMAGE": "example.invalid/schaubild@sha256:" + "0" * 64,
+            "WELTGEWEBE_ENV_FILE": os.devnull,
+            "REPO_DIR": str(REPO),
+            **shell,
+        }
+    )
+    proc = subprocess.run(
+        ["docker", "compose", "--env-file", str(env_file), "-p", "weltgewebe",
+         "-f", str(COMPOSE_DIR / "compose.prod.yml"), "-f", str(VPS_OVERRIDE),
+         "config", "--format", "json"],
+        capture_output=True, text=True, env=env, check=False,
+    )
+    if proc.returncode != 0 and "is not a docker command" in proc.stderr:
+        pytest.skip("docker compose plugin not available")
+    assert proc.returncode == 0, proc.stderr
+    return _load_checker().check_rendered(json.loads(proc.stdout))
+
+
+OVERRIDDEN_INGRESS = [
+    "WELTGEWEBE_INGRESS_SUBNET=10.99.0.0/28",
+    "WELTGEWEBE_INGRESS_GATEWAY=10.99.0.1",
+    "WELTGEWEBE_INGRESS_DYNAMIC_RANGE=10.99.0.8/29",
+    "WELTGEWEBE_INGRESS_CADDY_IPV4=10.99.0.2",
+]
+
+
+def test_ingress_override_in_the_runtime_env_file_alone_renders_consistently(
+    tmp_path: Path,
+) -> None:
+    """weltgewebe-up never sources the env file into Bash, so every default
+    that depends on WELTGEWEBE_INGRESS_CADDY_IPV4 must be resolved by Compose.
+    """
+    caddy_ip, errors = _render_vps(tmp_path, OVERRIDDEN_INGRESS, {})
+    assert (caddy_ip, errors) == ("10.99.0.2", [])
+
+
+def test_shell_only_schaubild_default_would_shadow_the_env_file(tmp_path: Path) -> None:
+    """The shape weltgewebe-up must not produce: a shell-derived default CIDR
+    exported over the env file's ingress override is refused, not deployed."""
+    _, errors = _render_vps(
+        tmp_path,
+        OVERRIDDEN_INGRESS,
+        {"SCHAUWERK_SCHAUBILD_TRUSTED_PROXY_CIDR": "10.231.64.2/32"},
+    )
+    assert any("--trusted-proxy-source-cidr" in error for error in errors), errors
+
+
+def test_weltgewebe_up_does_not_default_the_schaubild_cidr_in_bash() -> None:
+    deploy = (REPO / "scripts" / "weltgewebe-up").read_text(encoding="utf-8")
+    assert (
+        'SCHAUWERK_RUNTIME_TRUSTED_PROXY_CIDR="${SCHAUWERK_SCHAUBILD_TRUSTED_PROXY_CIDR:-}"'
+        in deploy
+    )
+    assert "10.231.64.2" not in deploy
