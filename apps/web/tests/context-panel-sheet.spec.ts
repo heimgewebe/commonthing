@@ -21,6 +21,11 @@ async function centerDemoMarkers(page: Page) {
 
 test.describe("ContextPanel mobile compact and full states", () => {
   test.beforeEach(async ({ page }) => {
+    // ContextPanel regression tests represent a returning authenticated Weber;
+    // onboarding itself is tested independently in map-welcome.spec.ts.
+    await page.addInitScript(() =>
+      localStorage.setItem("commonthing.map-welcome.dismissed.v1", "1"),
+    );
     await mockApiResponses(page, {
       auth: { authenticated: true, account_id: "e2e-weber", role: "weber" },
     });
@@ -355,6 +360,9 @@ test.describe("ContextPanel mobile compact and full states", () => {
       hasTouch: true,
       isMobile: true,
     });
+    await context.addInitScript(() =>
+      localStorage.setItem("commonthing.map-welcome.dismissed.v1", "1"),
+    );
     const landscapePage = await context.newPage();
     await mockApiResponses(landscapePage, {
       auth: { authenticated: true, account_id: "e2e-weber", role: "weber" },
@@ -440,6 +448,9 @@ test.describe("ContextPanel touch input", () => {
   test.use({ hasTouch: true, viewport: { width: 390, height: 844 } });
 
   test.beforeEach(async ({ page }) => {
+    await page.addInitScript(() =>
+      localStorage.setItem("commonthing.map-welcome.dismissed.v1", "1"),
+    );
     await mockApiResponses(page, {
       auth: { authenticated: true, account_id: "e2e-weber", role: "weber" },
     });
