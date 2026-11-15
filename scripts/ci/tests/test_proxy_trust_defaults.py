@@ -282,6 +282,37 @@ def test_checker_rejects_drift(path: str, value, needle: str) -> None:
     assert any(needle in error for error in errors), errors
 
 
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        ("services.api.environment", {"AUTH_TRUSTED_PROXIES": "SENSITIVE_PROXY_VALUE"}),
+        (
+            "services.schaubild.command",
+            ["serve", "--trusted-proxy-source-cidr", "SENSITIVE_PROXY_VALUE"],
+        ),
+        ("services.caddy.networks", {"ingress": {"ipv4_address": "SENSITIVE_PROXY_VALUE"}}),
+        (
+            "networks.ingress.ipam.config",
+            [{"subnet": "SENSITIVE_PROXY_VALUE", "gateway": "10.231.64.1", "ip_range": "10.231.64.8/29"}],
+        ),
+    ],
+)
+def test_checker_diagnostics_do_not_echo_config_values(path: str, value) -> None:
+    _, errors = _load_checker().check_rendered(_rendered(**{path: value}))
+    assert errors
+    assert "SENSITIVE_PROXY_VALUE" not in "\n".join(errors)
+
+
+def test_running_caddy_diagnostics_do_not_echo_observed_address() -> None:
+    errors = _load_checker().check_running_caddy(
+        _rendered(),
+        "10.231.64.2",
+        {"weltgewebe_ingress": {"IPAddress": "SENSITIVE_PROXY_VALUE"}},
+    )
+    assert errors
+    assert "SENSITIVE_PROXY_VALUE" not in "\n".join(errors)
+
+
 def test_checker_rejects_running_caddy_without_the_pinned_address() -> None:
     checker = _load_checker()
     cfg = _rendered()

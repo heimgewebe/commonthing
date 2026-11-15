@@ -60,8 +60,8 @@ def check_rendered(cfg: dict[str, Any]) -> tuple[str | None, list[str]]:
         return None, ["services.caddy is missing"]
     if _network_names(caddy) != {INGRESS}:
         errors.append(
-            "services.caddy must be attached to the ingress network only, got "
-            f"{sorted(_network_names(caddy))}; on any shared network `api` may "
+            "services.caddy must be attached to the ingress network only; "
+            "on any shared network `api` may "
             "resolve to an address the API does not trust"
         )
     caddy_networks = caddy.get("networks")
@@ -78,7 +78,7 @@ def check_rendered(cfg: dict[str, Any]) -> tuple[str | None, list[str]]:
         caddy_ip = ipaddress.IPv4Address(raw_ip)
     except ValueError:
         return None, errors + [
-            f"services.caddy ipv4_address {raw_ip!r} is not an IPv4 address"
+            "services.caddy ipv4_address is not a valid IPv4 address"
         ]
 
     ipam = _single_ipam_config(cfg, errors)
@@ -87,27 +87,25 @@ def check_rendered(cfg: dict[str, Any]) -> tuple[str | None, list[str]]:
             subnet = ipaddress.IPv4Network(ipam.get("subnet", ""), strict=True)
             dynamic = ipaddress.IPv4Network(ipam.get("ip_range", ""), strict=True)
             gateway = ipaddress.IPv4Address(ipam.get("gateway", ""))
-        except ValueError as exc:
-            errors.append(
-                f"networks.ingress IPAM subnet/ip_range/gateway invalid: {exc}"
-            )
+        except ValueError:
+            errors.append("networks.ingress IPAM subnet/ip_range/gateway is invalid")
         else:
             if caddy_ip not in subnet or caddy_ip in (
                 subnet.network_address,
                 subnet.broadcast_address,
             ):
                 errors.append(
-                    f"Caddy address {caddy_ip} is not a host address of {subnet}"
+                    "Caddy address must be a usable host in the ingress subnet"
                 )
             if not dynamic.subnet_of(subnet):
-                errors.append(f"ingress ip_range {dynamic} is not inside {subnet}")
+                errors.append("ingress ip_range must be inside the ingress subnet")
             if caddy_ip in dynamic:
                 errors.append(
-                    f"Caddy address {caddy_ip} lies inside the dynamic ip_range {dynamic}; "
+                    "Caddy address lies inside the dynamic ip_range; "
                     "another container could take it first"
                 )
             if caddy_ip == gateway:
-                errors.append(f"Caddy address {caddy_ip} equals the ingress gateway")
+                errors.append("Caddy address equals the ingress gateway")
 
     expected = f"{caddy_ip}/32"
 
@@ -120,7 +118,7 @@ def check_rendered(cfg: dict[str, Any]) -> tuple[str | None, list[str]]:
         trusted = str((api.get("environment") or {}).get("AUTH_TRUSTED_PROXIES", ""))
         if trusted != expected:
             errors.append(
-                f"api AUTH_TRUSTED_PROXIES is {trusted!r}, expected exactly {expected!r} "
+                "api AUTH_TRUSTED_PROXIES must equal pinned Caddy ingress IPv4 /32 "
                 "(an override in the env file or shell must follow WELTGEWEBE_INGRESS_CADDY_IPV4)"
             )
 
@@ -138,7 +136,7 @@ def check_rendered(cfg: dict[str, Any]) -> tuple[str | None, list[str]]:
         else:
             if cidr != expected:
                 errors.append(
-                    f"schaubild {CIDR_FLAG} is {cidr!r}, expected exactly {expected!r} "
+                    f"schaubild {CIDR_FLAG} must equal pinned Caddy ingress IPv4 /32 "
                     "(SCHAUWERK_SCHAUBILD_TRUSTED_PROXY_CIDR must follow WELTGEWEBE_INGRESS_CADDY_IPV4)"
                 )
 
@@ -155,7 +153,7 @@ def check_running_caddy(
     )
     if actual != caddy_ip:
         return [
-            f"running Caddy holds {actual or 'no address'} on {network_name}, expected {caddy_ip}; "
+            "running Caddy lacks the pinned ingress address; "
             "a bounded deploy would start an API that trusts no live proxy. Run a full deploy first."
         ]
     return []
@@ -168,8 +166,8 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         cfg = json.load(sys.stdin)
-    except json.JSONDecodeError as exc:
-        print(f"ERROR: rendered compose config is not JSON: {exc}", file=sys.stderr)
+    except json.JSONDecodeError:
+        print("ERROR: rendered compose config is not valid JSON", file=sys.stderr)
         return 2
 
     caddy_ip, errors = check_rendered(cfg)
@@ -177,8 +175,8 @@ def main(argv: list[str] | None = None) -> int:
         try:
             with open(args.running_caddy_networks, encoding="utf-8") as handle:
                 running = json.load(handle)
-        except (OSError, json.JSONDecodeError) as exc:
-            errors.append(f"cannot read running Caddy networks: {exc}")
+        except (OSError, json.JSONDecodeError):
+            errors.append("cannot read running Caddy network attachment data")
         else:
             errors.extend(
                 check_running_caddy(
