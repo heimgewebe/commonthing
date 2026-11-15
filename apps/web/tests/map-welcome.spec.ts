@@ -120,6 +120,54 @@ for (const viewport of [
   });
 }
 
+test("short landscape keeps introduction controls below topbar", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 568, height: 320 });
+  await mockApiResponses(page);
+  await page.goto("/map");
+  const welcome = page.getByTestId("map-welcome");
+  await expect(welcome).toBeVisible();
+  const bar = await page.locator(".topbar").boundingBox();
+  const heading = await welcome
+    .getByRole("heading", { name: /Was möchtest/ })
+    .boundingBox();
+  const close = await welcome
+    .getByRole("button", { name: "Einführung schließen" })
+    .boundingBox();
+  expect(bar && heading && close).toBeTruthy();
+  expect(heading!.y).toBeGreaterThanOrEqual(bar!.y + bar!.height);
+  expect(close!.y).toBeGreaterThanOrEqual(bar!.y + bar!.height);
+  expect(close!.y + close!.height).toBeLessThanOrEqual(320);
+});
+
+test("short mobile welcome copy retains native scrolling", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 640 });
+  await mockApiResponses(page);
+  await page.goto("/map");
+  const welcome = page.getByTestId("map-welcome");
+  await expect(welcome).toBeVisible();
+  const paragraphs = welcome.locator("p");
+  const paragraph = paragraphs.first();
+  const paragraphBox = await paragraph.boundingBox();
+  expect(paragraphBox).not.toBeNull();
+  const area = await welcome.evaluate((element) => ({
+    scrollHeight: element.scrollHeight,
+    clientHeight: element.clientHeight,
+    pointerEvents: getComputedStyle(element).pointerEvents,
+  }));
+  expect(area.scrollHeight).toBeGreaterThan(area.clientHeight);
+  expect(area.pointerEvents).toBe("auto");
+  await page.mouse.move(
+    paragraphBox!.x + paragraphBox!.width / 2,
+    paragraphBox!.y + Math.min(14, paragraphBox!.height / 2),
+  );
+  await page.mouse.wheel(0, 150);
+  await expect
+    .poll(() => welcome.evaluate((element) => element.scrollTop))
+    .toBeGreaterThan(0);
+});
+
 test("authenticated offering opens the existing composition", async ({
   page,
 }) => {
@@ -216,6 +264,14 @@ for (const viewport of [
         zoom: 14,
       });
     });
+    if (viewport.width === 390) {
+      // Camera jump alone is not a user gesture; a real map interaction
+      // outside the nonmodal introduction dismisses it before selection.
+      await page.locator("#map").click({
+        position: { x: viewport.width - 6, y: viewport.height / 2 },
+      });
+      await expect(page.getByTestId("map-welcome")).toHaveCount(0);
+    }
     const marker = page
       .locator('.map-marker[data-marker-category="node"]')
       .first();
@@ -239,6 +295,10 @@ test("first-visit help grid does not intercept a Garnrolle marker", async ({
       zoom: 14,
     });
   });
+  // The mobile user has interacted with the map to move the camera;
+  // the existing nonmodal introduction must then yield the marker targets.
+  await page.locator("#map").click({ position: { x: 384, y: 422 } });
+  await expect(page.getByTestId("map-welcome")).toHaveCount(0);
   const marker = page
     .locator('.map-marker[data-marker-category="account"]')
     .first();
