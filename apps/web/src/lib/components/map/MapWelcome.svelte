@@ -138,28 +138,25 @@
 <style>
   .welcome {
     position: fixed;
-    bottom: calc(
-      var(--tool-fan-edge) + var(--tool-fan-size) + 56px +
-        env(safe-area-inset-bottom)
-    );
-    left: 50%;
-    transform: translateX(-50%);
-    width: min(380px, calc(100vw - 24px));
+    /* Keep the interactive introduction clear of centred map markers. */
+    top: calc(var(--toolbar-offset) + 8px + env(safe-area-inset-top));
+    left: 24px;
+    width: min(380px, calc(100vw - 48px));
     z-index: var(--z-map-fan);
     display: grid;
-    justify-items: center;
+    justify-items: start;
     gap: 4px;
+    /* Unoccupied grid area must never swallow a map-marker gesture. */
+    pointer-events: none;
   }
   .welcome[hidden] {
     display: none;
   }
   section {
+    pointer-events: auto;
     box-sizing: border-box;
     width: 100%;
-    max-height: calc(
-      100dvh - var(--toolbar-offset) - 204px - env(safe-area-inset-bottom) -
-        env(safe-area-inset-top)
-    );
+    max-height: min(320px, 32dvh);
     overflow: auto;
     padding: 12px;
     border: 1px solid var(--panel-border-strong);
@@ -217,6 +214,7 @@
     font-weight: 400;
   }
   .recall {
+    pointer-events: auto;
     font-size: 0.8rem;
     border-radius: 999px;
   }

@@ -150,6 +150,57 @@ test("participation opens the existing decisions page", async ({ page }) => {
   await expect(page.getByTestId("applications-page")).toBeVisible();
 });
 
+for (const viewport of [
+  { width: 390, height: 844 },
+  { width: 1180, height: 820 },
+]) {
+  test(`first-visit help leaves map markers clickable at ${viewport.width}px`, async ({
+    page,
+  }) => {
+    await page.setViewportSize(viewport);
+    await mockApiResponses(page);
+    await page.goto("/map");
+    await expect(page.getByTestId("map-welcome")).toBeVisible();
+    await page.waitForFunction(
+      () => (window as any).__TEST_MAP__ !== undefined,
+    );
+    await page.evaluate(() => {
+      (window as any).__TEST_MAP__.jumpTo({
+        center: [10.060228407382967, 53.558894813662505],
+        zoom: 14,
+      });
+    });
+    const marker = page
+      .locator('.map-marker[data-marker-category="node"]')
+      .first();
+    await expect(marker).toBeVisible();
+    await marker.click({ timeout: 5000 });
+    await expect(page.getByTestId("context-panel")).toBeVisible();
+  });
+}
+
+test("first-visit help grid does not intercept a Garnrolle marker", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await mockApiResponses(page);
+  await page.goto("/map");
+  await expect(page.getByTestId("map-welcome")).toBeVisible();
+  await page.waitForFunction(() => (window as any).__TEST_MAP__ !== undefined);
+  await page.evaluate(() => {
+    (window as any).__TEST_MAP__.jumpTo({
+      center: [10.060228407382967, 53.558894813662505],
+      zoom: 14,
+    });
+  });
+  const marker = page
+    .locator('.map-marker[data-marker-category="account"]')
+    .first();
+  await expect(marker).toBeVisible();
+  await marker.click({ timeout: 5000 });
+  await expect(page.getByTestId("context-panel")).toBeVisible();
+});
+
 test("map interaction dismisses without returning or taking focus", async ({
   page,
 }) => {
