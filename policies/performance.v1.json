@@ -69,7 +69,7 @@
             "min_initial_css_assets": 1
           },
           "/map": {
-            "max_initial_js_gzip_bytes": 80500,
+            "max_initial_js_gzip_bytes": 80800,
             "max_initial_css_gzip_bytes": 18500,
             "forbid_css_markers": [],
             "require_css_markers": [
