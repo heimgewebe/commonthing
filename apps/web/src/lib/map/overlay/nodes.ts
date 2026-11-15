@@ -607,18 +607,28 @@ export class NodesOverlay {
     // Alt+click still exposes all overlapping objects on these markers.
     const marker = this.activeMarkers.get(id)?.element;
     const household = this.households.byAccountId.get(id);
+    const item = this.pointById(id);
+    if (!item) return;
+    // A collapsed household is normally a direct Garnrolle target. When a
+    // different object shares its screen hitbox, the front spool must not
+    // hide that node/centre from ordinary touch users without an Alt key.
+    const mixedHouseholdCollision =
+      household &&
+      household.key !== this.expandedHouseholdKey &&
+      this.householdFrontItem(household).id === id &&
+      this.overlappingObjects(item).some(
+        (candidate) => candidate.type !== "garnrolle",
+      );
     if (
       !event.altKey &&
       (marker?.classList.contains("search-highlight") ||
         marker?.classList.contains("is-selected") ||
-        household)
+        (household && !mixedHouseholdCollision))
     ) {
       this.closeObjectChooser();
       return;
     }
-    const item = this.pointById(id);
-    if (!item || !this.openObjectChooserIfOverlapping(item, event.altKey))
-      return;
+    if (!this.openObjectChooserIfOverlapping(item, event.altKey)) return;
     // The map page's normal click handler must not independently activate
     // the stacked top marker while the explicit chooser is open.
     event.preventDefault();

@@ -28,7 +28,10 @@ const account = {
 };
 const center = { ...demoWebgemeindezentren[0], location: { ...anchor } };
 
-async function overlappingMap(page: import("@playwright/test").Page) {
+async function overlappingMap(
+  page: import("@playwright/test").Page,
+  accounts: (typeof account)[] = [account],
+) {
   await mockApiResponses(page);
   await page.route("**/api/nodes*", async (route) => {
     if (
@@ -61,7 +64,7 @@ async function overlappingMap(page: import("@playwright/test").Page) {
     await route.fulfill({
       status: 200,
       contentType: "application/json",
-      body: JSON.stringify(mockListResponse(route.request().url(), [account])),
+      body: JSON.stringify(mockListResponse(route.request().url(), accounts)),
     });
   });
   await page.route("**/api/webgemeindezentren*", async (route) => {
@@ -221,6 +224,39 @@ test("focused marker Enter opens its detail directly despite nearby overlapping 
 
 test.describe("touchscreen emulation, not physical iPad Safari", () => {
   test.use({ hasTouch: true, viewport: { width: 820, height: 1180 } });
+
+  test("ordinary touch on a household stacked over a node opens the shared chooser", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    const neighbour = {
+      ...account,
+      id: "bff8798f-54f4-4a28-bcac-a54493ca04f1",
+      title: "Weitere Garnrolle am selben Haus",
+    };
+    await overlappingMap(page, [account, neighbour]);
+    const point = await anchorScreenPoint(page);
+    const top = await page.evaluate(
+      ({ x, y }) =>
+        document.elementFromPoint(x, y)?.closest(".map-marker")?.className,
+      point,
+    );
+    expect(top).toContain("marker-household-stack");
+
+    // Normal mobile touch has no Alt key; the top household must not hide
+    // the distinct node and community centre sharing its exact map anchor.
+    await page.touchscreen.tap(point.x, point.y);
+    const chooser = page.getByTestId("map-object-chooser");
+    await expect(chooser).toBeVisible();
+    for (const id of [demoNodes[0].id, account.id, neighbour.id, center.id]) {
+      await expect(page.getByTestId("choose-map-object-" + id)).toBeVisible();
+    }
+    await page.getByTestId("choose-map-object-" + demoNodes[0].id).tap();
+    await expect(chooser).toHaveCount(0);
+    await expect(page.getByTestId("context-panel")).toContainText(
+      demoNodes[0].title,
+    );
+  });
 
   test("touch on a covered marker exposes all authorized object choices", async ({
     page,
