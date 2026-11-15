@@ -118,8 +118,9 @@ services:
 networks:
   # Caddy-facing network. The subnet lies outside Docker's stock default
   # address pools (172.17-31/16, 192.168/16); a host with custom pools or a
-  # 10.231.64.0/28 route must override all WELTGEWEBE_INGRESS_* values. Dynamic addresses (api, schaubild) come from ip_range only,
-  # so no container can take Caddy's pinned address before Caddy starts.
+  # 10.231.64.0/28 route must override all WELTGEWEBE_INGRESS_* values.
+  # Dynamic addresses (api, schaubild) come from ip_range only, so no
+  # container can take Caddy's pinned address before Caddy starts.
   # Not `internal`: Caddy needs egress for ACME.
   ingress:
     ipam:
