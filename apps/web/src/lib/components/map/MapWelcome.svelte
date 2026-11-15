@@ -43,8 +43,8 @@
   }
 
   $effect(() => {
-    // Yield permanently for this visit when another map surface is used.
-    if (ready && busy && open) dismiss();
+    // Hide for this visit without permanently dismissing an unseen introduction.
+    if (ready && busy && open) open = false;
   });
 
   function find() {
