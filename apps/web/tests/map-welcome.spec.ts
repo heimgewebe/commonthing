@@ -74,6 +74,52 @@ for (const width of [320, 390]) {
   }
 }
 
+for (const viewport of [
+  { width: 320, height: 640 },
+  { width: 390, height: 844 },
+]) {
+  test(`mobile welcome does not cover the initial map markers at ${viewport.width}px`, async ({
+    page,
+  }) => {
+    await page.setViewportSize(viewport);
+    await mockApiResponses(page);
+    await page.goto("/map");
+    await expect(page.getByTestId("map-welcome")).toBeVisible();
+    await expect(page.locator(".map-marker").first()).toBeVisible();
+
+    const covered = await page.evaluate(() => {
+      const welcome = document.querySelector<HTMLElement>(".welcome");
+      if (!welcome) throw new Error("Welcome card missing");
+      const card = welcome.getBoundingClientRect();
+      return [...document.querySelectorAll<HTMLElement>(".map-marker")]
+        .filter((marker) => {
+          const rect = marker.getBoundingClientRect();
+          return (
+            rect.width > 0 &&
+            rect.height > 0 &&
+            rect.right > 0 &&
+            rect.left < window.innerWidth &&
+            rect.bottom > 0 &&
+            rect.top < window.innerHeight
+          );
+        })
+        .filter((marker) => {
+          const rect = marker.getBoundingClientRect();
+          return (
+            rect.left < card.right &&
+            rect.right > card.left &&
+            rect.top < card.bottom &&
+            rect.bottom > card.top
+          );
+        })
+        .map((marker) => marker.getAttribute("data-testid") ?? "unlabeled");
+    });
+    expect(covered, "intro must not hide visible map marker hitboxes").toEqual(
+      [],
+    );
+  });
+}
+
 test("authenticated offering opens the existing composition", async ({
   page,
 }) => {

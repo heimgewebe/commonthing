@@ -223,4 +223,21 @@
     outline: 3px solid var(--accent);
     outline-offset: 2px;
   }
+  /* Keep the first-visit help below the initial map markers on small screens.
+     Reserve the 142px map control stack and a 16px gap at the bottom. */
+  @media (max-width: 640px) {
+    .welcome {
+      top: auto;
+      bottom: calc(170px + env(safe-area-inset-bottom));
+    }
+    /* Map points that move under the explanatory copy remain interactive.
+       Actual controls keep their normal accessible pointer targets. */
+    .welcome section {
+      pointer-events: none;
+    }
+    .welcome section button,
+    .welcome section a {
+      pointer-events: auto;
+    }
+  }
 </style>
