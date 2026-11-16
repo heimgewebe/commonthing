@@ -160,8 +160,12 @@ test("real PostgreSQL and Chromium: personal invitations are private, actionable
       },
       headers: { origin: WEB_ORIGIN },
     });
-    expect(create.status()).toBe(201);
-    circleId = (await create.json()).id;
+    const createBody = await create.text();
+    expect(
+      create.status(),
+      "create household HTTP: " + createBody.slice(0, 220),
+    ).toBe(201);
+    circleId = JSON.parse(createBody).id;
     expect(circleId).toMatch(/^[0-9a-f-]{36}$/);
 
     const bPage = await bContext.newPage();

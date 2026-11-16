@@ -197,6 +197,13 @@ jobs:
         working-directory: apps/web
         run: pnpm test:map-cardinality-fullstack-evidence
 
+      - name: Prove real household inbox in Chromium against disposable PostgreSQL
+        working-directory: apps/web
+        env:
+          P3A_FULLSTACK_PROOF: "1"
+          PLAYWRIGHT_HTML_REPORT: playwright-report-p3a-fullstack
+        run: pnpm test:proof:map-cardinality-fullstack
+
       - name: Run the real 1k/10k/100k fullstack proof
         working-directory: apps/web
         run: pnpm test:proof:map-cardinality-fullstack
@@ -209,6 +216,7 @@ jobs:
           path: |
             build/proofs/web-runtime/map-cardinality-fullstack.json
             apps/web/playwright-report-cardinality-fullstack/**
+            apps/web/playwright-report-p3a-fullstack/**
             apps/web/test-results/**
             ${{ runner.temp }}/map-cardinality-api.log
           if-no-files-found: warn
