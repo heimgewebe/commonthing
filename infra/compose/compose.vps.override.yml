@@ -13,13 +13,15 @@ services:
       AUTH_LOG_MAGIC_TOKEN: ${AUTH_LOG_MAGIC_TOKEN:-0}
       AUTH_AUTO_PROVISION: ${AUTH_AUTO_PROVISION:-1}
       AUTH_ALLOW_EMAILS: ${AUTH_ALLOW_EMAILS:-}
-      # Caddy reaches the API over the compose bridge network, so its peer address
-      # is never loopback. Without this the allowlist falls back to loopback only,
-      # X-Forwarded-For is discarded, and every client collapses into the single
-      # per-IP bucket below — a site-wide login outage for the cost of 5 requests.
+      # Caddy reaches the API only over the `ingress` network below, from its
+      # pinned address. Trust exactly that /32: db, nats, schaubild and the
+      # loopback peers sharing the API namespace (ollama, search-worker) cannot
+      # spoof X-Forwarded-For. A wrong value collapses every client into one
+      # per-IP bucket (site-wide login outage); scripts/weltgewebe-up refuses to
+      # deploy when this, the Caddy address and the Schaubild CIDR disagree.
       # The API refuses to start on the unset combination; keep this next to the
       # rate limits it makes meaningful.
-      AUTH_TRUSTED_PROXIES: ${AUTH_TRUSTED_PROXIES:-127.0.0.1,::1,172.16.0.0/12}
+      AUTH_TRUSTED_PROXIES: ${AUTH_TRUSTED_PROXIES:-${WELTGEWEBE_INGRESS_CADDY_IPV4:-10.231.64.2}/32}
       AUTH_RL_IP_PER_MIN: "5"
       AUTH_RL_IP_PER_HOUR: "30"
       AUTH_RL_EMAIL_PER_MIN: "2"
@@ -34,6 +36,13 @@ services:
         source: ${REPO_DIR:-/opt/weltgewebe}/policies/limits.yaml
         target: /app/policies/limits.yaml
         read_only: true
+    # `default` keeps db, nats and the weltgewebe-api alias; `ingress` is the
+    # only path Caddy has to the API.
+    networks:
+      default:
+        aliases:
+          - weltgewebe-api
+      ingress: {}
 
   search-worker:
     env_file:
@@ -51,7 +60,7 @@ services:
       - 0.0.0.0
       - --trusted-reverse-proxy
       - --trusted-proxy-source-cidr
-      - ${SCHAUWERK_SCHAUBILD_TRUSTED_PROXY_CIDR:-172.16.0.0/12}
+      - ${SCHAUWERK_SCHAUBILD_TRUSTED_PROXY_CIDR:-${WELTGEWEBE_INGRESS_CADDY_IPV4:-10.231.64.2}/32}
       - --public-base-path
       - /schaubild
       - --port
@@ -82,6 +91,9 @@ services:
       retries: 20
       start_period: 10s
     restart: unless-stopped
+    # Schaubild talks to nothing but Caddy.
+    networks:
+      - ingress
 
   caddy:
     ports:
@@ -96,3 +108,23 @@ services:
       - caddy_config:/config
     environment:
       WELTGEWEBE_BUILD: ${WELTGEWEBE_BUILD:?WELTGEWEBE_BUILD must be set}
+    # Caddy sits only on `ingress`, so `api` and `schaubild` resolve to their
+    # ingress addresses and every proxied request leaves from the pinned
+    # address below, the single peer the API and Schaubild trust.
+    networks:
+      ingress:
+        ipv4_address: ${WELTGEWEBE_INGRESS_CADDY_IPV4:-10.231.64.2}
+
+networks:
+  # Caddy-facing network. The subnet lies outside Docker's stock default
+  # address pools (172.17-31/16, 192.168/16); a host with custom pools or a
+  # 10.231.64.0/28 route must override all WELTGEWEBE_INGRESS_* values.
+  # Dynamic addresses (api, schaubild) come from ip_range only, so no
+  # container can take Caddy's pinned address before Caddy starts.
+  # Not `internal`: Caddy needs egress for ACME.
+  ingress:
+    ipam:
+      config:
+        - subnet: ${WELTGEWEBE_INGRESS_SUBNET:-10.231.64.0/28}
+          gateway: ${WELTGEWEBE_INGRESS_GATEWAY:-10.231.64.1}
+          ip_range: ${WELTGEWEBE_INGRESS_DYNAMIC_RANGE:-10.231.64.8/29}

@@ -202,6 +202,22 @@ implementations:
     supersedes: []
     deprecated_by: []
 
+  - id: impl.ops.vps-ingress-proxy-trust
+    path: scripts/ops/check_ingress_proxy_trust.py
+    impl_type: guard
+    status: active
+    criticality: high
+    evidence_level: ci
+    documented_by:
+      - docs/deploy/vps.md
+      - docs/deploy/schauwerk-editor-frontdoor.md
+    verified_by:
+      - scripts/ci/tests/test_proxy_trust_defaults.py
+      - scripts/tests/test_weltgewebe_up_deploy_scope.sh
+      - .github/workflows/proxy-trust-preflight.yml
+    supersedes: []
+    deprecated_by: []
+
   - id: impl.infra.caddy
     path: infra/caddy/
     impl_type: config

@@ -11,6 +11,8 @@ name: Proxy trust preflight
       - "infra/compose/compose.prod.override.yml"
       - "infra/compose/compose.vps.override.yml"
       - "scripts/ci/tests/test_proxy_trust_defaults.py"
+      - "scripts/ops/check_ingress_proxy_trust.py"
+      - "scripts/weltgewebe-up"
       - ".github/workflows/proxy-trust-preflight.yml"
   push:
     branches: [main]
@@ -21,6 +23,8 @@ name: Proxy trust preflight
       - "infra/compose/compose.prod.override.yml"
       - "infra/compose/compose.vps.override.yml"
       - "scripts/ci/tests/test_proxy_trust_defaults.py"
+      - "scripts/ops/check_ingress_proxy_trust.py"
+      - "scripts/weltgewebe-up"
       - ".github/workflows/proxy-trust-preflight.yml"
   workflow_dispatch: {}
 

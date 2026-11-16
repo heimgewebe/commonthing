@@ -30,7 +30,7 @@ class SchaubildFrontdoorTest(unittest.TestCase):
         self.assertIn("--trusted-reverse-proxy", self.compose)
         self.assertIn("--trusted-proxy-source-cidr", self.compose)
         self.assertIn(
-            "${SCHAUWERK_SCHAUBILD_TRUSTED_PROXY_CIDR:-172.16.0.0/12}",
+            "${SCHAUWERK_SCHAUBILD_TRUSTED_PROXY_CIDR:-${WELTGEWEBE_INGRESS_CADDY_IPV4:-10.231.64.2}/32}",
             self.compose,
         )
         self.assertIn("--public-base-path", self.compose)

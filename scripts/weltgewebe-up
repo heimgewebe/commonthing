@@ -984,8 +984,14 @@ except Exception as exc:
     generate_failure_bundle "$msg"
     exit 1
   fi
-  SCHAUWERK_RUNTIME_TRUSTED_PROXY_CIDR="${SCHAUWERK_SCHAUBILD_TRUSTED_PROXY_CIDR:-172.16.0.0/12}"
-  if ! SCHAUWERK_RUNTIME_TRUSTED_PROXY_CIDR="$SCHAUWERK_RUNTIME_TRUSTED_PROXY_CIDR" python3 - << 'PY'; then
+  # Schaubild trusts exactly Caddy's pinned ingress address. Its default lives
+  # in compose.vps.override.yml, so Compose resolves it from the shell and the
+  # selected --env-file alike; this script must not shadow it with a
+  # shell-only default. check_ingress_proxy_trust.py then proves the rendered
+  # CIDR equals Caddy's address. An explicit shell value is still validated.
+  SCHAUWERK_RUNTIME_TRUSTED_PROXY_CIDR="${SCHAUWERK_SCHAUBILD_TRUSTED_PROXY_CIDR:-}"
+  if [[ -n "$SCHAUWERK_RUNTIME_TRUSTED_PROXY_CIDR" ]]; then
+    if ! SCHAUWERK_RUNTIME_TRUSTED_PROXY_CIDR="$SCHAUWERK_RUNTIME_TRUSTED_PROXY_CIDR" python3 - << 'PY'; then
 import ipaddress
 import os
 
@@ -997,12 +1003,13 @@ except ValueError:
 if not isinstance(network, ipaddress.IPv4Network) or str(network) != raw:
     raise SystemExit(2)
 PY
-    msg="Schaubild trusted proxy source CIDR is not one canonical IPv4 network."
-    echo "ERROR: $msg" >&2
-    generate_failure_bundle "$msg"
-    exit 1
+      msg="Schaubild trusted proxy source CIDR is not one canonical IPv4 network."
+      echo "ERROR: $msg" >&2
+      generate_failure_bundle "$msg"
+      exit 1
+    fi
+    export SCHAUWERK_SCHAUBILD_TRUSTED_PROXY_CIDR="$SCHAUWERK_RUNTIME_TRUSTED_PROXY_CIDR"
   fi
-  export SCHAUWERK_SCHAUBILD_TRUSTED_PROXY_CIDR="$SCHAUWERK_RUNTIME_TRUSTED_PROXY_CIDR"
   export SCHAUWERK_SCHAUBILD_IMAGE="$SCHAUWERK_RUNTIME_IMAGE_REF"
   SCHAUWERK_RUNTIME_POSTFLIGHT_REQUIRED="1"
   echo "   Schaubild runtime admitted source $SCHAUWERK_RUNTIME_SOURCE_COMMIT ($SCHAUWERK_RUNTIME_IMAGE_DIGEST)."
@@ -1018,6 +1025,30 @@ fi
 if ! docker compose "${BASE_ARGS[@]}" config > /dev/null; then
   echo "ERROR: Docker Compose config failed. Please fix your configuration."
   exit 1
+fi
+
+INGRESS_CADDY_IPV4=""
+INGRESS_TRUST_CHECKER="$REPO_DIR/scripts/ops/check_ingress_proxy_trust.py"
+if [[ "$DEPLOY_TARGET" == "vps" ]]; then
+  if [[ ! -f "$INGRESS_TRUST_CHECKER" ]]; then
+    echo "ERROR: VPS ingress proxy trust checker is missing: $INGRESS_TRUST_CHECKER" >&2
+    exit 1
+  fi
+  # Caddy is the only peer the API and Schaubild trust as a forwarding proxy.
+  # A mismatch between its pinned address and either allowlist collapses every
+  # client into one rate-limit bucket, so refuse before touching containers.
+  INGRESS_CHECK_ERR_FILE=$(mktemp)
+  if ! INGRESS_CADDY_IPV4="$(docker compose "${BASE_ARGS[@]}" config --format json 2> /dev/null |
+    python3 "$INGRESS_TRUST_CHECKER" 2> "$INGRESS_CHECK_ERR_FILE")"; then
+    cat "$INGRESS_CHECK_ERR_FILE" >&2
+    msg="Rendered Compose does not bind proxy trust to Caddy's pinned ingress address."
+    echo "ERROR: $msg" >&2
+    generate_failure_bundle "$msg" "$INGRESS_CHECK_ERR_FILE"
+    rm -f "$INGRESS_CHECK_ERR_FILE"
+    exit 1
+  fi
+  rm -f "$INGRESS_CHECK_ERR_FILE"
+  echo "   Proxy trust bound to Caddy ingress address $INGRESS_CADDY_IPV4."
 fi
 
 if [[ "$DEPLOY_TARGET" == "vps" && "$DEPLOY_SCOPE" == "full" ]]; then
@@ -1051,7 +1082,9 @@ try:
         "0.0.0.0",
         "--trusted-reverse-proxy",
         "--trusted-proxy-source-cidr",
-        expected_proxy_cidr,
+        # Empty when Compose resolved the default; check_ingress_proxy_trust.py
+        # already bound the rendered value to the Caddy ingress address.
+        *((expected_proxy_cidr,) if expected_proxy_cidr else ()),
         "--public-base-path",
         "/schaubild",
     ):
@@ -2455,6 +2488,19 @@ else
     if [[ "$DEPLOY_TARGET" == "vps" && "$DEPLOY_SCOPE" == "api" && (-z "${PROTECTED_IDS_BEFORE[caddy]}" || "${PROTECTED_IDS_BEFORE[caddy]}" == "__not_configured__") ]]; then
       echo "ERROR: bounded VPS API deploy requires the protected caddy service to be running." >&2
       exit 1
+    fi
+    if [[ "$DEPLOY_TARGET" == "vps" && -n "${PROTECTED_IDS_BEFORE[caddy]}" && "${PROTECTED_IDS_BEFORE[caddy]}" != "__not_configured__" ]]; then
+      # Bounded scopes recreate the API but keep Caddy. A Caddy from before the
+      # ingress network would reach the new API from an untrusted address.
+      RUNNING_CADDY_NETWORKS_FILE=$(mktemp)
+      docker inspect -f '{{json .NetworkSettings.Networks}}' "${PROTECTED_IDS_BEFORE[caddy]}" > "$RUNNING_CADDY_NETWORKS_FILE" 2> /dev/null || echo '{}' > "$RUNNING_CADDY_NETWORKS_FILE"
+      if ! docker compose "${BASE_ARGS[@]}" config --format json 2> /dev/null |
+        python3 "$INGRESS_TRUST_CHECKER" --running-caddy-networks "$RUNNING_CADDY_NETWORKS_FILE" > /dev/null; then
+        rm -f "$RUNNING_CADDY_NETWORKS_FILE"
+        echo "ERROR: bounded deploy scope '$DEPLOY_SCOPE' needs a running Caddy on the pinned ingress address." >&2
+        exit 1
+      fi
+      rm -f "$RUNNING_CADDY_NETWORKS_FILE"
     fi
   fi
 

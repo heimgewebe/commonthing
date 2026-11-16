@@ -58,8 +58,11 @@ The sidecar has no published host port. It runs read-only, drops all Linux
 capabilities, enables `no-new-privileges`, and receives only a bounded 64 MiB
 `/tmp` tmpfs. Its server binds the Compose network only in explicit
 `--trusted-reverse-proxy` mode, admits proxy peers only from
-`SCHAUWERK_SCHAUBILD_TRUSTED_PROXY_CIDR` (default `172.16.0.0/12` for the
-Docker bridge contract), and is configured with `--public-base-path /schaubild`.
+`SCHAUWERK_SCHAUBILD_TRUSTED_PROXY_CIDR` (default: Caddy's pinned address on
+the VPS `ingress` network as a `/32`, `10.231.64.2/32`; see
+[docs/deploy/vps.md](vps.md)), and is
+configured with `--public-base-path /schaubild`. The sidecar sits on the
+`ingress` network only, so Caddy is its single network peer.
 
 Caddy owns the public boundary and starts independently of Schaubild health. A
 missing or unhealthy renderer may therefore degrade only `/schaubild/*` with an

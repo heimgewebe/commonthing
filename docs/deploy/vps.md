@@ -234,6 +234,38 @@ Startet die API gar nicht und meldet `AUTH_TRUSTED_PROXIES is not set`, dann
 läuft der Stack ohne `compose.vps.override.yml` (siehe oben) oder die
 Runtime-Env-Datei überschreibt den Default mit einem leeren Wert.
 
+#### Proxy-Vertrauen: nur Caddy über das Ingress-Netz
+
+Caddy erreicht API und Schaubild ausschließlich über das Compose-Netz
+`ingress` und spricht sie dort von einer festen Adresse an
+(`WELTGEWEBE_INGRESS_CADDY_IPV4`, Default `10.231.64.2`). Nur diese Adresse
+als `/32` ist vertrauter Proxy: `AUTH_TRUSTED_PROXIES` der API und
+`--trusted-proxy-source-cidr` von Schaubild. `db`, `nats`, Schaubild und die
+Loopback-Nachbarn im API-Namespace (`ollama`, `search-worker`) können damit
+kein `X-Forwarded-For` mehr unterschieben. Vorher galt `172.16.0.0/12` plus
+Loopback, also jeder Container auf dem Host.
+
+* Das Subnetz (`WELTGEWEBE_INGRESS_SUBNET`, Default `10.231.64.0/28`) liegt
+  außerhalb der Standard-Adresspools von Docker. Kollidiert es auf dem Host mit
+  einer Route oder einem eigenen Pool, alle `WELTGEWEBE_INGRESS_*`-Werte
+  gemeinsam in der Runtime-Env-Datei überschreiben.
+* `scripts/weltgewebe-up` prüft vor jeder Container-Änderung mit
+  `scripts/ops/check_ingress_proxy_trust.py`, dass Caddy-Adresse, API-Allowlist
+  und Schaubild-CIDR übereinstimmen. Ein alter Override wie
+  `AUTH_TRUSTED_PROXIES=127.0.0.1,::1,172.16.0.0/12` in der Env-Datei wird
+  deshalb abgelehnt und muss entfernt werden.
+* Die erste Ausrollung braucht einen vollen Deploy, weil Caddy dabei das neue
+  Netz bekommt. Ein `--deploy-scope api` gegen ein Caddy ohne Ingress-Adresse
+  bricht vor jeder Mutation ab: Die neue API würde sonst keinem laufenden
+  Proxy vertrauen und alle Clients in einen Rate-Limit-Bucket legen.
+
+Nachweis auf dem Host:
+
+```bash
+wg-compose exec api printenv AUTH_TRUSTED_PROXIES      # 10.231.64.2/32
+docker inspect -f '{{json .NetworkSettings.Networks}}' weltgewebe-caddy-1
+```
+
 ### D. Backup (Strategie)
 
 Richte einen Cronjob ein, um regelmäßig Dumps der Datenbank zu erstellen und alte Backups zu rotieren
