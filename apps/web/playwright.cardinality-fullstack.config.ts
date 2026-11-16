@@ -56,7 +56,10 @@ export default defineConfig({
   ...baseConfig,
   webServer,
   testDir: "tests/proofs",
-  testMatch: ["**/map-cardinality-fullstack.performance.proof.ts"],
+  testMatch: [
+    "**/map-cardinality-fullstack.performance.proof.ts",
+    "**/personal-events-fullstack.proof.ts",
+  ],
   timeout: 360_000,
   retries: 0,
   workers: 1,

@@ -137,6 +137,10 @@ jobs:
           WELTGEWEBE_API_STARTUP_MIGRATIONS: run
           WELTGEWEBE_SEARCH_OLLAMA_URL: http://127.0.0.1:9/
           APP_CONFIG_PATH: ${{ github.workspace }}/configs/app.defaults.yml
+          # Disposable localhost-only proof sessions; never enabled in production.
+          AUTH_DEV_LOGIN: "1"
+          AUTH_COOKIE_SECURE: "0"
+          CSRF_ALLOWED_ORIGINS: http://127.0.0.1:5173
         run: |
           set -euo pipefail
           export DATABASE_URL="${PROOF_DATABASE_URL}"
