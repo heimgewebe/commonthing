@@ -165,6 +165,17 @@ test.describe("Knoten bearbeiten und löschen", () => {
       panel.getByText("Aktualisierte öffentliche Kurzbeschreibung"),
     ).toBeVisible();
     const markerCountBeforeDelete = await page.locator(".map-marker").count();
+    // A canonical single-node DELETE must not refetch the entire domain graph.
+    const domainReloads: string[] = [];
+    page.on("request", (request) => {
+      const path = new URL(request.url()).pathname;
+      if (
+        request.method() === "GET" &&
+        /^\/api\/(nodes|edges|accounts|webgemeindezentren)$/.test(path)
+      ) {
+        domainReloads.push(path);
+      }
+    });
 
     await expect(panel.getByRole("tab", { name: "Übersicht" })).toHaveAttribute(
       "aria-selected",
@@ -185,6 +196,8 @@ test.describe("Knoten bearbeiten und löschen", () => {
     await expect(page.locator(".map-marker")).toHaveCount(
       markerCountBeforeDelete - 1,
     );
+    await page.waitForTimeout(300);
+    expect(domainReloads).toEqual([]);
   });
 
   test("archivierte Gesprächsbeiträge bleiben nach der Entfernung erreichbar", async ({
