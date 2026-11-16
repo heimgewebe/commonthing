@@ -134,6 +134,7 @@ jobs:
         env:
           API_BIND: 127.0.0.1:8787
           WELTGEWEBE_DOMAIN_READ_SOURCE: postgres
+          WELTGEWEBE_DOMAIN_ACCOUNT_WRITE_SOURCE: postgres
           WELTGEWEBE_API_STARTUP_MIGRATIONS: run
           WELTGEWEBE_SEARCH_OLLAMA_URL: http://127.0.0.1:9/
           APP_CONFIG_PATH: ${{ github.workspace }}/configs/app.defaults.yml
