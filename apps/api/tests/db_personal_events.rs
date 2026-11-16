@@ -1,28 +1,38 @@
 //! P3a: real PostgreSQL + handler proof for account-private circle messages.
 mod support;
 
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
-    body,
-    extract::{Path, Query, State},
-    http::StatusCode,
-    Extension,
+    body::{self, Body},
+    extract::{connect_info::MockConnectInfo, Path, Query, State},
+    http::{header, Method, Request, StatusCode},
+    middleware::from_fn_with_state,
+    Extension, Router,
 };
 use serde_json::{json, Value};
+use serial_test::serial;
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use tokio::sync::RwLock;
+use tower::ServiceExt;
 use uuid::Uuid;
 use weltgewebe_api::{
     auth::{
         accounts::AccountStore, rate_limit::AuthRateLimiter, role::Role, session::SessionBackend,
+        session_db::DbSessionStore,
     },
     config::{
         AppConfig, DomainAccountWriteSource, DomainEdgeWriteSource, DomainNodeWriteSource,
         DomainReadSource, PasskeyCredentialSource,
     },
-    middleware::auth::AuthContext,
+    domain_db::load_accounts_from_postgres,
+    middleware::{
+        auth::{auth_middleware, AuthContext},
+        csrf::require_csrf,
+        domain_projection::ensure_current_domain_projection,
+    },
     routes::{
+        api_router,
         circles::{
             accept_invitation, leave_circle, withdraw_invitation, InvitationRevisionQuery,
             LeaveCircleQuery,
@@ -31,6 +41,7 @@ use weltgewebe_api::{
     },
     state::{ApiState, OrderedCache},
     telemetry::{BuildInfo, Metrics},
+    test_helpers::EnvGuard,
 };
 
 fn app_state(pool: PgPool) -> ApiState {
@@ -955,6 +966,381 @@ async fn historical_pending_invitations_are_backfilled_once_on_activation() {
         .await
         .unwrap();
     for id in [&founder, &invitee] {
+        sqlx::query("DELETE FROM domain_accounts WHERE id=$1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+}
+
+/// One disposable, production-middleware HTTP proof: four distinct cookie
+/// sessions share canonical PostgreSQL, not mocked request AuthContexts.
+/// Browser rendering and live production A/B acceptance remain separate.
+fn personal_events_session_router(state: ApiState) -> Router {
+    Router::new()
+        .merge(
+            api_router()
+                .layer(from_fn_with_state(
+                    state.clone(),
+                    ensure_current_domain_projection,
+                ))
+                .route_layer(from_fn_with_state(state.clone(), auth_middleware))
+                .layer(axum::middleware::from_fn(require_csrf)),
+        )
+        .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 18081))))
+        .with_state(state)
+}
+
+async fn personal_events_http(
+    app: &Router,
+    method: Method,
+    path: &str,
+    cookie: Option<&str>,
+    payload: Option<Value>,
+    with_origin: bool,
+) -> (StatusCode, String) {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(path)
+        .header(header::HOST, "localhost");
+    if with_origin {
+        request = request.header(header::ORIGIN, "http://localhost");
+    }
+    if let Some(cookie) = cookie {
+        request = request.header(header::COOKIE, cookie);
+    }
+    let body = if let Some(value) = payload {
+        request = request.header(header::CONTENT_TYPE, "application/json");
+        Body::from(value.to_string())
+    } else {
+        Body::empty()
+    };
+    let response = app
+        .clone()
+        .oneshot(request.body(body).expect("P3a HTTP request"))
+        .await
+        .expect("P3a HTTP response");
+    let status = response.status();
+    let bytes = body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("bounded P3a HTTP response");
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+async fn personal_events_login(app: &Router, account_id: &str) -> String {
+    let request = Request::post("/auth/dev/login")
+        .header(header::HOST, "localhost")
+        .header(header::ORIGIN, "http://localhost")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({"account_id": account_id}).to_string()))
+        .expect("local-only test login");
+    let response = app.clone().oneshot(request).await.expect("login response");
+    assert_eq!(response.status(), StatusCode::OK, "disposable dev login");
+    response
+        .headers()
+        .get(header::SET_COOKIE)
+        .expect("real session Set-Cookie")
+        .to_str()
+        .expect("ASCII session cookie")
+        .split(';')
+        .next()
+        .expect("session cookie pair")
+        .to_owned()
+}
+
+async fn personal_events_inbox(app: &Router, cookie: &str) -> Value {
+    let (status, response) = personal_events_http(
+        app,
+        Method::GET,
+        "/personal-events",
+        Some(cookie),
+        None,
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    serde_json::from_str(&response).expect("personal inbox JSON")
+}
+
+#[tokio::test]
+#[serial]
+#[ignore = "requires DATABASE_URL for a disposable direct PostgreSQL database"]
+async fn independent_http_cookies_deliver_private_circle_invites_answers_and_read_receipts() {
+    let _dev_login = EnvGuard::set("AUTH_DEV_LOGIN", "1");
+    let _remote_login = EnvGuard::unset("AUTH_DEV_LOGIN_ALLOW_REMOTE");
+    let _csrf_override = EnvGuard::unset("CSRF_ALLOWED_ORIGINS");
+    let url = support::postgres_proof::validated_direct_disposable_url(
+        std::env::var("DATABASE_URL").expect("disposable PostgreSQL URL"),
+    );
+    let pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&url)
+        .await
+        .expect("connect disposable PostgreSQL");
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+    let suffix = Uuid::new_v4().simple();
+    let a = format!("p3a-cookie-founder-{suffix}");
+    let b = format!("p3a-cookie-invitee-{suffix}");
+    let c = format!("p3a-cookie-decliner-{suffix}");
+    let guest = format!("p3a-cookie-guest-{suffix}");
+    for (id, role) in [
+        (&a, "weber"),
+        (&b, "weber"),
+        (&c, "weber"),
+        (&guest, "gast"),
+    ] {
+        sqlx::query(
+            "INSERT INTO domain_accounts(id,title,kind,role,map_state,location_lat,location_lon)
+             VALUES($1,$1,'garnrolle',$2,'not_on_map',53.555,10.055)",
+        )
+        .bind(id)
+        .bind(role)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let mut state = app_state(pool.clone());
+    *state.accounts.write().await = load_accounts_from_postgres(&pool)
+        .await
+        .expect("load the real PostgreSQL account projection");
+    state.sessions = SessionBackend::new(DbSessionStore::new(pool.clone()));
+    state.config.auth_cookie_secure = false; // localhost-only proof, never production
+    let app = personal_events_session_router(state);
+    let cookie_a = personal_events_login(&app, &a).await;
+    let cookie_b = personal_events_login(&app, &b).await;
+    let cookie_c = personal_events_login(&app, &c).await;
+    let cookie_guest = personal_events_login(&app, &guest).await;
+    assert_ne!(
+        cookie_a, cookie_b,
+        "different users have independent sessions"
+    );
+    assert_ne!(cookie_b, cookie_c, "session identity must not be reused");
+
+    for (id, cookie) in [
+        (&a, &cookie_a),
+        (&b, &cookie_b),
+        (&c, &cookie_c),
+        (&guest, &cookie_guest),
+    ] {
+        let (status, response) =
+            personal_events_http(&app, Method::GET, "/auth/me", Some(cookie), None, true).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&response).unwrap()["account_id"],
+            id.as_str(),
+            "every cookie must resolve only its real owner"
+        );
+    }
+    let (anonymous, _) =
+        personal_events_http(&app, Method::GET, "/personal-events", None, None, true).await;
+    assert_eq!(anonymous, StatusCode::UNAUTHORIZED);
+
+    // A real HTTP POST creates the circle and inserts the two PostgreSQL
+    // personal events in the same transaction: no manual message fixture.
+    let (created, response) = personal_events_http(
+        &app,
+        Method::POST,
+        "/circles",
+        Some(&cookie_a),
+        Some(json!({
+            "kind": "household",
+            "name": "Cookie-Proof House",
+            "invitee_account_id": b
+        })),
+        true,
+    )
+    .await;
+    assert_eq!(created, StatusCode::CREATED, "{response}");
+    let circle = serde_json::from_str::<Value>(&response).unwrap()["id"]
+        .as_str()
+        .expect("created household id")
+        .to_owned();
+
+    let incoming = personal_events_inbox(&app, &cookie_b).await;
+    assert_eq!(incoming["unread_count"], 1);
+    assert_eq!(incoming["items"][0]["event_kind"], "circle_invited");
+    assert_eq!(incoming["items"][0]["actionable"], true);
+    let event_id = incoming["items"][0]["id"].as_str().unwrap();
+    let timestamp = incoming["items"][0]["invitation_created_at"]
+        .as_str()
+        .unwrap()
+        .replace('+', "%2B");
+    let sent = personal_events_inbox(&app, &cookie_a).await;
+    assert_eq!(sent["unread_count"], 0);
+    assert_eq!(sent["items"][0]["event_kind"], "circle_invitation_sent");
+    for cookie in [&cookie_c, &cookie_guest] {
+        let page = personal_events_inbox(&app, cookie).await;
+        assert_eq!(page["unread_count"], 0);
+        assert!(page["items"].as_array().unwrap().is_empty());
+    }
+
+    let read_path = format!("/personal-events/{event_id}/read");
+    let (csrf, _) =
+        personal_events_http(&app, Method::POST, &read_path, Some(&cookie_b), None, false).await;
+    assert_eq!(
+        csrf,
+        StatusCode::FORBIDDEN,
+        "read receipt needs a same-origin request"
+    );
+    let (foreign, _) =
+        personal_events_http(&app, Method::POST, &read_path, Some(&cookie_c), None, true).await;
+    assert_eq!(
+        foreign,
+        StatusCode::NOT_FOUND,
+        "other accounts cannot read B's event"
+    );
+    let (marked, _) =
+        personal_events_http(&app, Method::POST, &read_path, Some(&cookie_b), None, true).await;
+    assert_eq!(marked, StatusCode::NO_CONTENT);
+    assert_eq!(
+        personal_events_inbox(&app, &cookie_b).await["unread_count"],
+        0
+    );
+
+    let accept_path =
+        format!("/circles/{circle}/accept?expected_invitation_created_at={timestamp}");
+    let (accepted, reply) = personal_events_http(
+        &app,
+        Method::POST,
+        &accept_path,
+        Some(&cookie_b),
+        None,
+        true,
+    )
+    .await;
+    assert_eq!(accepted, StatusCode::OK, "{reply}");
+    let (replayed, _) = personal_events_http(
+        &app,
+        Method::POST,
+        &accept_path,
+        Some(&cookie_b),
+        None,
+        true,
+    )
+    .await;
+    assert_eq!(replayed, StatusCode::CONFLICT);
+    let a_events = personal_events_inbox(&app, &cookie_a).await;
+    assert_eq!(
+        a_events["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|x| x["event_kind"] == "circle_joined")
+            .count(),
+        1
+    );
+    assert_eq!(
+        personal_events_inbox(&app, &cookie_b).await["items"][0]["actionable"],
+        false
+    );
+
+    // A invites C twice. Only the INSERT transition sends a new event.
+    let invite_path = format!("/circles/{circle}/invitations");
+    for _ in 0..2 {
+        let (status, _) = personal_events_http(
+            &app,
+            Method::POST,
+            &invite_path,
+            Some(&cookie_a),
+            Some(json!({"account_id": c})),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+    let c_inbox = personal_events_inbox(&app, &cookie_c).await;
+    assert_eq!(c_inbox["unread_count"], 1);
+    assert_eq!(
+        c_inbox["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|x| x["event_kind"] == "circle_invited")
+            .count(),
+        1
+    );
+    let c_round = c_inbox["items"][0]["invitation_created_at"]
+        .as_str()
+        .unwrap()
+        .replace('+', "%2B");
+    let decline_path = format!(
+        "/circles/{circle}/membership?expected_status=invited&expected_invitation_created_at={c_round}"
+    );
+    let (declined, _) = personal_events_http(
+        &app,
+        Method::DELETE,
+        &decline_path,
+        Some(&cookie_c),
+        None,
+        true,
+    )
+    .await;
+    assert_eq!(declined, StatusCode::NO_CONTENT);
+    let (stale, _) = personal_events_http(
+        &app,
+        Method::DELETE,
+        &decline_path,
+        Some(&cookie_c),
+        None,
+        true,
+    )
+    .await;
+    assert_eq!(stale, StatusCode::CONFLICT);
+    let c_after = personal_events_inbox(&app, &cookie_c).await;
+    assert_eq!(c_after["items"][0]["actionable"], false);
+    assert!(c_after["items"][0]["circle_id"].is_null());
+    assert!(c_after["items"][0]["circle_name"].is_null());
+    let a_after = personal_events_inbox(&app, &cookie_a).await;
+    assert_eq!(
+        a_after["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|x| x["event_kind"] == "circle_declined")
+            .count(),
+        1
+    );
+    assert_eq!(
+        a_after["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|x| x["event_kind"] == "circle_invitation_sent")
+            .count(),
+        2
+    );
+    assert_eq!(
+        personal_events_inbox(&app, &cookie_guest).await["unread_count"],
+        0
+    );
+
+    // The canonical 1:1 inbox remains separate from typed system messages.
+    for cookie in [&cookie_a, &cookie_b] {
+        let (status, response) = personal_events_http(
+            &app,
+            Method::GET,
+            "/direct-conversations",
+            Some(cookie),
+            None,
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert!(
+            !response.contains("Cookie-Proof House"),
+            "circle system events are not synthetic direct messages"
+        );
+    }
+
+    sqlx::query("DELETE FROM domain_audience_circles WHERE id=$1")
+        .bind(Uuid::parse_str(&circle).unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+    for id in [&a, &b, &c, &guest] {
         sqlx::query("DELETE FROM domain_accounts WHERE id=$1")
             .bind(id)
             .execute(&pool)
