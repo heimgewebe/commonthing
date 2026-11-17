@@ -19,6 +19,11 @@ name: Map cardinality fullstack proof
       - "apps/web/src/lib/map/**"
       - "apps/web/src/routes/map/**"
       - "apps/web/tests/proofs/map-cardinality*.ts"
+      - "apps/web/tests/proofs/personal-events-fullstack.proof.ts"
+      - "apps/web/src/lib/components/PersonalEventsInbox.svelte"
+      - "apps/web/src/lib/api/personalEvents.ts"
+      - "apps/web/src/lib/api/audienceCircles.ts"
+      - "apps/web/src/routes/nachrichten/**"
   push:
     branches: [main]
     paths:
@@ -36,6 +41,11 @@ name: Map cardinality fullstack proof
       - "apps/web/src/lib/map/**"
       - "apps/web/src/routes/map/**"
       - "apps/web/tests/proofs/map-cardinality*.ts"
+      - "apps/web/tests/proofs/personal-events-fullstack.proof.ts"
+      - "apps/web/src/lib/components/PersonalEventsInbox.svelte"
+      - "apps/web/src/lib/api/personalEvents.ts"
+      - "apps/web/src/lib/api/audienceCircles.ts"
+      - "apps/web/src/routes/nachrichten/**"
   workflow_dispatch: {}
 
 env:
