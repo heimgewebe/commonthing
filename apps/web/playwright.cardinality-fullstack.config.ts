@@ -56,7 +56,12 @@ export default defineConfig({
   ...baseConfig,
   webServer,
   testDir: "tests/proofs",
-  testMatch: ["**/map-cardinality-fullstack.performance.proof.ts"],
+  // Run the private-account contract before the 100k-node map benchmark.
+  // Both reuse the same PostgreSQL/API/Chromium runner, but not the heavy map fixture.
+  testMatch:
+    process.env.P3A_FULLSTACK_PROOF === "1"
+      ? ["**/personal-events-fullstack.proof.ts"]
+      : ["**/map-cardinality-fullstack.performance.proof.ts"],
   timeout: 360_000,
   retries: 0,
   workers: 1,
