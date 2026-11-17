@@ -23,7 +23,9 @@
       "source-map-js": "^1.2.2"
     },
     "auditConfig": {
-      "ignoreCves": ["CVE-2026-128120"]
+      "ignoreCves": [
+        "CVE-2026-128120"
+      ]
     }
   },
   "scripts": {
