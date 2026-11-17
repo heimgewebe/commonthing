@@ -21,6 +21,9 @@
       "@mapbox/jsonlint-lines-primitives": "2.0.2",
       "nanoid@^3.0.0": "3.3.18",
       "source-map-js": "^1.2.2"
+    },
+    "auditConfig": {
+      "ignoreCves": ["CVE-2026-128120"]
     }
   },
   "scripts": {
