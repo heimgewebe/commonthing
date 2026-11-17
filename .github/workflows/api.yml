@@ -696,6 +696,13 @@ jobs:
               --test db_governance_conversation_target \
               -- --include-ignored --test-threads=1
 
+      - name: Run household duplicate and full member-list regression
+        run: |
+          DATABASE_URL="postgres://${PGUSER}:${PGPASSWORD}@localhost:5432/${PGDATABASE}" \
+            cargo test --locked -p weltgewebe-api \
+              --test db_personal_events household_create_invite_and_full_member_list_regression \
+              -- --include-ignored --test-threads=1
+
   db-domain-edge-write-path-proof:
     name: db domain edge write path proof (phase e-c)
     runs-on: ubuntu-latest

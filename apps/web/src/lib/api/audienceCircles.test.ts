@@ -178,4 +178,24 @@ describe("voluntary audience circle API", () => {
       expect.objectContaining({ credentials: "include" }),
     );
   });
+
+  it("reports an existing household without pretending a new one was created", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response(null, { status: 409 })),
+    );
+    await expect(createHousehold("neighbor")).rejects.toThrow(
+      "bereits eine Hausgemeinschaft oder einen offenen Vorschlag",
+    );
+  });
+
+  it("reports an already invited member instead of a second sent invitation", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response(null, { status: 409 })),
+    );
+    await expect(inviteToCircle("house-1", "neighbor")).rejects.toThrow(
+      "bereits eingeladen oder Mitglied",
+    );
+  });
 });

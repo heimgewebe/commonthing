@@ -254,7 +254,7 @@ pub async fn list_circle_members(
         "SELECT a.id AS account_id, a.title FROM domain_audience_circle_members m
          JOIN domain_accounts a ON a.id=m.account_id
          WHERE m.circle_id=$1 AND m.status='active' AND a.disabled=FALSE
-         ORDER BY a.title, a.id LIMIT 100",
+         ORDER BY a.title, a.id",
     )
     .bind(id)
     .fetch_all(&mut *tx)
@@ -304,6 +304,41 @@ pub async fn create_circle(
         .begin()
         .await
         .map_err(internal_error("begin_create_circle"))?;
+    // A pair cannot create parallel pending/active circles of the same kind.
+    // The unordered pair lock also serializes simultaneous A->B and B->A proposals
+    // across replicas without introducing another persistence structure.
+    let pair_key = if actor <= invited {
+        format!("circle-pair:{kind}:{actor}:{invited}")
+    } else {
+        format!("circle-pair:{kind}:{invited}:{actor}")
+    };
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(&pair_key)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal_error("lock_circle_pair"))?;
+    let already_shared: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1 FROM domain_audience_circles c
+            JOIN domain_audience_circle_members first
+              ON first.circle_id=c.id AND first.account_id=$1
+            JOIN domain_audience_circle_members second
+              ON second.circle_id=c.id AND second.account_id=$2
+            WHERE c.kind=$3 AND c.state <> 'inactive'
+        )",
+    )
+    .bind(actor)
+    .bind(invited)
+    .bind(kind)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(internal_error("check_existing_circle_pair"))?;
+    if already_shared {
+        return Err((
+            StatusCode::CONFLICT,
+            "shared circle already exists".to_owned(),
+        ));
+    }
     let circle_id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO domain_audience_circles
@@ -447,7 +482,7 @@ pub async fn invite_account(
     if circle_state != "active" {
         return Err((StatusCode::CONFLICT, "circle is not yet active".to_owned()));
     }
-    sqlx::query(
+    let inserted = sqlx::query(
         "INSERT INTO domain_audience_circle_members
              (circle_id, account_id, status, invited_by_account_id)
          VALUES ($1, $2, 'invited', $3)
@@ -459,6 +494,12 @@ pub async fn invite_account(
     .execute(&mut *tx)
     .await
     .map_err(internal_error("insert_invitation"))?;
+    if inserted.rows_affected() == 0 {
+        return Err((
+            StatusCode::CONFLICT,
+            "account already invited or a member".to_owned(),
+        ));
+    }
     tx.commit().await.map_err(internal_error("commit_invite"))?;
     Ok((
         StatusCode::NO_CONTENT,

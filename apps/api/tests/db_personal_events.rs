@@ -1237,9 +1237,10 @@ async fn independent_http_cookies_deliver_private_circle_invites_answers_and_rea
         false
     );
 
-    // A invites C twice. Only the INSERT transition sends a new event.
+    // A invites C twice. The first INSERT sends one event; the second
+    // attempt must not masquerade as a newly sent invitation.
     let invite_path = format!("/circles/{circle}/invitations");
-    for _ in 0..2 {
+    for attempt in 0..2 {
         let (status, _) = personal_events_http(
             &app,
             Method::POST,
@@ -1249,7 +1250,14 @@ async fn independent_http_cookies_deliver_private_circle_invites_answers_and_rea
             true,
         )
         .await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            status,
+            if attempt == 0 {
+                StatusCode::NO_CONTENT
+            } else {
+                StatusCode::CONFLICT
+            }
+        );
     }
     let c_inbox = personal_events_inbox(&app, &cookie_c).await;
     assert_eq!(c_inbox["unread_count"], 1);
@@ -1347,4 +1355,176 @@ async fn independent_http_cookies_deliver_private_circle_invites_answers_and_rea
             .await
             .unwrap();
     }
+}
+
+/// Regression: duplicate founding and duplicate invites must not claim new
+/// deliveries; the member list may not silently hide everyone after member 100.
+#[tokio::test]
+#[serial]
+#[ignore = "requires DATABASE_URL for a disposable direct PostgreSQL database"]
+async fn household_create_invite_and_full_member_list_regression() {
+    use weltgewebe_api::routes::circles::{create_circle, invite_account, list_circle_members};
+
+    let url = support::postgres_proof::validated_direct_disposable_url(
+        std::env::var("DATABASE_URL").expect("disposable PostgreSQL URL"),
+    );
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&url)
+        .await
+        .expect("connect PostgreSQL");
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+    let token = Uuid::new_v4();
+    let owner = format!("fix-owner-{token}");
+    let neighbor = format!("fix-neighbor-{token}");
+    let third = format!("fix-third-{token}");
+    for id in [&owner, &neighbor, &third] {
+        sqlx::query(
+            "INSERT INTO domain_accounts(id,title,kind,location_lat,location_lon)
+             VALUES ($1,$1,'garnrolle',53.55,10.05)",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let input = || {
+        axum::Json(
+            serde_json::from_value(json!({
+                "kind": "household", "invitee_account_id": neighbor
+            }))
+            .unwrap(),
+        )
+    };
+    let created = create_circle(
+        State(app_state(pool.clone())),
+        Extension(actor(&owner)),
+        input(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let response: Value = serde_json::from_slice(
+        &body::to_bytes(created.into_body(), 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let id = Uuid::parse_str(response["id"].as_str().unwrap()).unwrap();
+    assert_eq!(kinds(&pool, &neighbor).await, vec!["circle_invited"]);
+
+    let duplicate = create_circle(
+        State(app_state(pool.clone())),
+        Extension(actor(&owner)),
+        input(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(duplicate.0, StatusCode::CONFLICT);
+
+    let reverse = create_circle(
+        State(app_state(pool.clone())),
+        Extension(actor(&neighbor)),
+        axum::Json(
+            serde_json::from_value(json!({
+                "kind": "household", "invitee_account_id": owner
+            }))
+            .unwrap(),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(reverse.0, StatusCode::CONFLICT);
+    assert_eq!(kinds(&pool, &neighbor).await, vec!["circle_invited"]);
+
+    let invited_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+        "SELECT created_at FROM domain_audience_circle_members
+         WHERE circle_id=$1 AND account_id=$2",
+    )
+    .bind(id)
+    .bind(&neighbor)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let accepted: InvitationRevisionQuery = serde_json::from_value(json!({
+        "expected_invitation_created_at": invited_at
+    }))
+    .unwrap();
+    accept_invitation(
+        State(app_state(pool.clone())),
+        Extension(actor(&neighbor)),
+        Path(id),
+        Query(accepted),
+    )
+    .await
+    .unwrap();
+
+    let third_invitation = || {
+        axum::Json(
+            serde_json::from_value(json!({
+                "account_id": third
+            }))
+            .unwrap(),
+        )
+    };
+    let sent = invite_account(
+        State(app_state(pool.clone())),
+        Extension(actor(&owner)),
+        Path(id),
+        third_invitation(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(sent.status(), StatusCode::NO_CONTENT);
+    let duplicate_invite = invite_account(
+        State(app_state(pool.clone())),
+        Extension(actor(&owner)),
+        Path(id),
+        third_invitation(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(duplicate_invite.0, StatusCode::CONFLICT);
+    assert_eq!(kinds(&pool, &third).await, vec!["circle_invited"]);
+
+    // 100 additional accepted members: they must all be visible, in addition
+    // to the two founders. The third invitee remains invisible until accepted.
+    let prefix = format!("fix-extra-{token}-");
+    sqlx::query(
+        "INSERT INTO domain_accounts(id,title,kind,location_lat,location_lon)
+         SELECT $1 || g::text, $1 || g::text, 'garnrolle',53.55,10.05
+         FROM generate_series(1,100) g",
+    )
+    .bind(&prefix)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO domain_audience_circle_members
+          (circle_id,account_id,status,invited_by_account_id,joined_at)
+         SELECT $1, $2 || g::text, 'active', $3, NOW()
+         FROM generate_series(1,100) g",
+    )
+    .bind(id)
+    .bind(&prefix)
+    .bind(&owner)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let members = list_circle_members(
+        State(app_state(pool.clone())),
+        Extension(actor(&owner)),
+        Path(id),
+    )
+    .await
+    .unwrap();
+    let members_json: Value = serde_json::from_slice(
+        &body::to_bytes(members.into_body(), 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(members_json.as_array().unwrap().len(), 102);
 }

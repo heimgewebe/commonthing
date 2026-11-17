@@ -212,6 +212,18 @@ sleep() { :; }
         self.assertIn('"${{ steps.image.outputs.image }}"', self.job)
         self.assertIn('commit=\\"${{ steps.image.outputs.commit }}\\"', self.job)
 
+    def test_exact_revision_registry_accepts_oci_image_index(self) -> None:
+        # BuildKit may publish an OCI index even for a single-platform image.
+        # The registry rejects HEAD with 404 unless its Accept header includes
+        # the index media type; the resolved digest must still be used for pull.
+        image_step = self.job.split("name: Build the exact API revision", 1)[1].split(
+            "name: Apply embedded migrations from the measured image", 1
+        )[0]
+        self.assertIn("application/vnd.oci.image.index.v1+json", image_step)
+        self.assertIn("-H \"Accept: ${MANIFEST_ACCEPT}\"", image_step)
+        self.assertIn('API_IMAGE_DIGEST="${API_IMAGE_REPOSITORY}@${API_DIGEST}"', image_step)
+        self.assertIn('docker pull "${API_IMAGE_DIGEST}"', image_step)
+
     def test_live_measurement_collects_every_required_input_during_one_run(
         self,
     ) -> None:
