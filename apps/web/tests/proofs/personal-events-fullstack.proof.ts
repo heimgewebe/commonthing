@@ -231,14 +231,15 @@ test("real PostgreSQL browsers: personal invitations are private, actionable and
       aInbox.getByText(joined!.content, { exact: true }),
     ).toBeVisible();
 
-    // The same invite is sent twice. Only the real INSERT changes the
-    // membership and creates one persistently unread notice for C.
+    // A new invite succeeds; retrying an existing invite reports a
+    // conflict instead of pretending to send another notification.
+    // Only the first INSERT creates one persistently unread notice for C.
     for (let i = 0; i < 2; i += 1) {
       const invite = await aContext.request.post(
         api("/circles/" + circleId + "/invitations"),
         { data: { account_id: c }, headers: { origin: WEB_ORIGIN } },
       );
-      expect(invite.status()).toBe(204);
+      expect(invite.status()).toBe(i === 0 ? 204 : 409);
     }
     const cBefore = await personalEvents(cContext);
     expect(cBefore.unread_count).toBe(1);

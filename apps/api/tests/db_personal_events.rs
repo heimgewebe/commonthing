@@ -1237,9 +1237,10 @@ async fn independent_http_cookies_deliver_private_circle_invites_answers_and_rea
         false
     );
 
-    // A invites C twice. Only the INSERT transition sends a new event.
+    // A invites C twice. The first INSERT sends one event; the second
+    // attempt must not masquerade as a newly sent invitation.
     let invite_path = format!("/circles/{circle}/invitations");
-    for _ in 0..2 {
+    for attempt in 0..2 {
         let (status, _) = personal_events_http(
             &app,
             Method::POST,
@@ -1249,7 +1250,14 @@ async fn independent_http_cookies_deliver_private_circle_invites_answers_and_rea
             true,
         )
         .await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            status,
+            if attempt == 0 {
+                StatusCode::NO_CONTENT
+            } else {
+                StatusCode::CONFLICT
+            }
+        );
     }
     let c_inbox = personal_events_inbox(&app, &cookie_c).await;
     assert_eq!(c_inbox["unread_count"], 1);
