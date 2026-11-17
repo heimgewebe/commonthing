@@ -295,7 +295,8 @@ jobs:
             --build-arg CARGO_BUILD_JOBS=2 \
             .
           docker push "${API_IMAGE_TAG}"
-          MANIFEST_ACCEPT='application/vnd.oci.image.manifest.v1+json, '
+          MANIFEST_ACCEPT='application/vnd.oci.image.index.v1+json, '
+          MANIFEST_ACCEPT="${MANIFEST_ACCEPT}application/vnd.oci.image.manifest.v1+json, "
           MANIFEST_ACCEPT="${MANIFEST_ACCEPT}application/vnd.docker.distribution.manifest.v2+json"
           API_DIGEST="$(
             curl -fsSI \
