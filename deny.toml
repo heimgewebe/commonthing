@@ -2,7 +2,12 @@
 version = 2
 yanked = "warn"
 # pin-utils is unmaintained transitively via hyper; no exploitable defect is reported.
-ignore = [{ id = "RUSTSEC-2026-0441", reason = "unmaintained transitive pin-utils via hyper; upstream still depends on it" }]
+ignore = [
+  { id = "RUSTSEC-2026-0441", reason = "unmaintained transitive pin-utils via hyper; upstream still depends on it" },
+  # Informational maintenance notice, not a known exploit. All chrono versions are affected;
+  # direct API and SQLx timestamp types have no drop-in fixed release.
+  { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; no safe upgrade, used directly by API and via SQLx" },
+]
 
 [bans]
 multiple-versions = "warn"
