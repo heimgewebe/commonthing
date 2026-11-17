@@ -14,13 +14,17 @@ export interface AudienceCircleMember {
 }
 
 export class AudienceCircleError extends Error {
-  constructor(public readonly status: number) {
+  constructor(
+    public readonly status: number,
+    detail?: string,
+  ) {
     super(
-      status === 401
-        ? "Bitte melde dich erneut an."
-        : status === 503 || status === 404
-          ? "Die Hausgemeinschaft ist derzeit nicht verfügbar."
-          : "Die Aktion konnte nicht abgeschlossen werden.",
+      detail ??
+        (status === 401
+          ? "Bitte melde dich erneut an."
+          : status === 503 || status === 404
+            ? "Die Hausgemeinschaft ist derzeit nicht verfügbar."
+            : "Die Aktion konnte nicht abgeschlossen werden."),
     );
     this.name = "AudienceCircleError";
   }
@@ -82,6 +86,14 @@ export const createHousehold = (inviteeAccountId: string) =>
       kind: "household",
       invitee_account_id: inviteeAccountId,
     }),
+  }).catch((error: unknown) => {
+    if (error instanceof AudienceCircleError && error.status === 409) {
+      throw new AudienceCircleError(
+        409,
+        "Mit dieser Person gibt es bereits eine Hausgemeinschaft oder einen offenen Vorschlag.",
+      );
+    }
+    throw error;
   });
 
 const invitationQuery = (createdAt: string) =>
@@ -99,6 +111,14 @@ export const inviteToCircle = (id: string, accountId: string) =>
   request<void>(`/api/circles/${encodeURIComponent(id)}/invitations`, {
     method: "POST",
     body: JSON.stringify({ account_id: accountId }),
+  }).catch((error: unknown) => {
+    if (error instanceof AudienceCircleError && error.status === 409) {
+      throw new AudienceCircleError(
+        409,
+        "Diese Person ist bereits eingeladen oder Mitglied.",
+      );
+    }
+    throw error;
   });
 
 export const leaveCircle = (id: string) =>
