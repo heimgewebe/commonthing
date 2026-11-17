@@ -12,7 +12,7 @@ BODY_FILES=()
 
 echo "Testing magic-link email rate limit at ${REQUEST_URL}"
 
-# shellcheck disable=SC2317
+# shellcheck disable=SC2317,SC2329
 cleanup() {
   for body_file in "${BODY_FILES[@]:-}"; do
     if [ -n "${body_file:-}" ] && [ -f "$body_file" ]; then
