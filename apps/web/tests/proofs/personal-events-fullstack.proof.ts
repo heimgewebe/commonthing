@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { expect, test, type BrowserContext } from "@playwright/test";
+import {
+  expect,
+  test,
+  type BrowserContext,
+  type Locator,
+} from "@playwright/test";
 
 const DATABASE_URL = process.env.MAP_CARDINALITY_FULLSTACK_DATABASE_URL ?? "";
 const API_ORIGIN = process.env.MAP_CARDINALITY_FULLSTACK_API_BASE ?? "";
@@ -96,7 +101,15 @@ async function personalEvents(context: BrowserContext): Promise<{
   return response.json();
 }
 
-test("real PostgreSQL and Chromium: personal invitations are private, actionable and idempotent", async ({
+async function activate(button: Locator, touch: boolean): Promise<void> {
+  if (touch) {
+    await button.tap();
+  } else {
+    await button.click();
+  }
+}
+
+test("real PostgreSQL browsers: personal invitations are private, actionable and idempotent", async ({
   browser,
 }) => {
   test.setTimeout(180_000);
@@ -116,6 +129,7 @@ test("real PostgreSQL and Chromium: personal invitations are private, actionable
   const houseName = "Browser-Proof-Haus-" + randomUUID().slice(0, 8);
   let circleId: string | null = null;
   const contexts: BrowserContext[] = [];
+  const webkitTouch = browser.browserType().name() === "webkit";
 
   // Test-only records are confined to the existing guarded disposable DB.
   // No API handler, session cookie or permission is mocked in this proof.
@@ -142,7 +156,11 @@ test("real PostgreSQL and Chromium: personal invitations are private, actionable
       const context = await browser.newContext({
         baseURL: WEB_ORIGIN,
         viewport:
-          i === 2 ? { width: 390, height: 844 } : { width: 820, height: 1050 },
+          i === 2
+            ? { width: 390, height: 844 }
+            : { width: 820, height: webkitTouch ? 1180 : 1050 },
+        isMobile: webkitTouch,
+        hasTouch: webkitTouch,
         serviceWorkers: "block",
       });
       contexts.push(context);
@@ -186,7 +204,10 @@ test("real PostgreSQL and Chromium: personal invitations are private, actionable
       expect(page.unread_count).toBe(0);
     }
 
-    await bInbox.getByRole("button", { name: "Annehmen" }).click();
+    await activate(
+      bInbox.getByRole("button", { name: "Annehmen" }),
+      webkitTouch,
+    );
     await expect(bInbox.getByRole("button", { name: "Annehmen" })).toHaveCount(
       0,
     );
@@ -229,7 +250,10 @@ test("real PostgreSQL and Chromium: personal invitations are private, actionable
     await cPage.goto("/nachrichten");
     const cInbox = cPage.getByTestId("personal-events-inbox");
     await expect(cInbox.getByText(houseName, { exact: true })).toBeVisible();
-    await cInbox.getByRole("button", { name: "Ablehnen" }).click();
+    await activate(
+      cInbox.getByRole("button", { name: "Ablehnen" }),
+      webkitTouch,
+    );
     await expect(cInbox.getByRole("button", { name: "Ablehnen" })).toHaveCount(
       0,
     );
@@ -243,7 +267,10 @@ test("real PostgreSQL and Chromium: personal invitations are private, actionable
       aAfter.items.filter((e) => e.event_kind === "circle_declined"),
     ).toHaveLength(1);
 
-    await aInbox.getByRole("button", { name: "Aktualisieren" }).click();
+    await activate(
+      aInbox.getByRole("button", { name: "Aktualisieren" }),
+      webkitTouch,
+    );
     const declined = aAfter.items.find(
       (e) => e.event_kind === "circle_declined",
     );

@@ -57,7 +57,7 @@ export default defineConfig({
   webServer,
   testDir: "tests/proofs",
   // Run the private-account contract before the 100k-node map benchmark.
-  // Both reuse the same PostgreSQL/API/Chromium runner, but not the heavy map fixture.
+  // Both reuse the same PostgreSQL/API runner, but not the heavy map fixture.
   testMatch:
     process.env.P3A_FULLSTACK_PROOF === "1"
       ? ["**/personal-events-fullstack.proof.ts"]
@@ -68,7 +68,11 @@ export default defineConfig({
   fullyParallel: false,
   use: {
     ...baseConfig.use,
-    browserName: "chromium",
+    browserName:
+      process.env.P3A_FULLSTACK_PROOF === "1" &&
+      process.env.P3A_FULLSTACK_BROWSER === "webkit"
+        ? "webkit"
+        : "chromium",
     // Tracing records screenshots/DOM snapshots and is deliberately disabled
     // for this timed benchmark so the observer is not part of the measured
     // workload. The proof attaches its raw frame vectors after each timed
