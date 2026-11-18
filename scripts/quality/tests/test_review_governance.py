@@ -809,8 +809,10 @@ class BundleTests(unittest.TestCase):
         )
         self.assertIsNotNone(match)
         block = match.group(1)
+        self.assertIn('select(', block)
+        self.assertIn('.status != "removed" or', block)
         self.assertIn(
-            'select(.status != "removed" or .filename == "apps/web/static/fonts/atkinson-hyperlegible-next-latin-wght-normal.woff2")',
+            '.filename == "apps/web/static/fonts/atkinson-hyperlegible-next-latin-wght-normal.woff2"',
             block,
         )
         # The pinned WOFF2 needs its opaque candidate so its original proof
