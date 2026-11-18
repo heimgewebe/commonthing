@@ -284,111 +284,14 @@ jobs:
             fi
           fi
 
-          # Only the exact MODIFIED heading pair, original ADDED text pair,
-          # or the newer, separately SHA-pinned MODIFIED text pair.
-          # Pin every byte and its unchanged photo source from the trusted base;
-          # never execute PR code, admit mixed pairs, or allow arbitrary WOFF.
-          wool_font_proofs='[]'
-          wool_mode=''
-          wool_dark='apps/web/static/fonts/garnschrift-c-dark.woff'
-          wool_light='apps/web/static/fonts/garnschrift-c-light.woff'
-          wool_text_dark='apps/web/static/fonts/garnschrift-c-text-dark.woff'
-          wool_text_light='apps/web/static/fonts/garnschrift-c-text-light.woff'
-          if jq -e --arg dark "${wool_dark}" --arg light "${wool_light}" '
-            any(.[]; .filename == $dark) and any(.[]; .filename == $light)
-          ' "${RUNNER_TEMP}/files.json" >/dev/null; then
-            wool_mode='modified'
-            wool_dark_spec="${wool_dark}|"
-            wool_dark_spec+='c6c0d2c661226c89b85d7431cc27801a77e4b956|'
-            wool_dark_spec+='fe8979fe9f6cd5cd1cccbcc8d5a7ccf2cbe79e79ed575d82ec6c87bcfd5dff63|362748'
-            wool_light_spec="${wool_light}|"
-            wool_light_spec+='135f95506f756786ba6ae657971ed685b3eb80ab|'
-            wool_light_spec+='e16c9e1baae88bd56f46fbe97337991311e0a1cdcb7002a229deeb6613532f9e|399024'
-          elif jq -e --arg dark "${wool_text_dark}" --arg light "${wool_text_light}" \
-            --arg dark_blob '3071036210134188314045b94d227102dd2adc64' \
-            --arg light_blob '766e44785350063f1d554fb98da6493ddb6bff3c' '
-            any(.[]; .filename == $dark and .status == "modified" and .sha == $dark_blob) and
-            any(.[]; .filename == $light and .status == "modified" and .sha == $light_blob)
-          ' "${RUNNER_TEMP}/files.json" >/dev/null; then
-            wool_mode='modified'
-            wool_dark_spec="${wool_text_dark}|"
-            wool_dark_spec+='3071036210134188314045b94d227102dd2adc64|'
-            wool_dark_spec+='cc5216bfcfa22537c4f0f7ede840af4558cdf02d216b1cf0050de10c1b48e42b|430408'
-            wool_light_spec="${wool_text_light}|"
-            wool_light_spec+='766e44785350063f1d554fb98da6493ddb6bff3c|'
-            wool_light_spec+='dc0d5292b6ee71867b5dfb4c11d2b4c2ad259eb85a5f4238fff99057c3d8ea40|465684'
-          elif jq -e --arg dark "${wool_text_dark}" --arg light "${wool_text_light}" '
-            any(.[]; .filename == $dark and .status == "modified") and
-            any(.[]; .filename == $light and .status == "modified")
-          ' "${RUNNER_TEMP}/files.json" >/dev/null; then
-            wool_mode='modified'
-            wool_dark_spec="${wool_text_dark}|"
-            wool_dark_spec+='6cc666cb36548d5585b3f3c7c9239fb37894f569|'
-            wool_dark_spec+='c7f209f4e254c93fe642f6c2785c9f349cd42d8c68809c733fa8836db3ea2adf|412276'
-            wool_light_spec="${wool_text_light}|"
-            wool_light_spec+='939286440c31bab17b46c206ea6a733d07951b90|'
-            wool_light_spec+='6ecb836bb20a49f0b1ace328941c57d87bf475ad966b3068ef271362040202b7|448932'
-          elif jq -e --arg dark "${wool_text_dark}" --arg light "${wool_text_light}" '
-            any(.[]; .filename == $dark and .status == "added") and
-            any(.[]; .filename == $light and .status == "added")
-          ' "${RUNNER_TEMP}/files.json" >/dev/null; then
-            wool_mode='added'
-            wool_dark_spec="${wool_text_dark}|"
-            wool_dark_spec+='ea1f56c6b804fb140d6637248ea1df15608b4723|'
-            wool_dark_spec+='65b87161ff41cb584e26859715cf294bf59787054d0d973926ec3532429f9f36|389736'
-            wool_light_spec="${wool_text_light}|"
-            wool_light_spec+='e21aeda4bc5726ead4f0e7a5cf35a31e998ecad5|'
-            wool_light_spec+='a1a5854b9712d23a762a31cad0b3ed030b8e4a96f68c8c02cc123cc4be7031e7|424128'
-          fi
-          if [[ -n "${wool_mode}" ]]; then
-            wool_source_path='docs/assets/garnschrift-c-contact-sheet.png'
-            jq -e --arg source "${wool_source_path}" '
-              all(.[]; .filename != $source)
-            ' "${RUNNER_TEMP}/files.json" >/dev/null
-            wool_source_blob="$(gh api -H "${api_header}" \
-              "repos/${REPOSITORY}/contents/${wool_source_path}?ref=${base_sha}" \
-              | jq -er '.sha')"
-            [[ "${wool_source_blob}" == '3ada289072a765db9787208f6b95c6f73c3c7cce' ]]
-            for wool_spec in "${wool_dark_spec}" "${wool_light_spec}"; do
-              IFS='|' read -r wool_path expected_blob expected_sha expected_bytes <<< "${wool_spec}"
-              wool_blob="$(jq -er --arg path "${wool_path}" --arg mode "${wool_mode}" '
-                .[] | select(.filename == $path and .status == $mode) | .sha
-              ' "${RUNNER_TEMP}/files.json")"
-              [[ "${wool_blob}" == "${expected_blob}" ]]
-              gh api -H "${api_header}" \
-                "repos/${REPOSITORY}/git/blobs/${wool_blob}" \
-                > "${RUNNER_TEMP}/wool-blob.json"
-              jq -e --argjson size "${expected_bytes}" '
-                .encoding == "base64" and .size == $size
-              ' "${RUNNER_TEMP}/wool-blob.json" >/dev/null
-              jq -r '.content' "${RUNNER_TEMP}/wool-blob.json" \
-                | base64 --decode > "${RUNNER_TEMP}/verified-wool.woff"
-              [[ "$(wc -c < "${RUNNER_TEMP}/verified-wool.woff")" == "${expected_bytes}" ]]
-              wool_sha="$(sha256sum "${RUNNER_TEMP}/verified-wool.woff" | cut -d ' ' -f 1)"
-              [[ "${wool_sha}" == "${expected_sha}" ]]
-              [[ "$(od -An -tc -N4 "${RUNNER_TEMP}/verified-wool.woff" | tr -d '[:space:]')" == 'wOFF' ]]
-              wool_font_proofs="$(jq -cn \
-                --argjson old "${wool_font_proofs}" --arg path "${wool_path}" \
-                --arg blob "${wool_blob}" --arg sha "${wool_sha}" \
-                --argjson size "${expected_bytes}" --arg source "${wool_source_blob}" '
-                $old + [{
-                  path: $path, blob_sha: $blob, sha256: $sha,
-                  size: $size, magic: "wOFF", source_blob: $source
-                }]
-              ')"
-            done
-          fi
-
           jq -n \
             --argjson font_proof "${garn_font_proof}" \
-            --argjson wool_font_proofs "${wool_font_proofs}" \
             --slurpfile pr "${RUNNER_TEMP}/pr-before.json" \
             --slurpfile compare "${RUNNER_TEMP}/compare.json" \
             --slurpfile files "${RUNNER_TEMP}/files.json" '
             {
               schema_version: 1,
               font_asset_proof: $font_proof,
-              wool_font_proofs: $wool_font_proofs,
               pr_number: $pr[0].number,
               base_sha: $pr[0].base.sha,
               head_sha: $pr[0].head.sha,
@@ -402,11 +305,12 @@ jobs:
               ] | map(select(type == "string" and length > 0)) | unique),
               additions: $pr[0].additions,
               deletions: $pr[0].deletions,
-              # Every missing/null per-file patch remains an opaque candidate here.
-              # Never filter by additions/deletions: only the exact full diff
-              # may later prove that a candidate contains an ordinary text hunk.
+              # Removed files introduce no unreadable replacement bytes.
+              # Keep their paths in changed_files for review and risk classification.
+              # All remaining patchless files stay opaque candidates.
               opaque_files: [
                 $files[0][] |
+                select(.status != "removed") |
                 select((has("patch") | not) or .patch == null) |
                 .filename
               ]
