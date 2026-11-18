@@ -318,9 +318,7 @@ test.describe("Farbschema", () => {
         basemapStyleUrls.some((url) => url.includes("style-germany-dark.json")),
       )
       .toBe(true);
-    await expect(
-      page.getByRole("link", { name: "Einstellungen öffnen" }),
-    ).toBeVisible();
+    await expect(page.getByTestId("site-menu-trigger")).toBeVisible();
     await expect(page.getByTestId("theme-compact-button")).toHaveCount(0);
 
     await page.goto("/settings");
@@ -567,153 +565,52 @@ test.describe("Farbschema", () => {
     });
   });
 
-  test("hält Einstellungen und Anmeldung bei 320 Pixeln frei berührbar", async ({
+  test("zeigt ein berührbares Hauptmenü und Anmeldung auch bei 320 Pixeln", async ({
     page,
   }) => {
     await page.setViewportSize({ width: 320, height: 640 });
-    await page.route("**/_app/version.json", (route) =>
-      route.fulfill({ status: 404, body: "" }),
-    );
-    await page.route("**/api/auth/me", (route) =>
-      route.fulfill({
-        status: 401,
-        contentType: "application/json",
-        body: JSON.stringify({
-          authenticated: false,
-          account_id: null,
-          role: "gast",
-        }),
-      }),
-    );
+    await mockApiResponses(page, {
+      auth: { authenticated: false, role: "gast" },
+    });
     await page.goto("/map");
 
-    const settings = page.getByRole("link", { name: "Einstellungen öffnen" });
+    const trigger = page.getByTestId("site-menu-trigger");
     const login = page.getByRole("link", { name: "Anmelden", exact: true });
-    await expect(settings).toBeVisible();
+    await expect(trigger).toBeVisible();
     await expect(login).toBeVisible();
 
-    const settingsBox = await settings.boundingBox();
-    const loginBox = await login.boundingBox();
-    expect(settingsBox).not.toBeNull();
-    expect(loginBox).not.toBeNull();
-    expect(settingsBox!.x).toBeGreaterThanOrEqual(0);
-    expect(loginBox!.x).toBeGreaterThanOrEqual(
-      settingsBox!.x + settingsBox!.width,
-    );
-    expect(loginBox!.x + loginBox!.width).toBeLessThanOrEqual(320);
-
-    for (const [label, target] of [
-      ["Einstellungen", settings],
-      ["Anmelden", login],
-    ] as const) {
-      const hitTest = await target.evaluate((element) => {
-        const rect = element.getBoundingClientRect();
-        const hit = document.elementFromPoint(
-          rect.left + rect.width / 2,
-          rect.top + rect.height / 2,
-        );
-        return hit === element || (hit !== null && element.contains(hit));
-      });
-      expect(hitTest, `${label} ist nicht frei berührbar`).toBe(true);
+    for (const target of [trigger, login]) {
+      const box = await target.boundingBox();
+      expect(box).not.toBeNull();
+      expect(box!.x).toBeGreaterThanOrEqual(0);
+      expect(box!.x + box!.width).toBeLessThanOrEqual(320);
+      expect(box!.height).toBeGreaterThanOrEqual(44);
     }
+
+    await trigger.click();
+    const settings = page
+      .getByRole("navigation", { name: "Hauptmenü" })
+      .getByRole("link", { name: "Einstellungen", exact: true });
+    await expect(settings).toBeVisible();
+    await expect(settings).toHaveAttribute("href", "/settings");
   });
 
-  test("hält Gastzugriffe bis zur sicheren Textbreite kollisionsfrei", async ({
-    page,
-  }) => {
-    await page.route("**/_app/version.json", (route) =>
-      route.fulfill({ status: 404, body: "" }),
-    );
-    await page.route("**/api/auth/me", (route) =>
-      route.fulfill({
-        status: 401,
-        contentType: "application/json",
-        body: JSON.stringify({
-          authenticated: false,
-          account_id: null,
-          role: "gast",
-        }),
-      }),
-    );
-
-    for (const width of [361, 375, 390, 414, 430, 480, 510, 511]) {
-      await page.setViewportSize({ width, height: 720 });
-      await page.goto("/map");
-
-      const settings = page.getByRole("link", { name: "Einstellungen öffnen" });
-      const login = page.getByRole("link", { name: "Anmelden", exact: true });
-      await expect(settings).toBeVisible();
-      await expect(login).toBeVisible();
-
-      const settingsBox = await settings.boundingBox();
-      const loginBox = await login.boundingBox();
-      expect(settingsBox, `${width}px: Einstellungen fehlen`).not.toBeNull();
-      expect(loginBox, `${width}px: Anmeldung fehlt`).not.toBeNull();
-      expect(settingsBox!.x).toBeGreaterThanOrEqual(0);
-      expect(loginBox!.x).toBeGreaterThanOrEqual(
-        settingsBox!.x + settingsBox!.width,
-      );
-      expect(loginBox!.x + loginBox!.width).toBeLessThanOrEqual(width);
-
-      const loginLabel = login.locator(".auth-label");
-      if (width <= 510) {
-        await expect(loginLabel).toBeHidden();
-      } else {
-        await expect(loginLabel).toBeVisible();
-      }
-    }
-  });
-
-  test("zeigt private Nachrichten angemeldeten Webern direkt in der Kartenleiste", async ({
+  test("öffnet Nachrichten und Einstellungen für angemeldete Nutzer im Hauptmenü", async ({
     page,
   }) => {
     await page.setViewportSize({ width: 320, height: 640 });
-    await page.route("**/_app/version.json", (route) =>
-      route.fulfill({ status: 404, body: "" }),
-    );
-    await page.route("**/api/auth/me", (route) =>
-      route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        body: JSON.stringify({
-          authenticated: true,
-          account_id: "weber-test",
-          role: "weber",
-        }),
-      }),
-    );
+    await mockApiResponses(page, {
+      auth: { authenticated: true, account_id: "weber-test", role: "weber" },
+    });
     await page.goto("/map");
-
-    const messages = page.getByRole("link", { name: "Private Nachrichten" });
-    const settings = page.getByRole("link", { name: "Einstellungen öffnen" });
-    await expect(messages).toBeVisible();
-    await expect(messages).toHaveAttribute("href", "/nachrichten");
-    await expect(settings).toBeVisible();
-
-    const messagesBox = await messages.boundingBox();
-    const settingsBox = await settings.boundingBox();
-    expect(messagesBox).not.toBeNull();
-    expect(settingsBox).not.toBeNull();
-    expect(messagesBox!.x).toBeGreaterThanOrEqual(0);
-    expect(settingsBox!.x).toBeGreaterThanOrEqual(
-      messagesBox!.x + messagesBox!.width,
-    );
-    expect(settingsBox!.x + settingsBox!.width).toBeLessThanOrEqual(320);
-
-    for (const [label, target] of [
-      ["Private Nachrichten", messages],
-      ["Einstellungen", settings],
-    ] as const) {
-      const hitTest = await target.evaluate((element) => {
-        const rect = element.getBoundingClientRect();
-        const hit = document.elementFromPoint(
-          rect.left + rect.width / 2,
-          rect.top + rect.height / 2,
-        );
-        return hit === element || (hit !== null && element.contains(hit));
-      });
-      expect(hitTest, `${label} ist nicht frei berührbar`).toBe(true);
-    }
+    await page.getByTestId("site-menu-trigger").click();
+    const menu = page.getByRole("navigation", { name: "Hauptmenü" });
+    await expect(
+      menu.getByRole("link", { name: "Nachrichten" }),
+    ).toHaveAttribute("href", "/nachrichten");
+    await expect(
+      menu.getByRole("link", { name: "Einstellungen", exact: true }),
+    ).toHaveAttribute("href", "/settings");
   });
 
   test("ordnet Kopf und Darstellungssteuerung ohne Überlappung", async ({

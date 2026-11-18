@@ -5,7 +5,6 @@
     retainAccountAttentionRuntime,
   } from "$lib/accountAttentionRuntime";
   import { authStore } from "$lib/auth/store";
-  import { garnrolleIcon } from "$lib/ui/icons";
   import { deriveTopBarAuthView } from "./topBarAuthState";
 
   let authView = $derived.by(() => deriveTopBarAuthView($authStore));
@@ -46,29 +45,44 @@
     void authStore.checkAuth({ force: true });
   }
 
+  let menuEl: HTMLDetailsElement | undefined = $state();
+
+  function closeMenuOnOutsideClick(event: PointerEvent) {
+    if (menuEl?.open && !menuEl.contains(event.target as Node)) {
+      menuEl.open = false;
+    }
+  }
+
+  function closeMenuOnEscape(event: KeyboardEvent) {
+    if (!menuEl?.open || event.key !== "Escape") return;
+    event.preventDefault();
+    menuEl.open = false;
+    menuEl.querySelector("summary")?.focus();
+  }
+
   onMount(() => retainAccountAttentionRuntime());
 </script>
 
-<div class="auth-slot">
-  {#if authView.showAccountLink}
-    <a
-      class="message-entry"
-      href="/nachrichten"
-      aria-label="Private Nachrichten"
-      title="Private Nachrichten"
-    >
-      <span aria-hidden="true">✉</span>
-    </a>
-  {/if}
+<svelte:window
+  onpointerdown={closeMenuOnOutsideClick}
+  onkeydown={closeMenuOnEscape}
+/>
 
-  <a
-    class="garnrolle-link"
-    href="/settings"
-    aria-label="Einstellungen öffnen"
-    title="Einstellungen"
-  >
-    <img src={garnrolleIcon} alt="" />
-  </a>
+<div class="auth-slot">
+  <details class="site-menu" bind:this={menuEl} data-testid="site-menu">
+    <summary data-testid="site-menu-trigger" aria-controls="site-menu-links">
+      Menü <span aria-hidden="true" class="menu-chevron">⌄</span>
+    </summary>
+    <nav id="site-menu-links" class="site-menu-links" aria-label="Hauptmenü">
+      <a href="/map">Karte</a>
+      {#if authView.showAccountLink}
+        <a href="/nachrichten">Nachrichten</a>
+        <a href="/settings#meine-garnrolle">Mein Profil (Garnrolle)</a>
+      {/if}
+      <a href="/antraege">Anträge und Entscheidungen</a>
+      <a href="/settings">Einstellungen</a>
+    </nav>
+  </details>
 
   {#if authView.isGuest}
     <a
@@ -128,26 +142,89 @@
     pointer-events: auto;
   }
 
-  .garnrolle-link {
-    display: block;
-    width: 44px;
-    height: 44px;
-    transition: transform 0.1s ease;
+  .site-menu {
+    position: relative;
+    flex: 0 0 auto;
+    color: var(--text);
   }
 
-  .garnrolle-link img {
-    display: block;
-    width: 100%;
-    height: 100%;
-    object-fit: contain;
+  .site-menu summary {
+    box-sizing: border-box;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.4rem;
+    min-height: 44px;
+    padding: 0 0.8rem;
+    border: 1px solid var(--panel-border-strong);
+    border-radius: 999px;
+    background: var(--panel-solid);
+    color: var(--text);
+    font: inherit;
+    font-weight: 700;
+    cursor: pointer;
+    list-style: none;
   }
 
-  .garnrolle-link:active {
-    transform: scale(0.95);
+  .site-menu summary::-webkit-details-marker {
+    display: none;
   }
 
-  .garnrolle-link:focus-visible,
-  .message-entry:focus-visible,
+  .menu-chevron {
+    font-size: 1.15rem;
+    line-height: 1;
+  }
+
+  .site-menu[open] .menu-chevron {
+    transform: rotate(180deg);
+  }
+
+  .site-menu-links {
+    box-sizing: border-box;
+    position: absolute;
+    top: calc(100% + 0.5rem);
+    right: 0;
+    display: grid;
+    gap: 0.15rem;
+    width: min(20rem, calc(100vw - 24px));
+    max-height: calc(100dvh - var(--toolbar-offset) - 1rem);
+    overflow-y: auto;
+    padding: 0.45rem;
+    border: 1px solid var(--panel-border-strong);
+    border-radius: 14px;
+    background: var(--panel-solid);
+    box-shadow: var(--shadow);
+    z-index: 1;
+  }
+
+  .site-menu-links a {
+    display: flex;
+    align-items: center;
+    min-height: 44px;
+    padding: 0.25rem 0.75rem;
+    border-radius: 9px;
+    color: var(--text);
+    font-weight: 600;
+    text-decoration: none;
+  }
+
+  .site-menu-links a:hover,
+  .site-menu-links a:focus-visible {
+    background: var(--accent-soft);
+  }
+
+  @media (max-width: 768px) {
+    /* The guest badge can move the trigger away from the screen edge.
+     * Anchor the expanded navigation to the viewport, not that trigger. */
+    .site-menu-links {
+      position: fixed;
+      top: calc(var(--toolbar-offset) + env(safe-area-inset-top) + 0.5rem);
+      right: 12px;
+    }
+  }
+
+  .site-menu summary:focus-visible,
+  .site-menu-links a:focus-visible,
   .login-entry:focus-visible,
   .auth-retry:focus-visible,
   .guest-badge:focus-visible {
@@ -189,7 +266,6 @@
     line-height: 1;
   }
 
-  .message-entry,
   .login-entry,
   .auth-retry {
     display: grid;
@@ -203,15 +279,6 @@
     text-decoration: none;
     font: inherit;
     font-weight: 600;
-  }
-
-  .message-entry {
-    box-sizing: border-box;
-    width: 44px;
-    min-width: 44px;
-    padding: 0;
-    font-size: 1.15rem;
-    line-height: 1;
   }
 
   .auth-symbol {

@@ -135,13 +135,13 @@
     class="fan-trigger"
     bind:this={triggerEl}
     data-testid="tool-fan-trigger"
-    aria-label={open ? "Werkzeuge schließen" : "Werkzeuge öffnen"}
+    aria-label={open ? "Aktionen schließen" : "Aktionen öffnen"}
     aria-expanded={open}
     aria-controls="tool-fan-actions"
     onclick={handleTrigger}
   >
     <span class="trigger-symbol" aria-hidden="true">{open ? "×" : "✣"}</span>
-    <span>Werkzeuge</span>
+    <span>Aktionen</span>
   </button>
 
   <ToolFanMenu

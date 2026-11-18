@@ -23,56 +23,24 @@
   const normalize = (value) =>
     value === "light" || value === "dark" ? value : "system";
   let current = "system";
-  const woolKey = "commonthing.wool-everywhere";
-  // Die abgenommene Wollschrift ist regulärer Standard; ein explizites
-  // Opt-out aus früheren Sitzungen bleibt erhalten.
-  let wool = "on";
-
   try {
     current = normalize(window.localStorage.getItem(key));
-    const savedWool = window.localStorage.getItem(woolKey);
-    if (savedWool === "on" || savedWool === "off") wool = savedWool;
   } catch {
-    // Die Anwendung bleibt ohne Speicherzugriff vollständig benutzbar.
+    // Die Darstellung funktioniert ohne Speicherzugriff.
   }
-
-  // An- und Abschalten per URL (?wollschrift=1 und ?wollschrift=0).
-  const woolQuery = new URLSearchParams(window.location.search).get(
-    "wollschrift",
-  );
-  if (woolQuery === "1" || woolQuery === "0") {
-    wool = woolQuery === "1" ? "on" : "off";
-    try {
-      window.localStorage.setItem(woolKey, wool);
-    } catch {
-      // Der aktuelle Seitenzustand funktioniert auch ohne lokalen Speicher.
-    }
-  }
-  // Stylesheet is render-blocking in app.html, avoiding a late font flash.
-  // Only the active theme's WOFF is fetched; explicit opt-out stops font use.
-  const syncWoolStyles = () => {
-    root.dataset.woolExperiment = wool;
-  };
-  syncWoolStyles();
 
   const syncSelect = (control) => {
     if (control.matches("[data-wg-theme-control]")) control.value = current;
-    if (control.matches("[data-wg-wool-control]"))
-      control.checked = wool === "on";
   };
 
   const syncControlTree = (scope = document) => {
     if (
-      (scope instanceof HTMLSelectElement &&
-        scope.matches("[data-wg-theme-control]")) ||
-      (scope instanceof HTMLInputElement &&
-        scope.matches("[data-wg-wool-control]"))
+      scope instanceof HTMLSelectElement &&
+      scope.matches("[data-wg-theme-control]")
     ) {
       syncSelect(scope);
     }
-    scope
-      .querySelectorAll?.("[data-wg-theme-control], [data-wg-wool-control]")
-      .forEach(syncSelect);
+    scope.querySelectorAll?.("[data-wg-theme-control]").forEach(syncSelect);
   };
 
   const watchControls = () => {
@@ -144,19 +112,5 @@
   document.addEventListener("change", (event) => {
     const control = getSelect(event.target);
     if (control) apply(control.value, true);
-    const woolControl = event.target;
-    if (
-      woolControl instanceof HTMLInputElement &&
-      woolControl.matches("[data-wg-wool-control]")
-    ) {
-      wool = woolControl.checked ? "on" : "off";
-      syncWoolStyles();
-      try {
-        window.localStorage.setItem(woolKey, wool);
-      } catch {
-        // Abschalten funktioniert auch ohne lokalen Speicher.
-      }
-      syncControlTree();
-    }
   });
 })();

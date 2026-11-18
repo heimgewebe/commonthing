@@ -66,9 +66,10 @@ test.describe("Interaction Clarity & State Feedback", () => {
   test("Einstellungen bündeln Garnrolle, Konto und Darstellung nachvollziehbar", async ({
     page,
   }) => {
-    const settingsLink = page.getByRole("link", {
-      name: "Einstellungen öffnen",
-    });
+    await page.getByTestId("site-menu-trigger").click();
+    const settingsLink = page
+      .getByRole("navigation", { name: "Hauptmenü" })
+      .getByRole("link", { name: "Einstellungen", exact: true });
 
     await expect(settingsLink).toBeVisible();
     await expect(settingsLink).toHaveAttribute("href", "/settings");

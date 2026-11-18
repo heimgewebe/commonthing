@@ -339,7 +339,7 @@ test.describe("Komposition Flow (gast/anonymous)", () => {
     await expect(weave).toBeDisabled();
     await expect(weave).toHaveAttribute(
       "aria-label",
-      "Weben – Anmeldung erforderlich",
+      "Erstellen – Anmeldung erforderlich",
     );
     await expect(page.locator('[data-testid="context-panel"]')).toHaveCount(0);
 
