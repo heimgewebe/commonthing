@@ -439,9 +439,7 @@ test.describe("Map URL addressing", () => {
 
     await page.goto("/map");
     await waitForMapReady(page);
-    await expect(
-      page.getByRole("link", { name: "Einstellungen öffnen" }),
-    ).toBeVisible();
+    await expect(page.getByTestId("site-menu-trigger")).toBeVisible();
     await installDeferredViewportFetch(page);
     const targets = await viewportRaceTargets(page);
 
@@ -449,7 +447,11 @@ test.describe("Map URL addressing", () => {
     await waitForDeferredViewportRequests(page, 1);
     expect(abortedViewportUrls).toEqual([]);
 
-    await page.getByRole("link", { name: "Einstellungen öffnen" }).click();
+    await page.getByTestId("site-menu-trigger").click();
+    await page
+      .getByRole("navigation", { name: "Hauptmenü" })
+      .getByRole("link", { name: "Einstellungen", exact: true })
+      .click();
     await expect(page).toHaveURL(/\/settings(?:[?#]|$)/);
     await expect.poll(() => abortedViewportUrls.length).toBe(1);
     expect(new URL(abortedViewportUrls[0]).pathname).toBe("/api/nodes");

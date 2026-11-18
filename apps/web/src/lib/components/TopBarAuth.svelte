@@ -84,6 +84,18 @@
     </nav>
   </details>
 
+  {#if authView.showAccountLink}
+    <a
+      class="message-entry"
+      href="/nachrichten"
+      aria-label="Private Nachrichten"
+      title="Private Nachrichten"
+    >
+      <span class="message-icon" aria-hidden="true">✉</span>
+      <span class="message-label">Nachrichten</span>
+    </a>
+  {/if}
+
   {#if authView.isGuest}
     <a
       class:pending={pendingWeberApplication}
@@ -225,6 +237,7 @@
 
   .site-menu summary:focus-visible,
   .site-menu-links a:focus-visible,
+  .message-entry:focus-visible,
   .login-entry:focus-visible,
   .auth-retry:focus-visible,
   .guest-badge:focus-visible {
@@ -266,6 +279,7 @@
     line-height: 1;
   }
 
+  .message-entry,
   .login-entry,
   .auth-retry {
     display: grid;
@@ -281,6 +295,18 @@
     font-weight: 600;
   }
 
+  .message-entry {
+    grid-auto-flow: column;
+    gap: 0.35rem;
+    padding-inline: 0.65rem;
+    white-space: nowrap;
+  }
+
+  .message-icon {
+    font-size: 1.15rem;
+    line-height: 1;
+  }
+
   .auth-symbol {
     display: none;
     font-size: 1.15rem;
@@ -294,9 +320,49 @@
     font-size: 0.75rem;
   }
 
+  @media (max-width: 768px) {
+    .message-entry {
+      box-sizing: border-box;
+      width: 44px;
+      min-width: 44px;
+      padding: 0;
+    }
+
+    .message-label {
+      display: none;
+    }
+
+    .guest-badge {
+      box-sizing: border-box;
+      width: 44px;
+      min-width: 44px;
+      gap: 0;
+      justify-content: center;
+      padding: 0;
+    }
+
+    .guest-badge-role,
+    .guest-badge-cta {
+      display: none;
+    }
+
+    .guest-badge-compact {
+      display: inline;
+    }
+  }
+
   @media (max-width: 510px) {
     .auth-slot {
       gap: 0.125rem;
+    }
+
+    .site-menu summary {
+      gap: 0;
+      padding-inline: 0.45rem;
+    }
+
+    .menu-chevron {
+      display: none;
     }
 
     .login-entry,

@@ -195,9 +195,11 @@
   }
 
   .fan-panel.root .fan-row--root :global(.fan-action) {
-    min-width: 104px;
+    min-width: 0;
+    width: 104px;
     min-height: 44px;
-    padding-inline: 0.7rem;
+    padding-inline: 0.4rem;
+    font-size: 0.875rem;
     pointer-events: auto;
   }
 

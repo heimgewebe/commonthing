@@ -364,18 +364,18 @@ test.describe("Map Interaction & Context Panel", () => {
     await expect(antraegeTab).toHaveAttribute("tabindex", "-1");
     await expect(panel.locator("#panel-bearbeiten")).toBeVisible();
 
-    const tabListBox = await tabList.boundingBox();
-    const bearbeitenBox = await bearbeitenTab.boundingBox();
-    expect(tabListBox).not.toBeNull();
-    expect(bearbeitenBox).not.toBeNull();
-    expect(bearbeitenBox!.x + bearbeitenBox!.width).toBeLessThanOrEqual(
-      tabListBox!.x + tabListBox!.width + 1,
-    );
+    // Full-size tab labels may extend beyond the panel. They remain intact,
+    // horizontally scrollable and follow the keyboard's selected tab.
+    await expect(tabList).toHaveCSS("overflow-x", "auto");
     await expect
       .poll(() =>
-        tabList.evaluate(
-          (element) => element.scrollWidth <= element.clientWidth + 1,
-        ),
+        bearbeitenTab.evaluate((element) => {
+          const tab = element.getBoundingClientRect();
+          const list = element.parentElement?.getBoundingClientRect();
+          return (
+            !!list && tab.left >= list.left - 1 && tab.right <= list.right + 1
+          );
+        }),
       )
       .toBe(true);
     await expect
@@ -392,13 +392,7 @@ test.describe("Map Interaction & Context Panel", () => {
     await page.getByTestId("sheet-handle").click();
     await expect(panel).toHaveAttribute("data-sheet-stage", "full");
     await expect(tabList).toBeVisible();
-    await expect
-      .poll(() =>
-        tabList.evaluate(
-          (element) => element.scrollWidth <= element.clientWidth + 1,
-        ),
-      )
-      .toBe(true);
+    await expect(tabList).toHaveCSS("overflow-x", "auto");
     await expect
       .poll(() =>
         tabList

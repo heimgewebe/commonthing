@@ -158,7 +158,15 @@
     const buttons = (e.currentTarget as HTMLElement)
       ?.closest(".tabs")
       ?.querySelectorAll<HTMLButtonElement>('button[role="tab"]');
-    buttons?.item(nextIndex)?.focus();
+    const nextButton = buttons?.item(nextIndex);
+    nextButton?.focus();
+    if (nextButton) {
+      // Labels retain a readable width. Keyboard navigation scrolls the
+      // selected tab into view rather than clipping or shrinking its text.
+      void tick().then(() =>
+        nextButton.scrollIntoView({ inline: "nearest", block: "nearest" }),
+      );
+    }
   }
 
   function beginEdit() {
