@@ -809,7 +809,12 @@ class BundleTests(unittest.TestCase):
         )
         self.assertIsNotNone(match)
         block = match.group(1)
-        self.assertIn('select(.status != "removed")', block)
+        self.assertIn(
+            'select(.status != "removed" or .filename == "apps/web/static/fonts/atkinson-hyperlegible-next-latin-wght-normal.woff2")',
+            block,
+        )
+        # The pinned WOFF2 needs its opaque candidate so its original proof
+        # is checked even on removal. Every other removed binary stays absent.
         self.assertIn(
             'select((has("patch") | not) or .patch == null)',
             block,

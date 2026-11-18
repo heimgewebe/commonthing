@@ -310,7 +310,9 @@ jobs:
               # All remaining patchless files stay opaque candidates.
               opaque_files: [
                 $files[0][] |
-                select(.status != "removed") |
+                # The single Atkinson WOFF2 removal still carries an exact
+                # byte/provenance proof, and the Python parser expects it here.
+                select(.status != "removed" or .filename == "apps/web/static/fonts/atkinson-hyperlegible-next-latin-wght-normal.woff2") |
                 select((has("patch") | not) or .patch == null) |
                 .filename
               ]
