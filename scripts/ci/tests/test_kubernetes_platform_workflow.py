@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from fnmatch import fnmatchcase
 from pathlib import Path
 
 import yaml
@@ -60,6 +61,44 @@ class KubernetesPlatformWorkflowDiagnosticsTests(unittest.TestCase):
             ".github/workflows/domain-scale.yml",
             proof_workflow["on"]["push"]["paths"],
         )
+
+    def test_main_proofs_skip_ui_only_edits_but_retain_web_image_inputs(self) -> None:
+        pr_workflow = yaml.safe_load(PR_WORKFLOW.read_text(encoding="utf-8"))
+        proof_workflow = yaml.safe_load(PROOF_WORKFLOW.read_text(encoding="utf-8"))
+        pr_paths = pr_workflow["on"]["pull_request"]["paths"]
+        main_paths = proof_workflow["on"]["push"]["paths"]
+
+        # PR platform contract keeps wide app coverage. Expensive kind/HA
+        # reference proofs on main run only when their build inputs change.
+        self.assertIn("apps/web/**", pr_paths)
+        self.assertNotIn("apps/web/**", main_paths)
+        self.assertIn("apps/api/**", main_paths)
+        self.assertIn("platform/**", main_paths)
+        self.assertIn("workflow_dispatch", proof_workflow["on"])
+
+        for ui_only_path in (
+            "apps/web/src/routes/map/+page.svelte",
+            "apps/web/src/lib/map/overlay/edges.ts",
+            "apps/web/static/textures/porcelain-light.png",
+            "apps/web/tests/map-interaction.spec.ts",
+        ):
+            with self.subTest(ui_only_path=ui_only_path):
+                self.assertFalse(
+                    any(fnmatchcase(ui_only_path, pattern) for pattern in main_paths)
+                )
+
+        for image_input in (
+            "apps/web/Dockerfile",
+            "apps/web/Caddyfile.container",
+            "apps/web/package.json",
+            "apps/web/pnpm-lock.yaml",
+            "apps/web/scripts/generate-basemap-config.js",
+            "apps/web/vite.config.ts",
+        ):
+            with self.subTest(image_input=image_input):
+                self.assertTrue(
+                    any(fnmatchcase(image_input, pattern) for pattern in main_paths)
+                )
 
     def test_failed_live_package_receipt_is_uploaded_for_both_proof_jobs(self) -> None:
         workflow = yaml.safe_load(PROOF_WORKFLOW.read_text(encoding="utf-8"))
