@@ -11,18 +11,17 @@ test("first visit: dismiss, recall, Escape and persistence", async ({
   const welcome = page.getByTestId("map-welcome");
   await expect(welcome).toBeVisible();
   await expect(welcome).toContainText("Garnrolle");
-  await expect(welcome.getByRole("link", { name: /Anbieten/ })).toHaveAttribute(
-    "href",
-    "/login",
-  );
   await expect(
-    welcome.getByRole("link", { name: /Mitmachen/ }),
+    welcome.getByRole("link", { name: /Eintrag erstellen/ }),
+  ).toHaveAttribute("href", "/login");
+  await expect(
+    welcome.getByRole("link", { name: /Anträge ansehen/ }),
   ).toHaveAttribute("href", "/antraege");
   await welcome.getByRole("button", { name: "Einführung schließen" }).click();
   const recall = page.getByRole("button", { name: "Karte kennenlernen" });
   await expect(recall).toBeFocused();
   await recall.press("Enter");
-  await welcome.getByRole("button", { name: /Finden/ }).focus();
+  await welcome.getByRole("button", { name: /Suchen/ }).focus();
   await page.keyboard.press("Escape");
   await expect(recall).toBeFocused();
   await page.reload();
@@ -63,7 +62,7 @@ for (const width of [320, 390]) {
       for (const target of await welcome.locator("button, a").all()) {
         expect((await target.boundingBox())!.height).toBeGreaterThanOrEqual(44);
       }
-      await welcome.getByRole("button", { name: /Finden/ }).click();
+      await welcome.getByRole("button", { name: /Suchen/ }).click();
       await expect(welcome).toHaveCount(0);
       await expect(page.getByTestId("search-overlay")).toBeVisible();
       await page.keyboard.press("Escape");
@@ -177,7 +176,7 @@ test("authenticated offering opens the existing composition", async ({
   await page.goto("/map");
   await page
     .getByTestId("map-welcome")
-    .getByRole("button", { name: /Anbieten/ })
+    .getByRole("button", { name: /Eintrag erstellen/ })
     .click();
   await expect(page.getByTestId("context-panel")).toBeVisible();
   await expect(
@@ -225,7 +224,7 @@ test("anonymous offering reaches the real login page", async ({ page }) => {
   await page.goto("/map");
   await page
     .getByTestId("map-welcome")
-    .getByRole("link", { name: /Anbieten/ })
+    .getByRole("link", { name: /Eintrag erstellen/ })
     .click();
   await expect(page).toHaveURL(/\/login$/);
   await expect(page.getByTestId("login-page")).toBeVisible();
@@ -238,7 +237,7 @@ test("participation opens the existing decisions page", async ({ page }) => {
   await page.goto("/map");
   await page
     .getByTestId("map-welcome")
-    .getByRole("link", { name: /Mitmachen/ })
+    .getByRole("link", { name: /Anträge ansehen/ })
     .click();
   await expect(page).toHaveURL(new RegExp("/antraege$"));
   await expect(page.getByTestId("applications-page")).toBeVisible();
@@ -319,6 +318,6 @@ test("map interaction dismisses without returning or taking focus", async ({
   await expect(recall).not.toBeFocused();
   await recall.click();
   await expect(
-    page.getByTestId("map-welcome").getByRole("button", { name: /Finden/ }),
+    page.getByTestId("map-welcome").getByRole("button", { name: /Suchen/ }),
   ).toBeFocused();
 });

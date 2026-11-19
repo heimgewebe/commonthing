@@ -1,6 +1,4 @@
 <script lang="ts">
-  import YarnWord from "$lib/components/YarnWord.svelte";
-
   let email = $state("");
   let error: string | null = $state(null);
   let success = $state(false);
@@ -28,7 +26,7 @@
 </script>
 
 <svelte:head>
-  <title>Login</title>
+  <title>Anmelden</title>
 </svelte:head>
 
 <main class="wg-page" data-testid="login-page">
@@ -39,9 +37,7 @@
     >
       <header class="wg-stack">
         <p class="wg-eyebrow">Gewebekonto</p>
-        <h1 id="login-heading" class="wg-title wg-title--compact">
-          <YarnWord word="Login" />
-        </h1>
+        <h1 id="login-heading" class="wg-title wg-title--compact">Anmelden</h1>
       </header>
 
       {#if success}

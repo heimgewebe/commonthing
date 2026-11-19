@@ -48,6 +48,12 @@
     transition: right var(--motion-ui);
   }
 
+  /* The expanded site menu must outrank the map-welcome recall button.
+   * Its inner z-index cannot escape this topbar stacking context. */
+  .topbar:has(:global(.site-menu[open])) {
+    z-index: calc(var(--z-map-fan) + 1);
+  }
+
   @media (min-width: 769px) {
     .topbar.panel-open {
       right: var(--context-panel-width);

@@ -30,13 +30,21 @@ async function gotoMapAsAccount(page: Page, accountId: string, role = "weber") {
 }
 
 async function expectSettingsEntry(page: Page) {
-  const link = page.getByRole("link", { name: "Einstellungen öffnen" });
+  const trigger = page.getByTestId("site-menu-trigger");
+  await expect(trigger).toBeVisible();
+  await trigger.click();
+  const link = page
+    .getByRole("navigation", { name: "Hauptmenü" })
+    .getByRole("link", { name: "Einstellungen", exact: true });
   await expect(link).toBeVisible();
   await expect(link).toHaveAttribute("href", "/settings");
 }
 
 async function openGarnrolleSettings(page: Page) {
-  const settingsLink = page.getByRole("link", { name: "Einstellungen öffnen" });
+  await page.getByTestId("site-menu-trigger").click();
+  const settingsLink = page
+    .getByRole("navigation", { name: "Hauptmenü" })
+    .getByRole("link", { name: "Einstellungen", exact: true });
   await settingsLink.click();
   await expect(page).toHaveURL(/\/settings$/);
 

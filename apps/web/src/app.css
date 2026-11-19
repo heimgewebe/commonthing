@@ -10,7 +10,7 @@ body {
   background: var(--bg);
   color: var(--text);
   font:
-    14px/1.4 ui-sans-serif,
+    16px/1.5 ui-sans-serif,
     system-ui,
     -apple-system,
     Segoe UI,
@@ -19,6 +19,14 @@ body {
     Cantarell,
     "Helvetica Neue",
     Arial;
+}
+
+/* Bedienelemente übernehmen die lesbare Textschrift statt 13px Browser-Defaults. */
+button,
+input,
+select,
+textarea {
+  font: inherit;
 }
 
 :focus {

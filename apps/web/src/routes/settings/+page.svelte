@@ -1,5 +1,4 @@
 <script lang="ts">
-  import YarnWord from "$lib/components/YarnWord.svelte";
   import { onMount } from "svelte";
   import MyGarnrolleSection from "$lib/components/MyGarnrolleSection.svelte";
   import { authStore } from "$lib/auth/store";
@@ -70,7 +69,7 @@
   <div class="container">
     <header class="page-header">
       <a class="back-link touch-target" href="/map">← Zur Karte</a>
-      <h1><YarnWord word="Einstellungen" /></h1>
+      <h1>Einstellungen</h1>
       <p class="intro">
         Verwalte deine Garnrolle, dein Konto, Benachrichtigungen und die
         Darstellung an einem übersichtlichen Ort.
@@ -118,23 +117,6 @@
             <option value="light">Hell</option>
             <option value="dark">Dunkel</option>
           </select>
-          <div class="col">
-            <label class="row touch-target" for="wool-experiment-toggle">
-              <input
-                id="wool-experiment-toggle"
-                type="checkbox"
-                data-wg-wool-control
-                data-testid="wool-experiment-toggle"
-              />
-              <span>Wollschrift verwenden</span>
-            </label>
-            <p class="menu-hint">
-              Echte dreifach gezwirnte Wollschrift in der gesamten Oberfläche,
-              auch für Texte, Eingaben und Schaltflächen. Bei Bedarf in diesem
-              Browser abschaltbar; technische Kennungen und
-              Kartenbild-Beschriftungen bleiben in ihrer bisherigen Darstellung.
-            </p>
-          </div>
         </div>
 
         <a

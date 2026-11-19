@@ -95,17 +95,19 @@
         </p>
         <div class="actions">
           <button onclick={find}
-            >Finden <small>Auf der Karte suchen</small></button
+            >Suchen <small>Menschen, Orte und Projekte finden</small></button
           >
           {#if $authStore.authenticated}
             <button onclick={offer}
-              >Anbieten <small>Einen Knoten knüpfen</small></button
+              >Eintrag erstellen <small>Etwas auf der Karte teilen</small
+              ></button
             >
           {:else}
-            <a href="/login">Anbieten <small>Zuerst anmelden</small></a>
+            <a href="/login">Eintrag erstellen <small>Zuerst anmelden</small></a
+            >
           {/if}
           <a href="/antraege" onclick={() => dismiss()}
-            >Mitmachen <small>Gemeinsame Entscheidungen ansehen</small></a
+            >Anträge ansehen <small>Gemeinsam entscheiden</small></a
           >
         </div>
         <p class="terms">
