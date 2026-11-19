@@ -218,16 +218,10 @@ fn classify_push_provider_status(status: reqwest::StatusCode) -> PushSendOutcome
         return PushSendOutcome::Sent;
     }
     if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::GONE {
-        return PushSendOutcome::Gone(format!(
-            "push provider returned HTTP {}",
-            status.as_u16()
-        ));
+        return PushSendOutcome::Gone(format!("push provider returned HTTP {}", status.as_u16()));
     }
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-        return PushSendOutcome::Retry(format!(
-            "push provider returned HTTP {}",
-            status.as_u16()
-        ));
+        return PushSendOutcome::Retry(format!("push provider returned HTTP {}", status.as_u16()));
     }
     PushSendOutcome::Quarantined(format!(
         "push provider rejected request with HTTP {}",
