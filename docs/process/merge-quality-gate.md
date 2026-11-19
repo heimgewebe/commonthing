@@ -189,8 +189,10 @@ Nur die unveränderte Atkinson-Hyperlegible-Next-WOFF2 besitzt weiterhin
 eine begrenzte Ausnahme mit exakten Herkunfts- und Bytebelegen. Die
 früheren Ausnahmen für fotografische Wollschriftdateien sind aufgehoben.
 Entfernte Dateien bleiben für Risikoklasse und Review in der Dateiliste,
-gelten aber nicht als neuer undurchsichtiger Inhalt. Neue oder ersetzte
-unbekannte WOFF-Dateien bleiben blockiert.
+gelten aber nicht als neuer undurchsichtiger Inhalt. Ausnahme ist die exakt
+belegpflichtige Atkinson-WOFF2-Entfernung, die der Parser weiterhin als
+opaque-Kandidat prüfen muss. Neue oder ersetzte unbekannte WOFF-Dateien
+bleiben blockiert.
 
 Ein neuer Push, ein Basiswechsel oder ein anderer Diffhash entwertet den Beleg
 automatisch. Für dieselbe Kombination aus Prüfer und Reviewachse zählt nur der
