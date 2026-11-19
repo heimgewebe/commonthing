@@ -60,6 +60,12 @@ test("Hauptmenü führt verständlich zu Kartenfunktionen und Seiten", async ({
     ).toHaveAttribute("href", href);
   }
 
+  // Same-route navigation leaves the persistent topbar mounted.
+  await menu.getByRole("link", { name: "Karte", exact: true }).click();
+  await expect(page).toHaveURL(/\/map(?:[?#]|$)/);
+  await expect(page.getByTestId("site-menu")).not.toHaveAttribute("open");
+  await trigger.click();
+
   await page.keyboard.press("Escape");
   await expect(page.getByTestId("site-menu")).not.toHaveAttribute("open");
   await expect(trigger).toBeFocused();

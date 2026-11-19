@@ -47,6 +47,10 @@
 
   let menuEl: HTMLDetailsElement | undefined = $state();
 
+  function closeMenuOnNavigation() {
+    if (menuEl) menuEl.open = false;
+  }
+
   function closeMenuOnOutsideClick(event: PointerEvent) {
     if (menuEl?.open && !menuEl.contains(event.target as Node)) {
       menuEl.open = false;
@@ -74,13 +78,17 @@
       Menü <span aria-hidden="true" class="menu-chevron">⌄</span>
     </summary>
     <nav id="site-menu-links" class="site-menu-links" aria-label="Hauptmenü">
-      <a href="/map">Karte</a>
+      <a href="/map" onclick={closeMenuOnNavigation}>Karte</a>
       {#if authView.showAccountLink}
-        <a href="/nachrichten">Nachrichten</a>
-        <a href="/settings#meine-garnrolle">Mein Profil (Garnrolle)</a>
+        <a href="/nachrichten" onclick={closeMenuOnNavigation}>Nachrichten</a>
+        <a href="/settings#meine-garnrolle" onclick={closeMenuOnNavigation}
+          >Mein Profil (Garnrolle)</a
+        >
       {/if}
-      <a href="/antraege">Anträge und Entscheidungen</a>
-      <a href="/settings">Einstellungen</a>
+      <a href="/antraege" onclick={closeMenuOnNavigation}
+        >Anträge und Entscheidungen</a
+      >
+      <a href="/settings" onclick={closeMenuOnNavigation}>Einstellungen</a>
     </nav>
   </details>
 
