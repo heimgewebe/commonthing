@@ -185,18 +185,14 @@ und erzwingen mindestens R1. PDF, SVG, Archive, ausführbare Dateien und Rasterb
 außerhalb dieser Pfade blockieren weiterhin fail-closed. Damit sind alltägliche
 Bildänderungen möglich, ohne undurchsichtige Artefakte pauschal freizugeben.
 
-Für den iPad/Safari-Positionierungsfix werden genau zwei bereits
-vorhandene Farb-WOFFs als *modified*-Dateien ausschließlich mit ihren
-neuen, fest gepinnten Git-Blob-IDs, Bytewerten und SHA-256-Werten
-geprüft. Diese Ausnahme gewährt keine allgemeine Fontfreigabe.
-
-Die optionale originale Wollschrift erhält ausschließlich für ihr exakt
-bekanntes WOFF1-Paar eine beweisgebundene Ausnahme. Der privilegierte
-Workflow prüft die unveränderte Original-PNG-Quelle aus der PR-Basis sowie
-für beide Fontblobs die erwarteten Git-Blob-IDs, SHA-256, Bytezahlen und
-Signaturen. Ein anderes oder einzelnes WOFF bleibt unverändert blockiert.
-Der Workflow führt weder PR-Code noch fremde Fontgeneratoren aus;
-es gibt keine allgemeine WOFF-Allowlist.
+Nur die unveränderte Atkinson-Hyperlegible-Next-WOFF2 besitzt weiterhin
+eine begrenzte Ausnahme mit exakten Herkunfts- und Bytebelegen. Die
+früheren Ausnahmen für fotografische Wollschriftdateien sind aufgehoben.
+Entfernte Dateien bleiben für Risikoklasse und Review in der Dateiliste,
+gelten aber nicht als neuer undurchsichtiger Inhalt. Ausnahme ist die exakt
+belegpflichtige Atkinson-WOFF2-Entfernung, die der Parser weiterhin als
+opaque-Kandidat prüfen muss. Neue oder ersetzte unbekannte WOFF-Dateien
+bleiben blockiert.
 
 Ein neuer Push, ein Basiswechsel oder ein anderer Diffhash entwertet den Beleg
 automatisch. Für dieselbe Kombination aus Prüfer und Reviewachse zählt nur der

@@ -64,67 +64,6 @@ GARN_FONT_PROVENANCE_BLOBS = {
     "apps/web/static/fonts/OFL-Atkinson-Hyperlegible-Next.txt": "9459440df26a30cfb6ed5542485d281bae449e5f",
     "apps/web/static/fonts/README.md": "ed4fb686e498eeffa98f9a6cb7d9a103bf083802",
 }
-# The two approved three-ply wool bitmap fonts. This is an immutable,
-# byte-for-byte review exception only, not an extension of safe opaque suffixes.
-# The trusted workflow checks exact Git blobs/sha256/bytes and the committed
-# original PNG source blob from the PR base without executing PR code.
-WOOL_FONT_SOURCE_BLOB = "3ada289072a765db9787208f6b95c6f73c3c7cce"
-WOOL_FONT_SPECS = {
-    "apps/web/static/fonts/garnschrift-c-dark.woff": {
-        "blob_sha": "c6c0d2c661226c89b85d7431cc27801a77e4b956",
-        "sha256": "fe8979fe9f6cd5cd1cccbcc8d5a7ccf2cbe79e79ed575d82ec6c87bcfd5dff63",
-        "size": 362748,
-    },
-    "apps/web/static/fonts/garnschrift-c-light.woff": {
-        "blob_sha": "135f95506f756786ba6ae657971ed685b3eb80ab",
-        "sha256": "e16c9e1baae88bd56f46fbe97337991311e0a1cdcb7002a229deeb6613532f9e",
-        "size": 399024,
-    },
-}
-# The two supplemental text-weight fonts originate from the same pinned yarn
-# photograph. Only this complete exact pair is admissible with blob/SHA/size
-# proof; arbitrary new WOFF files and mixed pairs remain blocked.
-WOOL_TEXT_FONT_SPECS = {
-    "apps/web/static/fonts/garnschrift-c-text-dark.woff": {
-        "blob_sha": "ea1f56c6b804fb140d6637248ea1df15608b4723",
-        "sha256": "65b87161ff41cb584e26859715cf294bf59787054d0d973926ec3532429f9f36",
-        "size": 389736,
-    },
-    "apps/web/static/fonts/garnschrift-c-text-light.woff": {
-        "blob_sha": "e21aeda4bc5726ead4f0e7a5cf35a31e998ecad5",
-        "sha256": "a1a5854b9712d23a762a31cad0b3ed030b8e4a96f68c8c02cc123cc4be7031e7",
-        "size": 424128,
-    },
-}
-# The next photographic text refinement modifies both previously ADDED WOFFs.
-# Keep old exact proofs admissible for historical attestations, but reject
-# partial, mixed, or arbitrary updated blobs just as before.
-WOOL_TEXT_FINER_FONT_SPECS = {
-    "apps/web/static/fonts/garnschrift-c-text-dark.woff": {
-        "blob_sha": "6cc666cb36548d5585b3f3c7c9239fb37894f569",
-        "sha256": "c7f209f4e254c93fe642f6c2785c9f349cd42d8c68809c733fa8836db3ea2adf",
-        "size": 412276,
-    },
-    "apps/web/static/fonts/garnschrift-c-text-light.woff": {
-        "blob_sha": "939286440c31bab17b46c206ea6a733d07951b90",
-        "sha256": "6ecb836bb20a49f0b1ace328941c57d87bf475ad966b3068ef271362040202b7",
-        "size": 448932,
-    },
-}
-# Additional finer text glyphs are an exact, complete replacement pair.
-# Their source, RGB and glyph metrics remain fixed; no generic WOFF admission.
-WOOL_TEXT_FINEST_FONT_SPECS = {
-    "apps/web/static/fonts/garnschrift-c-text-dark.woff": {
-        "blob_sha": "3071036210134188314045b94d227102dd2adc64",
-        "sha256": "cc5216bfcfa22537c4f0f7ede840af4558cdf02d216b1cf0050de10c1b48e42b",
-        "size": 430408,
-    },
-    "apps/web/static/fonts/garnschrift-c-text-light.woff": {
-        "blob_sha": "766e44785350063f1d554fb98da6493ddb6bff3c",
-        "sha256": "dc0d5292b6ee71867b5dfb4c11d2b4c2ad259eb85a5f4238fff99057c3d8ea40",
-        "size": 465684,
-    },
-}
 RISK_ORDER = {"R0": 0, "R1": 1, "R2": 2, "R3": 3}
 REQUIRED_REVIEWS = {"R0": 0, "R1": 1, "R2": 2, "R3": 2}
 AUTHORIZED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
@@ -384,12 +323,7 @@ def _partition_opaque_files(
     blocking: list[str] = []
     for path in paths:
         allowed = _is_safe_opaque_asset(path) or (
-            path in verified
-            and (
-                path == GARN_FONT_PATH
-                or path in WOOL_FONT_SPECS
-                or path in WOOL_TEXT_FONT_SPECS
-            )
+            path in verified and path == GARN_FONT_PATH
         )
         (reviewable if allowed else blocking).append(path)
     return tuple(reviewable), tuple(blocking)
@@ -747,7 +681,7 @@ def _materialized_metadata(path: Path) -> tuple[int, str, str, str, DiffStats]:
         "deletions",
         "opaque_files",
     }
-    optional = {"attention_changed_files", "font_asset_proof", "wool_font_proofs"}
+    optional = {"attention_changed_files", "font_asset_proof"}
     if not required.issubset(raw) or not set(raw).issubset(required | optional):
         missing = sorted(required - set(raw))
         extra = sorted(set(raw) - required - optional)
@@ -860,69 +794,6 @@ def _materialized_metadata(path: Path) -> tuple[int, str, str, str, DiffStats]:
             stats.attention_changed_files,
             (GARN_FONT_PATH,),
         )
-    wool_proofs = raw.get("wool_font_proofs")
-    if wool_proofs is not None:
-        if not isinstance(wool_proofs, list):
-            raise GovernanceError("wool_font_proofs must be an array")
-        if wool_proofs:
-            # Only a complete and homogeneous, cryptographically pinned pair.
-            fields = {"path", "blob_sha", "sha256", "size", "magic", "source_blob"}
-            if any(
-                not isinstance(entry, dict) or set(entry) != fields
-                for entry in wool_proofs
-            ):
-                raise GovernanceError("invalid wool font proof fields")
-            paths = [entry["path"] for entry in wool_proofs]
-            if not all(isinstance(item, str) for item in paths):
-                raise GovernanceError("wool font paths must be strings")
-            if len(paths) == len(WOOL_FONT_SPECS) and set(paths) == set(
-                WOOL_FONT_SPECS
-            ):
-                exact_specs = WOOL_FONT_SPECS
-            elif len(paths) == len(WOOL_TEXT_FONT_SPECS) and set(paths) == set(
-                WOOL_TEXT_FONT_SPECS
-            ):
-                # Different approved versions share the same two paths.
-                # A single old+new mixed pair cannot match either candidate.
-                exact_specs = next(
-                    (
-                        specs
-                        for specs in (WOOL_TEXT_FONT_SPECS, WOOL_TEXT_FINER_FONT_SPECS, WOOL_TEXT_FINEST_FONT_SPECS)
-                        if all(
-                            entry["blob_sha"] == specs[entry["path"]]["blob_sha"]
-                            for entry in wool_proofs
-                        )
-                    ),
-                    None,
-                )
-                if exact_specs is None:
-                    raise GovernanceError("mixed or unknown wool text font blobs")
-            else:
-                raise GovernanceError("exact approved wool font pair required")
-            for entry in wool_proofs:
-                path = entry["path"]
-                known = exact_specs.get(path) if isinstance(path, str) else None
-                if (
-                    known is None
-                    or entry["blob_sha"] != known["blob_sha"]
-                    or entry["sha256"] != known["sha256"]
-                    or type(entry["size"]) is not int
-                    or entry["size"] != known["size"]
-                    or entry["magic"] != "wOFF"
-                    or entry["source_blob"] != WOOL_FONT_SOURCE_BLOB
-                    or path not in stats.opaque_files
-                    or path not in stats.changed_files
-                ):
-                    raise GovernanceError("unverified wool font bytes or provenance")
-            stats = DiffStats(
-                stats.changed_files,
-                stats.additions,
-                stats.deletions,
-                stats.binary_files,
-                stats.opaque_files,
-                stats.attention_changed_files,
-                (*stats.verified_font_files, *sorted(paths)),
-            )
     return pr_number, base_sha, head_sha, merge_base_sha, stats
 
 
