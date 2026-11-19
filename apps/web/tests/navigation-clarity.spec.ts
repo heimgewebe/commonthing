@@ -72,6 +72,44 @@ test("Hauptmenü führt verständlich zu Kartenfunktionen und Seiten", async ({
   await expect(page.getByTestId("tool-fan-weave")).toContainText("Erstellen");
 });
 
+for (const [width, height] of [
+  [320, 480],
+  [390, 540],
+]) {
+  test(`Geöffnetes Hauptmenü bleibt bei ${width}×${height} über der Kartenhilfe anklickbar`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width, height });
+    await page.addInitScript(() => {
+      localStorage.setItem("commonthing.map-welcome.dismissed.v1", "1");
+    });
+    await mockApiResponses(page, {
+      auth: { authenticated: true, account_id: "weber-test", role: "weber" },
+    });
+    await page.goto("/map");
+    await expect(
+      page.getByRole("button", { name: "Karte kennenlernen" }),
+    ).toBeVisible();
+
+    await page.getByTestId("site-menu-trigger").click();
+    const menu = page.getByRole("navigation", { name: "Hauptmenü" });
+    const firstLink = menu.getByRole("link", { name: "Karte", exact: true });
+    await expect(firstLink).toBeVisible();
+    const onTop = await firstLink.evaluate((link) => {
+      const bounds = link.getBoundingClientRect();
+      const hit = document.elementFromPoint(
+        bounds.left + bounds.width / 2,
+        bounds.top + bounds.height / 2,
+      );
+      return hit === link || link.contains(hit);
+    });
+    expect(onTop).toBe(true);
+
+    await menu.getByRole("link", { name: "Nachrichten" }).click();
+    await expect(page).toHaveURL(/\/nachrichten(?:[?#]|$)/);
+  });
+}
+
 for (const width of [320, 390, 510, 511, 768]) {
   test(
     "Hauptmenü und Gaststatus bleiben bei " + width + "px getrennt bedienbar",
