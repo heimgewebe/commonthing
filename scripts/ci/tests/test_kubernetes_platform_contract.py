@@ -1211,6 +1211,149 @@ class KubernetesPlatformContractTests(unittest.TestCase):
                     image_id,
                 )
 
+    def _oci_platform_archive_fixture(
+        self, directory: Path, *, architecture: str = "amd64",
+        corrupt_config: bool = False, legacy: bool = False,
+    ) -> tuple[Path, str]:
+        config = json.dumps({
+            "os": "linux", "architecture": architecture,
+            "config": {"Env": ["PROOF_ONLY=yes"]},
+        }, sort_keys=True).encode()
+        config_digest = hashlib.sha256(config).hexdigest()
+        stored_config = config + (b" " if corrupt_config else b"")
+        manifest = json.dumps({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": f"sha256:{config_digest}",
+                "size": len(config),
+            },
+            "layers": [],
+        }, sort_keys=True).encode()
+        manifest_digest = hashlib.sha256(manifest).hexdigest()
+        index = json.dumps({
+            "schemaVersion": 2,
+            "manifests": [{
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": f"sha256:{manifest_digest}",
+                "platform": {"os": "linux", "architecture": architecture},
+            }],
+        }, sort_keys=True).encode()
+        archive = directory / ("docker.tar" if legacy else "oci.tar")
+        items = (
+            [(f"{config_digest}.json", stored_config),
+             ("manifest.json", json.dumps([{
+                 "Config": f"{config_digest}.json",
+                 "RepoTags": ["quay.io/cilium/cilium:v1.19.5"],
+                 "Layers": [],
+             }]).encode())]
+            if legacy else
+            [("index.json", index),
+             (f"blobs/sha256/{manifest_digest}", manifest),
+             (f"blobs/sha256/{config_digest}", stored_config)]
+        )
+        with tarfile.open(archive, "w") as package:
+            for name, data in items:
+                member = tarfile.TarInfo(name)
+                member.size = len(data)
+                package.addfile(member, io.BytesIO(data))
+        return archive, f"sha256:{config_digest}"
+
+    def test_oci_platform_archive_id_uses_verified_config_not_host_index(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            archive, expected = self._oci_platform_archive_fixture(Path(directory))
+            self.assertEqual(
+                self.oci_mirror._archive_platform_config_id(
+                    archive, "linux/amd64", "quay.io/cilium/cilium:v1.19.5",
+                ),
+                expected,
+            )
+
+    def test_oci_platform_archive_rejects_config_digest_tampering(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            archive, _ = self._oci_platform_archive_fixture(
+                Path(directory), corrupt_config=True,
+            )
+            with self.assertRaisesRegex(
+                self.oci_mirror.IntegrityError, "config.*digest|digest.*config",
+            ):
+                self.oci_mirror._archive_platform_config_id(
+                    archive, "linux/amd64", "quay.io/cilium/cilium:v1.19.5",
+                )
+
+    def test_oci_platform_archive_rejects_wrong_platform(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            archive, _ = self._oci_platform_archive_fixture(
+                Path(directory), architecture="arm64",
+            )
+            with self.assertRaises(self.oci_mirror.IntegrityError):
+                self.oci_mirror._archive_platform_config_id(
+                    archive, "linux/amd64", "quay.io/cilium/cilium:v1.19.5",
+                )
+
+    def test_oci_platform_archive_legacy_config_id_is_hashed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            archive, expected = self._oci_platform_archive_fixture(
+                Path(directory), legacy=True,
+            )
+            self.assertEqual(
+                self.oci_mirror._archive_platform_config_id(
+                    archive, "linux/amd64", "quay.io/cilium/cilium:v1.19.5",
+                ),
+                expected,
+            )
+
+    def test_oci_kind_receipt_separates_verified_host_index_and_cri_config(self) -> None:
+        host_id = "sha256:" + "a" * 64
+        config_id = "sha256:" + "b" * 64
+        runtime_ref = "quay.io/cilium/cilium:v1.19.5"
+        target = "sha256:" + "c" * 64
+        spec = {
+            "local_ref": runtime_ref, "canonical": f"{runtime_ref}@{host_id}",
+            "digest": host_id,
+            "load_into_kind": True,
+        }
+        node_binding = {
+            "node": "proof-control-plane",
+            "runtime_ref": runtime_ref,
+            "image_id": config_id,
+            "platform_target_digest": target,
+        }
+        with mock.patch.object(
+            self.oci_mirror, "_load_lock",
+            return_value={"generation": {}, "images": {}},
+        ), mock.patch.object(
+            self.oci_mirror, "_selected_images",
+            return_value=[("cilium_agent", spec)],
+        ), mock.patch.object(
+            self.oci_mirror, "_kind_nodes", return_value=["proof-control-plane"],
+        ), mock.patch.object(
+            self.oci_mirror, "_local_image",
+            return_value={"image_id": host_id, "source": "local-verified"},
+        ), mock.patch.object(
+            self.oci_mirror, "_load_kind_images",
+            return_value={runtime_ref: config_id},
+        ), mock.patch.object(
+            self.oci_mirror, "_kind_cri_image_binding",
+            return_value=node_binding,
+        ) as verify_cri, mock.patch.object(
+            self.oci_mirror, "_block_kind_registries",
+            return_value={"node": "proof-control-plane", "registries": {}},
+        ), mock.patch.object(
+            self.oci_mirror, "_lock_sha256", return_value="f" * 64,
+        ), mock.patch.object(self.oci_mirror, "_atomic_write"):
+            receipt = self.oci_mirror.load_kind(
+                Path("/tmp/mock-oci-state"), ["kind-gitops"], "kind", "proof",
+            )
+        self.assertEqual(verify_cri.call_args.args[-1], config_id)
+        binding = receipt["images"]["cilium_agent"]
+        self.assertEqual(binding["host_image_id"], host_id)
+        self.assertEqual(binding["image_id"], config_id)
+        self.assertEqual(binding["cri_image_id"], config_id)
+        self.assertEqual(binding["image_id_source"], "archive_platform_config")
+        self.assertEqual(binding["platform_target_digest"], target)
+
     def test_oci_kind_import_keeps_existing_batch_on_success(self) -> None:
         refs = ["quay.io/cilium/cilium:v1.19.5", "postgres:16"]
         with mock.patch.object(self.oci_mirror, "_run") as run:
@@ -1227,12 +1370,18 @@ class KubernetesPlatformContractTests(unittest.TestCase):
             1, ["kind", "load"], stderr=f"ctr: content digest {digest}: not found"
         )
         refs = ["quay.io/cilium/cilium:v1.19.5", "postgres:16"]
+        expected_ids = ["sha256:" + "1" * 64, "sha256:" + "2" * 64]
         with mock.patch.object(
             self.oci_mirror, "_run", side_effect=[error, None, None, None, None]
         ) as run, mock.patch.object(
+            self.oci_mirror, "_archive_platform_config_id",
+            side_effect=expected_ids,
+        ) as config_id, mock.patch.object(
             self.oci_mirror.platform, "machine", return_value="x86_64"
         ):
-            self.oci_mirror._load_kind_images("kind", "proof", refs)
+            imported = self.oci_mirror._load_kind_images("kind", "proof", refs)
+        self.assertEqual(imported, dict(zip(refs, expected_ids, strict=True)))
+        self.assertEqual(config_id.call_count, len(refs))
         commands = [call.args[0] for call in run.call_args_list]
         self.assertEqual(
             commands[0], ["kind", "load", "docker-image", "--name", "proof", *refs]
@@ -3431,6 +3580,53 @@ class KubernetesPlatformContractTests(unittest.TestCase):
             }
             with mock.patch.object(self.proof_identity, "ROOT", root):
                 self.proof_identity._validate_controlled_oci_proof(identity, proof)
+                # Image archive exports contain one platform's config, whose
+                # CRI id differs from Docker's verified host OCI index id.
+                archive_receipt = json.loads(json.dumps(proof))
+                archive_image = archive_receipt["oci_controlled_source"]["cluster"][
+                    "images"
+                ]["runtime"]
+                config_id = "sha256:" + "d" * 64
+                archive_image.update({
+                    "host_image_id": image_id,
+                    "image_id": config_id,
+                    "cri_image_id": config_id,
+                    "image_id_source": "archive_platform_config",
+                })
+                archive_image["nodes"][0]["image_id"] = config_id
+                self.proof_identity._validate_controlled_oci_proof(
+                    identity, archive_receipt,
+                )
+                invalid_host = json.loads(json.dumps(archive_receipt))
+                invalid_host["oci_controlled_source"]["cluster"]["images"][
+                    "runtime"
+                ]["host_image_id"] = "sha256:" + "e" * 64
+                with self.assertRaisesRegex(
+                    self.proof_identity.IdentityError, "image binding is invalid",
+                ):
+                    self.proof_identity._validate_controlled_oci_proof(
+                        identity, invalid_host,
+                    )
+                invalid_kind = json.loads(json.dumps(archive_receipt))
+                invalid_kind["oci_controlled_source"]["cluster"]["images"][
+                    "runtime"
+                ]["image_id_source"] = "unknown"
+                with self.assertRaisesRegex(
+                    self.proof_identity.IdentityError, "image binding is invalid",
+                ):
+                    self.proof_identity._validate_controlled_oci_proof(
+                        identity, invalid_kind,
+                    )
+                invalid_cri = json.loads(json.dumps(archive_receipt))
+                invalid_cri["oci_controlled_source"]["cluster"]["images"][
+                    "runtime"
+                ]["cri_image_id"] = image_id
+                with self.assertRaisesRegex(
+                    self.proof_identity.IdentityError, "image binding is invalid",
+                ):
+                    self.proof_identity._validate_controlled_oci_proof(
+                        identity, invalid_cri,
+                    )
                 drifted = json.loads(json.dumps(proof))
                 drifted["oci_controlled_source"]["cluster"]["registry_blockades"] = []
                 with self.assertRaisesRegex(
