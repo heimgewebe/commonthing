@@ -3580,6 +3580,53 @@ class KubernetesPlatformContractTests(unittest.TestCase):
             }
             with mock.patch.object(self.proof_identity, "ROOT", root):
                 self.proof_identity._validate_controlled_oci_proof(identity, proof)
+                # Image archive exports contain one platform's config, whose
+                # CRI id differs from Docker's verified host OCI index id.
+                archive_receipt = json.loads(json.dumps(proof))
+                archive_image = archive_receipt["oci_controlled_source"]["cluster"][
+                    "images"
+                ]["runtime"]
+                config_id = "sha256:" + "d" * 64
+                archive_image.update({
+                    "host_image_id": image_id,
+                    "image_id": config_id,
+                    "cri_image_id": config_id,
+                    "image_id_source": "archive_platform_config",
+                })
+                archive_image["nodes"][0]["image_id"] = config_id
+                self.proof_identity._validate_controlled_oci_proof(
+                    identity, archive_receipt,
+                )
+                invalid_host = json.loads(json.dumps(archive_receipt))
+                invalid_host["oci_controlled_source"]["cluster"]["images"][
+                    "runtime"
+                ]["host_image_id"] = "sha256:" + "e" * 64
+                with self.assertRaisesRegex(
+                    self.proof_identity.IdentityError, "image binding is invalid",
+                ):
+                    self.proof_identity._validate_controlled_oci_proof(
+                        identity, invalid_host,
+                    )
+                invalid_kind = json.loads(json.dumps(archive_receipt))
+                invalid_kind["oci_controlled_source"]["cluster"]["images"][
+                    "runtime"
+                ]["image_id_source"] = "unknown"
+                with self.assertRaisesRegex(
+                    self.proof_identity.IdentityError, "image binding is invalid",
+                ):
+                    self.proof_identity._validate_controlled_oci_proof(
+                        identity, invalid_kind,
+                    )
+                invalid_cri = json.loads(json.dumps(archive_receipt))
+                invalid_cri["oci_controlled_source"]["cluster"]["images"][
+                    "runtime"
+                ]["cri_image_id"] = image_id
+                with self.assertRaisesRegex(
+                    self.proof_identity.IdentityError, "image binding is invalid",
+                ):
+                    self.proof_identity._validate_controlled_oci_proof(
+                        identity, invalid_cri,
+                    )
                 drifted = json.loads(json.dumps(proof))
                 drifted["oci_controlled_source"]["cluster"]["registry_blockades"] = []
                 with self.assertRaisesRegex(

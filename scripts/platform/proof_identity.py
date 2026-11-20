@@ -316,6 +316,20 @@ def _validate_cached_cluster_image(
         raise IdentityError(f"reusable proof {label} OCI image is invalid: {name}")
     image_id = observed.get("cri_image_id")
     platform_digest = observed.get("platform_target_digest")
+    identity_source = observed.get("image_id_source")
+    observed_host_id = observed.get("host_image_id")
+    # Legacy receipts predate the separate archive config ID. New receipts
+    # explicitly bind Docker's verified host index and the node's config ID.
+    if identity_source is None and observed_host_id is None:
+        host_id_binding_valid = image_id == host_image_id
+    elif identity_source == "docker_host":
+        host_id_binding_valid = (
+            observed_host_id == host_image_id and image_id == host_image_id
+        )
+    elif identity_source == "archive_platform_config":
+        host_id_binding_valid = observed_host_id == host_image_id
+    else:
+        host_id_binding_valid = False
     if (
         observed.get("canonical") != canonical
         or observed.get("local_ref") != local_ref
@@ -323,7 +337,7 @@ def _validate_cached_cluster_image(
         or observed.get("runtime_ref") != expected_runtime
         or observed.get("locked_index_digest") != locked_digest
         or observed.get("image_id") != image_id
-        or image_id != host_image_id
+        or not host_id_binding_valid
         or not isinstance(image_id, str)
         or re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is None
         or not isinstance(platform_digest, str)
