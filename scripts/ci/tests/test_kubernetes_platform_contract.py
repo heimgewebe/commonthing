@@ -1211,10 +1211,82 @@ class KubernetesPlatformContractTests(unittest.TestCase):
                     image_id,
                 )
 
+    def test_oci_kind_import_keeps_existing_batch_on_success(self) -> None:
+        refs = ["quay.io/cilium/cilium:v1.19.5", "postgres:16"]
+        with mock.patch.object(self.oci_mirror, "_run") as run:
+            self.oci_mirror._load_kind_images("kind", "proof", refs)
+        run.assert_called_once_with(
+            ["kind", "load", "docker-image", "--name", "proof", *refs],
+            capture=True,
+            timeout=900,
+        )
+
+    def test_oci_kind_import_digest_error_uses_single_platform_archives(self) -> None:
+        digest = "sha256:" + "a" * 64
+        error = subprocess.CalledProcessError(
+            1, ["kind", "load"], stderr=f"ctr: content digest {digest}: not found"
+        )
+        refs = ["quay.io/cilium/cilium:v1.19.5", "postgres:16"]
+        with mock.patch.object(
+            self.oci_mirror, "_run", side_effect=[error, None, None, None, None]
+        ) as run, mock.patch.object(
+            self.oci_mirror.platform, "machine", return_value="x86_64"
+        ):
+            self.oci_mirror._load_kind_images("kind", "proof", refs)
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(
+            commands[0], ["kind", "load", "docker-image", "--name", "proof", *refs]
+        )
+        for index, reference in enumerate(refs):
+            save = commands[1 + index * 2]
+            load = commands[2 + index * 2]
+            self.assertEqual(save[:6], [
+                "docker", "image", "save", "--platform", "linux/amd64", "--output"
+            ])
+            self.assertEqual(save[7:], [reference])
+            self.assertEqual(
+                load, ["kind", "load", "image-archive", save[6], "--name", "proof"]
+            )
+            self.assertFalse(Path(save[6]).exists())
+        self.assertEqual(run.call_count, 5)
+
+    def test_oci_kind_import_unrelated_failure_does_not_retry(self) -> None:
+        error = subprocess.CalledProcessError(
+            1, ["kind", "load"], stderr="write /tmp: no space left on device"
+        )
+        with mock.patch.object(
+            self.oci_mirror, "_run", side_effect=error
+        ) as run:
+            with self.assertRaisesRegex(
+                self.oci_mirror.MirrorError, "no space left on device"
+            ):
+                self.oci_mirror._load_kind_images("kind", "proof", ["postgres:16"])
+        run.assert_called_once()
+
+    def test_oci_kind_import_archive_failure_retains_diagnostic(self) -> None:
+        digest = "sha256:" + "b" * 64
+        mismatch = subprocess.CalledProcessError(
+            1, ["kind", "load"], stderr=f"ctr: content digest {digest}: not found"
+        )
+        failed_save = subprocess.CalledProcessError(
+            1, ["docker", "image", "save"],
+            stderr="archive write failed: no space left on device",
+        )
+        with mock.patch.object(
+            self.oci_mirror, "_run", side_effect=[mismatch, failed_save]
+        ) as run, mock.patch.object(
+            self.oci_mirror.platform, "machine", return_value="x86_64"
+        ):
+            with self.assertRaisesRegex(
+                self.oci_mirror.MirrorError, "archive write failed: no space left"
+            ):
+                self.oci_mirror._load_kind_images("kind", "proof", ["postgres:16"])
+        self.assertEqual(run.call_count, 2)
+
     def test_oci_mirror_internal_kind_commands_do_not_pollute_json_stdout(self) -> None:
         source = (ROOT / "scripts/platform/oci_proof_mirror.py").read_text()
         self.assertIn(
-            '[kind, "load", "docker-image", "--name", cluster, *local_refs],\n        capture=True,',
+            '[kind, "load", "docker-image", "--name", cluster, *local_refs],',
             source,
         )
         self.assertNotIn('"images", "tag", "--force"', source)
