@@ -1044,14 +1044,43 @@ def _load_kind_images(
         with tempfile.TemporaryDirectory(prefix="commonthing-kind-oci-") as directory:
             archive = Path(directory) / "image.tar"
             try:
-                _run(
-                    [
-                        "docker", "image", "save", "--platform", node_platform,
-                        "--output", str(archive), local_ref,
-                    ],
-                    capture=True,
-                    timeout=900,
-                )
+                try:
+                    _run(
+                        [
+                            "docker", "image", "save", "--platform",
+                            node_platform, "--output", str(archive), local_ref,
+                        ],
+                        capture=True,
+                        timeout=900,
+                    )
+                except subprocess.CalledProcessError as error:
+                    # The containerd image store may have a valid platform
+                    # config but no matching Docker export target descriptor.
+                    # Allow only this exact known failure, then validate the
+                    # actual archive config and node architecture before load.
+                    detail = _kind_load_output(error).strip()
+                    missing_export_target = (
+                        "Error response from daemon: no suitable export target "
+                        f"found: image with reference {local_ref} was found but "
+                        f"does not provide the specified platform ({node_platform})"
+                    )
+                    if detail != missing_export_target:
+                        raise
+                    print(
+                        "kind OCI image store has no platform-specific export "
+                        f"target for {local_ref}; verifying default archive "
+                        f"against {node_platform}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    _run(
+                        [
+                            "docker", "image", "save",
+                            "--output", str(archive), local_ref,
+                        ],
+                        capture=True,
+                        timeout=900,
+                    )
                 archive_image_ids[local_ref] = _archive_platform_config_id(
                     archive, node_platform, local_ref,
                 )

@@ -1399,6 +1399,99 @@ class KubernetesPlatformContractTests(unittest.TestCase):
             self.assertFalse(Path(save[6]).exists())
         self.assertEqual(run.call_count, 5)
 
+    def test_oci_kind_archive_falls_back_when_docker_lacks_platform_export(self) -> None:
+        ref = "quay.io/jetstack/cert-manager-cainjector:weltgewebe-test"
+        digest = "sha256:" + "a" * 64
+        kind_error = subprocess.CalledProcessError(
+            1, ["kind", "load"],
+            stderr=f"ctr: content digest {digest}: not found",
+        )
+        export_error = subprocess.CalledProcessError(
+            1, ["docker", "image", "save"],
+            stderr=(
+                "Error response from daemon: no suitable export target found: "
+                f"image with reference {ref} was found but does not provide "
+                "the specified platform (linux/amd64)"
+            ),
+        )
+        expected_id = "sha256:" + "b" * 64
+        with mock.patch.object(
+            self.oci_mirror, "_run",
+            side_effect=[kind_error, export_error, None, None],
+        ) as run, mock.patch.object(
+            self.oci_mirror, "_archive_platform_config_id",
+            return_value=expected_id,
+        ) as config_id, mock.patch.object(
+            self.oci_mirror.platform, "machine", return_value="x86_64",
+        ):
+            ids = self.oci_mirror._load_kind_images("kind", "proof", [ref])
+        self.assertEqual(ids, {ref: expected_id})
+        self.assertEqual(run.call_count, 4)
+        platform_save = run.call_args_list[1].args[0]
+        fallback_save = run.call_args_list[2].args[0]
+        kind_load = run.call_args_list[3].args[0]
+        self.assertEqual(platform_save[:6], [
+            "docker", "image", "save", "--platform", "linux/amd64", "--output",
+        ])
+        self.assertEqual(platform_save[-1], ref)
+        self.assertEqual(fallback_save, [
+            "docker", "image", "save", "--output", platform_save[6], ref,
+        ])
+        self.assertEqual(
+            kind_load,
+            ["kind", "load", "image-archive", platform_save[6], "--name", "proof"],
+        )
+        config_id.assert_called_once_with(
+            Path(platform_save[6]), "linux/amd64", ref,
+        )
+        self.assertFalse(Path(platform_save[6]).exists())
+
+    def test_oci_kind_unplatformed_save_rejects_wrong_config_architecture(self) -> None:
+        ref = "quay.io/cilium/cilium:v1.19.5"
+        digest = "sha256:" + "a" * 64
+        kind_error = subprocess.CalledProcessError(
+            1, ["kind", "load"],
+            stderr=f"ctr: content digest {digest}: not found",
+        )
+        export_error = subprocess.CalledProcessError(
+            1, ["docker", "image", "save"],
+            stderr=(
+                "Error response from daemon: no suitable export target found: "
+                f"image with reference {ref} was found but does not provide "
+                "the specified platform (linux/amd64)"
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            fixture, _ = self._oci_platform_archive_fixture(
+                Path(directory), architecture="arm64", legacy=True,
+            )
+            def run_command(argv, *, capture=False, timeout=120):
+                del capture, timeout
+                if argv[:3] == ["kind", "load", "docker-image"]:
+                    raise kind_error
+                if argv[:6] == [
+                    "docker", "image", "save", "--platform",
+                    "linux/amd64", "--output",
+                ]:
+                    raise export_error
+                if argv[:4] == ["docker", "image", "save", "--output"]:
+                    Path(argv[4]).write_bytes(fixture.read_bytes())
+                    return
+                raise AssertionError(f"unverified archive was loaded: {argv}")
+            with mock.patch.object(
+                self.oci_mirror, "_run", side_effect=run_command,
+            ) as run, mock.patch.object(
+                self.oci_mirror.platform, "machine", return_value="x86_64",
+            ):
+                with self.assertRaisesRegex(
+                    self.oci_mirror.IntegrityError,
+                    "config architecture differs",
+                ):
+                    self.oci_mirror._load_kind_images(
+                        "kind", "proof", [ref],
+                    )
+            self.assertEqual(run.call_count, 3)
+
     def test_oci_kind_import_unrelated_failure_does_not_retry(self) -> None:
         error = subprocess.CalledProcessError(
             1, ["kind", "load"], stderr="write /tmp: no space left on device"
