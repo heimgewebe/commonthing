@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -3218,6 +3219,54 @@ def _captured_subprocess_evidence(error: subprocess.CalledProcessError) -> str:
         payload = value if isinstance(value, bytes) else str(value).encode("utf-8")
         fields.append(f"{label}_bytes={len(payload)}")
         fields.append(f"{label}_sha256={hashlib.sha256(payload).hexdigest()}")
+
+    # The HA CI runner used to hide the only error from our controlled OCI
+    # loader, making an otherwise actionable CRI image failure opaque. Other
+    # processes (including those handling generated credentials) remain
+    # strictly hash-only. Even for this exact loader, accept only its own
+    # bounded, printable and class-named failure line, never arbitrary stderr.
+    command = error.cmd
+    if (
+        isinstance(command, (tuple, list))
+        and "load-kind" in command
+        and any(
+            isinstance(arg, str)
+            and (arg == "scripts/platform/oci_proof_mirror.py"
+                 or arg.endswith("/scripts/platform/oci_proof_mirror.py"))
+            for arg in command
+        )
+        and isinstance(error.stderr, (str, bytes))
+    ):
+        raw = (
+            error.stderr.decode("utf-8", errors="replace")
+            if isinstance(error.stderr, bytes) else error.stderr
+        )
+        prefix = "OCI proof mirror failed: "
+        permitted = (
+            "CRI image ID drift for ",
+            "CRI runtime ",
+            "CRI returned ",
+            "kind nodes disagree ",
+            "kind OCI ",
+            "kind node ",
+            "verified mirror image disappeared ",
+            "containerd ",
+            "cannot load unverified mirror image ",
+        )
+        for line in raw.splitlines():
+            if not line.startswith(prefix):
+                continue
+            detail = line[len(prefix):].strip()
+            if (
+                detail.startswith(permitted)
+                and re.fullmatch(r"[A-Za-z0-9_./:@=+!,() \[\]-]{8,600}", detail)
+                and not re.search(
+                    r"(?i)(?:bearer|token|password|secret|authorization|api[_-]?key)",
+                    detail,
+                )
+            ):
+                fields.append("oci_failure=" + detail)
+                break
     return "; ".join(fields)
 
 
