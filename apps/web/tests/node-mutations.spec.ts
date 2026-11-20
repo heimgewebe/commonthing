@@ -51,7 +51,7 @@ test.describe("Knoten bearbeiten und löschen", () => {
       };
     });
 
-    expect(layout.fontFamily).toContain("Garnschrift C");
+    expect(layout.fontFamily).not.toContain("Garnschrift C");
     expect(layout.fontSize).toBeGreaterThanOrEqual(14);
     expect(layout.whiteSpace).toBe("nowrap");
     expect(layout.overflowWrap).toBe("normal");

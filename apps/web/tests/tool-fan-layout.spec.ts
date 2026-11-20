@@ -32,8 +32,8 @@ test.describe("Tool Fan Layout", () => {
     const trigger = page.getByTestId("tool-fan-trigger");
     await expect(trigger).toBeVisible();
     await expect(trigger).toHaveAttribute("aria-expanded", "false");
-    await expect(trigger).toHaveAttribute("aria-label", "Werkzeuge öffnen");
-    await expect(trigger).toContainText("Werkzeuge");
+    await expect(trigger).toHaveAttribute("aria-label", "Aktionen öffnen");
+    await expect(trigger).toContainText("Aktionen");
 
     const box = await trigger.boundingBox();
     const viewport = page.viewportSize();
@@ -57,17 +57,17 @@ test.describe("Tool Fan Layout", () => {
       "data-testid",
       ROOT_ACTIONS[0],
     );
-    await expect(actions.nth(0)).toContainText("Finden");
+    await expect(actions.nth(0)).toContainText("Suchen");
     await expect(actions.nth(1)).toHaveAttribute(
       "data-testid",
       ROOT_ACTIONS[1],
     );
-    await expect(actions.nth(1)).toContainText("Karteninhalt");
+    await expect(actions.nth(1)).toContainText("Filter");
     await expect(actions.nth(2)).toHaveAttribute(
       "data-testid",
       ROOT_ACTIONS[2],
     );
-    await expect(actions.nth(2)).toContainText("Weben");
+    await expect(actions.nth(2)).toContainText("Erstellen");
 
     for (const testId of ROOT_ACTIONS) {
       await expect(page.getByTestId(testId)).toHaveAttribute("tabindex", "0");
@@ -80,7 +80,7 @@ test.describe("Tool Fan Layout", () => {
     await openToolFan(page);
     const mapContent = page.getByTestId("tool-fan-map-content");
     await expect(mapContent).not.toHaveAttribute("aria-label", /.+/);
-    await expect(mapContent).toHaveAccessibleName("Karteninhalt");
+    await expect(mapContent).toHaveAccessibleName("Filter");
   });
 
   test("Tab leaves the non-modal fan and closes it instead of trapping focus", async ({
@@ -216,7 +216,7 @@ test.describe("Tool Fan Layout — guest role", () => {
     await openToolFan(page);
     const weave = page.getByTestId("tool-fan-weave");
     await expect(weave).toBeEnabled();
-    await expect(weave).toContainText("Weben");
+    await expect(weave).toContainText("Erstellen");
     expect((await weave.boundingBox())!.width).toBeLessThan(120);
 
     await weave.click();

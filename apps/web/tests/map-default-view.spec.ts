@@ -236,9 +236,7 @@ test("camera movement remains sticky after returning to the initial view", async
     });
   }, initialCamera);
   releaseAuth();
-  await expect(
-    page.getByRole("link", { name: "Einstellungen öffnen" }),
-  ).toBeVisible();
+  await expect(page.getByTestId("site-menu-trigger")).toBeVisible();
   const finalCamera = await page.evaluate(() => {
     const map = (window as any).__TEST_MAP__;
     const center = map.getCenter();

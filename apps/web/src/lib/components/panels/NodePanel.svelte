@@ -158,7 +158,15 @@
     const buttons = (e.currentTarget as HTMLElement)
       ?.closest(".tabs")
       ?.querySelectorAll<HTMLButtonElement>('button[role="tab"]');
-    buttons?.item(nextIndex)?.focus();
+    const nextButton = buttons?.item(nextIndex);
+    nextButton?.focus();
+    if (nextButton) {
+      // Labels retain a readable width. Keyboard navigation scrolls the
+      // selected tab into view rather than clipping or shrinking its text.
+      void tick().then(() =>
+        nextButton.scrollIntoView({ inline: "nearest", block: "nearest" }),
+      );
+    }
   }
 
   function beginEdit() {
@@ -790,11 +798,11 @@
     gap: 0;
   }
   .node-tabs > button {
-    /* Let longer labels claim a little more width instead of forcing every
-     * tab into an equal column. Words stay intact and all tabs remain visible. */
-    flex: 1 1 auto;
-    min-width: 0;
-    padding-inline: 0.2rem;
+    /* Keep tab labels intact and readable; narrow panels scroll horizontally
+     * instead of squeezing the labels below their natural width. */
+    flex: 0 0 auto;
+    min-width: max-content;
+    padding-inline: 0.45rem;
     line-height: 1.15;
     overflow-wrap: normal;
     white-space: nowrap;
@@ -1011,8 +1019,8 @@
   }
   @media (max-width: 420px) {
     .node-tabs > button {
-      padding-inline: 0.1rem;
-      font-size: 0.75rem;
+      padding-inline: 0.35rem;
+      font-size: 0.875rem;
     }
     .coordinate-grid,
     .form-actions {

@@ -43,16 +43,14 @@
   class:open
   class:root={branch === TOOL_FAN_BRANCH.root}
   role="group"
-  aria-label={branch === TOOL_FAN_BRANCH.root
-    ? "Werkzeugfächer"
-    : "Webungsaktionen"}
+  aria-label={branch === TOOL_FAN_BRANCH.root ? "Kartenaktionen" : "Erstellen"}
   aria-hidden={!open}
 >
   {#if branch === TOOL_FAN_BRANCH.root}
     <div class="fan-row fan-row--root">
       <div class="fan-slot fan-slot--left">
         <FanAction
-          label="Finden"
+          label="Suchen"
           symbol="⌕"
           testId="tool-fan-find"
           active={searchOpen}
@@ -62,7 +60,7 @@
       </div>
       <div class="fan-slot fan-slot--center">
         <FanAction
-          label="Karteninhalt"
+          label="Filter"
           symbol="◉"
           testId="tool-fan-map-content"
           active={filterOpen}
@@ -78,18 +76,18 @@
       </div>
       <div class="fan-slot fan-slot--right">
         <FanAction
-          label="Weben"
+          label="Erstellen"
           symbol="⌁"
           testId="tool-fan-weave"
           active={compositionActive}
           disabled={!hasWeavingAction}
           tabIndex={open && hasWeavingAction ? 0 : -1}
           ariaLabel={hasWeavingAction
-            ? "Webungsaktionen öffnen"
-            : "Weben – Anmeldung erforderlich"}
+            ? "Eintrag oder Antrag erstellen"
+            : "Erstellen – Anmeldung erforderlich"}
           title={hasWeavingAction
-            ? "Webungsaktionen öffnen"
-            : "Zum Weben ist eine Anmeldung erforderlich"}
+            ? "Eintrag oder Antrag erstellen"
+            : "Zum Erstellen ist eine Anmeldung erforderlich"}
           onclick={() => dispatch("openWeave")}
         />
       </div>
@@ -100,29 +98,29 @@
         type="button"
         class="branch-back"
         data-testid="tool-fan-back"
-        aria-label="Zurück zu den Werkzeugen"
+        aria-label="Zurück zu den Aktionen"
         tabindex={open ? 0 : -1}
         onclick={() => dispatch("back")}>←</button
       >
-      <span>Weben</span>
+      <span>Erstellen</span>
     </div>
     <div class="fan-row fan-row--branch">
       <FanAction
-        label="Knoten knüpfen"
+        label="Eintrag erstellen"
         symbol="＋"
         testId="tool-fan-create-node"
         disabled={!canCreateNode}
         tabIndex={open && canCreateNode ? 0 : -1}
         ariaLabel={canCreateNode
           ? undefined
-          : "Knoten knüpfen – Anmeldung erforderlich"}
+          : "Eintrag erstellen – Anmeldung erforderlich"}
         title={canCreateNode
-          ? "Neuen Knoten auf der Karte knüpfen"
-          : "Zum Knotenknüpfen musst du angemeldet sein"}
+          ? "Neuen Eintrag auf der Karte erstellen"
+          : "Zum Erstellen musst du angemeldet sein"}
         onclick={() => dispatch("createNode")}
       />
       <FanAction
-        label="Antrag stellen"
+        label="Weberstatus beantragen"
         symbol="◇"
         testId="tool-fan-create-proposal"
         href={canCreateProposal ? "/antraege#antrag-stellen" : null}
@@ -139,7 +137,7 @@
     </div>
     <p class="branch-note">
       {#if canCreateProposal}
-        Dein Weberantrag ist eine eigene Webungsaktion.
+        Hier beantragst du den Weberstatus.
       {:else if canCreateNode}
         Allgemeine Antragstypen sind noch nicht produktiv freigeschaltet.
       {:else}
@@ -197,9 +195,11 @@
   }
 
   .fan-panel.root .fan-row--root :global(.fan-action) {
-    min-width: 104px;
+    min-width: 0;
+    width: 104px;
     min-height: 44px;
-    padding-inline: 0.7rem;
+    padding-inline: 0.4rem;
+    font-size: 0.875rem;
     pointer-events: auto;
   }
 

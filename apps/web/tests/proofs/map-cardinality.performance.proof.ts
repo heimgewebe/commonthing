@@ -432,7 +432,7 @@ test("keeps 1k/10k/100k map cardinalities inside fixed browser budgets", async (
       });
 
       if (cardinality === 1000 && nativeLayerExpected) {
-        await page.getByRole("button", { name: "Werkzeuge öffnen" }).click();
+        await page.getByTestId("tool-fan-trigger").click();
         await page.getByTestId("tool-fan-find").click();
         const dialog = page.getByRole("dialog", { name: "Finden" });
         const combobox = page.getByRole("combobox", { name: "Suchbegriff" });
