@@ -7,6 +7,7 @@ import fcntl
 import hashlib
 import json
 import os
+import platform
 import re
 import subprocess
 import sys
@@ -874,6 +875,81 @@ def _block_kind_registries(node: str) -> dict[str, Any]:
     return {"node": node, "registries": observed}
 
 
+def _kind_load_output(error: subprocess.CalledProcessError) -> str:
+    """Keep failures actionable without flooding the CI log with image archives."""
+    chunks = []
+    for value in (error.stdout, error.stderr):
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", errors="replace")
+        if isinstance(value, str) and value.strip():
+            chunks.append(value.strip())
+    return "\n".join(chunks)
+
+
+def _load_kind_images(kind: str, cluster: str, local_refs: list[str]) -> None:
+    """Try native import first; handle only kind's known containerd store bug."""
+    try:
+        _run(
+            [kind, "load", "docker-image", "--name", cluster, *local_refs],
+            capture=True,
+            timeout=900,
+        )
+        return
+    except subprocess.CalledProcessError as error:
+        diagnostic = _kind_load_output(error)
+        # kind's documented containerd image-store failure: a multi-platform
+        # docker-save archive refers to a digest not present in that archive.
+        if re.search(
+            r"content digest sha256:[0-9a-f]{64}: not found",
+            diagnostic,
+            re.IGNORECASE,
+        ) is None:
+            raise MirrorError(
+                f"kind OCI image import failed (exit {error.returncode}): "
+                f"{diagnostic[-2400:] or 'no captured diagnostics'}"
+            ) from error
+        node_platform = {"x86_64": "linux/amd64", "aarch64": "linux/arm64"}.get(
+            platform.machine()
+        )
+        if node_platform is None:
+            raise MirrorError(
+                "kind OCI single-platform fallback has no verified host architecture: "
+                f"{platform.machine()}"
+            ) from error
+        print(
+            "kind OCI image import hit the known containerd digest-missing failure; "
+            f"loading verified images as individual {node_platform} archives",
+            file=sys.stderr,
+            flush=True,
+        )
+    for local_ref in local_refs:
+        # One archive at a time bounds peak temporary space; each image still
+        # passes the same strict post-load CRI identity checks in load_kind().
+        with tempfile.TemporaryDirectory(prefix="commonthing-kind-oci-") as directory:
+            archive = Path(directory) / "image.tar"
+            try:
+                _run(
+                    [
+                        "docker", "image", "save", "--platform", node_platform,
+                        "--output", str(archive), local_ref,
+                    ],
+                    capture=True,
+                    timeout=900,
+                )
+                _run(
+                    [kind, "load", "image-archive", str(archive), "--name", cluster],
+                    capture=True,
+                    timeout=900,
+                )
+            except subprocess.CalledProcessError as error:
+                detail = _kind_load_output(error)
+                raise MirrorError(
+                    f"kind OCI single-platform archive failed for {local_ref} "
+                    f"(exit {error.returncode}): "
+                    f"{detail[-2400:] or 'no captured diagnostics'}"
+                ) from error
+
+
 def load_kind(
     state: Path,
     suites: Iterable[str],
@@ -893,11 +969,7 @@ def load_kind(
         if _local_image(spec) is None:
             raise IntegrityError(f"cannot load unverified mirror image into kind: {name}")
     local_refs = [spec["local_ref"] for _name, spec in selected]
-    _run(
-        [kind, "load", "docker-image", "--name", cluster, *local_refs],
-        capture=True,
-        timeout=900,
-    )
+    _load_kind_images(kind, cluster, local_refs)
     loaded: dict[str, Any] = {}
     for name, spec in selected:
         verified = _local_image(spec)
