@@ -995,8 +995,41 @@ def _archive_platform_config_id(
                         continue
                     matching_configs[hashlib.sha256(candidate).hexdigest()] = candidate
                 if len(matching_configs) != 1:
+                    # The hosted Docker archive is ephemeral. Expose only
+                    # bounded counts, never untrusted index fields or tags,
+                    # so the real CI failure can distinguish missing labels,
+                    # nested indexes, and genuinely ambiguous image configs.
+                    labels = {"target": 0, "missing": 0, "unknown": 0, "other": 0}
+                    image_manifests = 0
+                    for item in descriptors:
+                        if not isinstance(item, dict) or item.get("mediaType") not in {
+                            "application/vnd.oci.image.manifest.v1+json",
+                            "application/vnd.docker.distribution.manifest.v2+json",
+                        }:
+                            continue
+                        image_manifests += 1
+                        declared = item.get("platform")
+                        if declared is None:
+                            labels["missing"] += 1
+                        elif isinstance(declared, dict) and (
+                            declared.get("os"), declared.get("architecture")
+                        ) == (os_name, architecture):
+                            labels["target"] += 1
+                        elif isinstance(declared, dict) and (
+                            declared.get("os"), declared.get("architecture")
+                        ) == ("unknown", "unknown"):
+                            labels["unknown"] += 1
+                        else:
+                            labels["other"] += 1
                     raise IntegrityError(
-                        "kind OCI archive has no unique matching platform config"
+                        "kind OCI archive has no unique matching platform config "
+                        f"index_entries={len(descriptors)} "
+                        f"image_manifests={image_manifests} "
+                        f"label_target={labels['target']} "
+                        f"label_missing={labels['missing']} "
+                        f"label_unknown={labels['unknown']} "
+                        f"label_other={labels['other']} "
+                        f"matching_configs={len(matching_configs)}"
                     )
                 config_digest, config_bytes = next(iter(matching_configs.items()))
             config = json.loads(config_bytes)

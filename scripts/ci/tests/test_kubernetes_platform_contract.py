@@ -1353,6 +1353,44 @@ class KubernetesPlatformContractTests(unittest.TestCase):
                     archive, "linux/amd64", "quay.io/cilium/cilium:v1.19.5",
                 )
 
+    def test_oci_platform_archive_failure_classifies_safe_platform_labels(self) -> None:
+        # A real HA runner error lacks the containerd export's index metadata.
+        # Only fixed count labels, never arbitrary index strings, may reach CI.
+        with tempfile.TemporaryDirectory() as tmp:
+            archive, _ = self._oci_multi_manifest_archive_fixture(
+                Path(tmp), [
+                    ({"os": "unknown", "architecture": "unknown"}, "amd64", "x"),
+                    ({"os": "linux", "architecture": "arm64"}, "arm64", "arm"),
+                    ({"os": "private-token-secret", "architecture": "leak"}, "amd64", "bad"),
+                ],
+            )
+            with self.assertRaises(self.oci_mirror.IntegrityError) as caught:
+                self.oci_mirror._archive_platform_config_id(
+                    archive, "linux/amd64", "quay.io/cilium/cilium:v1.19.5",
+                )
+            message = str(caught.exception)
+            for observed in (
+                "index_entries=3", "image_manifests=3",
+                "label_target=0", "label_missing=0",
+                "label_unknown=1", "label_other=2", "matching_configs=0",
+            ):
+                self.assertIn(observed, message)
+            self.assertNotIn("private-token-secret", message)
+            self.assertLess(len(message), 350)
+
+    def test_oci_platform_archive_failure_reports_distinct_config_count(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            archive, _ = self._oci_multi_manifest_archive_fixture(
+                Path(tmp), [(None, "amd64", "one"), (None, "amd64", "two")],
+            )
+            with self.assertRaises(self.oci_mirror.IntegrityError) as caught:
+                self.oci_mirror._archive_platform_config_id(
+                    archive, "linux/amd64", "quay.io/cilium/cilium:v1.19.5",
+                )
+            message = str(caught.exception)
+            self.assertIn("label_missing=2", message)
+            self.assertIn("matching_configs=2", message)
+
     def test_oci_platform_archive_matching_descriptor_wrong_config_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             archive, _ = self._oci_multi_manifest_archive_fixture(
