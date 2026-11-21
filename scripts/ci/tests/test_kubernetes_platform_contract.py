@@ -3083,6 +3083,25 @@ class KubernetesPlatformContractTests(unittest.TestCase):
         )
 
         ha = named_steps("kind-ha-recovery-proof")
+        docker = ha["Use complete Docker image archives for HA proof"]
+        self.assertEqual(
+            docker["if"], "steps.proof-cache.outputs.cache-hit != 'true'",
+        )
+        self.assertIn("containerd-snapshotter", docker["run"])
+        self.assertIn("sudo systemctl restart docker", docker["run"])
+        self.assertIn('test "$driver" = "overlay2"', docker["run"])
+        ha_order = [
+            step.get("name")
+            for step in workflow["jobs"]["kind-ha-recovery-proof"]["steps"]
+        ]
+        self.assertLess(
+            ha_order.index("Use complete Docker image archives for HA proof"),
+            ha_order.index("Initialize isolated OCI mirror credentials"),
+        )
+        self.assertNotIn(
+            "Use complete Docker image archives for HA proof",
+            named_steps("kind-gitops-proof"),
+        )
         stage_receipt = ha["Stage HA recovery receipt"]
         self.assertEqual(stage_receipt["if"], "success()")
         self.assertIn(
