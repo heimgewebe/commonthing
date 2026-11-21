@@ -2343,6 +2343,46 @@ spec:
             self.assertEqual(self.ha.main(), 0)
         self.assertEqual(json.loads(stdout.getvalue()), {"status": "pass"})
 
+    def test_ha_oci_load_kind_failure_exposes_bounded_safe_diagnostic(self) -> None:
+        argv = [
+            "python3", "scripts/platform/oci_proof_mirror.py",
+            "--state", "/tmp/test-mirror-state", "load-kind",
+            "--suite", "ha-recovery", "--kind", "kind",
+            "--cluster", "wg-ha-proof",
+        ]
+        observed = "sha256:" + "a" * 64
+        expected = "sha256:" + "b" * 64
+        message = (
+            "OCI proof mirror failed: CRI image ID drift for "
+            "ghcr.io/cloudnative-pg/postgresql:16.14 on wg-ha-proof-worker: "
+            f"{observed} != {expected}"
+        )
+        error = self.ha.subprocess.CalledProcessError(
+            1, argv, stderr="+ kind load\n" + message + "\n",
+        )
+        evidence = self.ha._captured_subprocess_evidence(error)
+        self.assertIn("oci_failure=CRI image ID drift for", evidence)
+        self.assertIn("ghcr.io/cloudnative-pg/postgresql:16.14", evidence)
+        self.assertIn("stderr_sha256=", evidence)
+
+    def test_ha_oci_load_kind_diagnostic_never_leaks_untrusted_output(self) -> None:
+        argv = [
+            "python3", "scripts/platform/oci_proof_mirror.py",
+            "load-kind", "--suite", "ha-recovery",
+        ]
+        sensitive = "Bearer highly-sensitive-example-token"
+        for command in (["other-tool"], argv):
+            with self.subTest(command=command):
+                error = self.ha.subprocess.CalledProcessError(
+                    2, command, stderr=(
+                        "OCI proof mirror failed: " + sensitive
+                    ),
+                )
+                evidence = self.ha._captured_subprocess_evidence(error)
+                self.assertNotIn(sensitive, evidence)
+                self.assertIn("stderr_sha256=", evidence)
+                self.assertNotIn("oci_failure=", evidence)
+
     def test_postgres_operand_keeps_version_and_digest(self) -> None:
         image = self.ha.POSTGRES_IMAGE
         self.assertIn(":16.14@sha256:", image)

@@ -11,6 +11,7 @@ import platform
 import re
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 from contextlib import contextmanager
@@ -886,23 +887,229 @@ def _kind_load_output(error: subprocess.CalledProcessError) -> str:
     return "\n".join(chunks)
 
 
-def _load_kind_images(kind: str, cluster: str, local_refs: list[str]) -> None:
-    """Try native import first; handle only kind's known containerd store bug."""
+def _archive_platform_config_id(
+    archive: Path, node_platform: str, local_ref: str,
+) -> str:
+    """Bind CRI's config ID to the exact verified single-platform Docker archive.
+
+    Docker with the containerd store can report an index ID from image inspect,
+    while crictl returns the platform image's config digest. Neither ID is a
+    substitute for the source mirror lock; this derives the second from bytes
+    actually passed to kind without relaxing either check.
+    """
+    os_name, sep, architecture = node_platform.partition("/")
+    if os_name != "linux" or not sep or architecture not in {"amd64", "arm64"}:
+        raise IntegrityError("kind OCI archive platform is not supported")
+
+    def member_bytes(bundle: tarfile.TarFile, name: str, maximum: int) -> bytes:
+        try:
+            member = bundle.getmember(name)
+        except KeyError as error:
+            raise IntegrityError(
+                f"kind OCI archive required member is absent: {name}"
+            ) from error
+        if not member.isfile() or not 0 < member.size <= maximum:
+            raise IntegrityError("kind OCI archive metadata member is invalid")
+        stream = bundle.extractfile(member)
+        if stream is None:
+            raise IntegrityError("kind OCI archive metadata cannot be read")
+        with stream:
+            content = stream.read(maximum + 1)
+        if len(content) != member.size:
+            raise IntegrityError("kind OCI archive metadata length mismatch")
+        return content
+
+    def checked_blob(
+        bundle: tarfile.TarFile, digest: str, label: str,
+    ) -> bytes:
+        if not isinstance(digest, str) or not FULL_SHA256.fullmatch(digest):
+            raise IntegrityError(f"kind OCI archive {label} digest is invalid")
+        content = member_bytes(
+            bundle, f"blobs/sha256/{digest[7:]}", 4 * 1024 * 1024,
+        )
+        if hashlib.sha256(content).hexdigest() != digest[7:]:
+            raise IntegrityError(f"kind OCI archive {label} digest mismatch")
+        return content
+
+    try:
+        with tarfile.open(archive, "r:") as bundle:
+            try:
+                bundle.getmember("index.json")
+            except KeyError:
+                manifest = json.loads(member_bytes(bundle, "manifest.json", 1024 * 1024))
+                if not isinstance(manifest, list) or len(manifest) != 1:
+                    raise IntegrityError("kind Docker archive image inventory is ambiguous")
+                entry = manifest[0]
+                if not isinstance(entry, dict) or local_ref not in (
+                    entry.get("RepoTags") or []
+                ):
+                    raise IntegrityError("kind Docker archive image tag is not bound")
+                config_path = entry.get("Config")
+                if not isinstance(config_path, str) or re.fullmatch(
+                    r"[0-9a-f]{64}\.json", config_path,
+                ) is None:
+                    raise IntegrityError("kind Docker archive config path is invalid")
+                config_bytes = member_bytes(bundle, config_path, 4 * 1024 * 1024)
+                config_digest = hashlib.sha256(config_bytes).hexdigest()
+                if config_digest != config_path[:-5]:
+                    raise IntegrityError("kind Docker archive config digest mismatch")
+            else:
+                index = json.loads(member_bytes(bundle, "index.json", 1024 * 1024))
+                if not isinstance(index, dict) or not isinstance(
+                    index.get("manifests"), list,
+                ):
+                    raise IntegrityError("kind OCI archive index is invalid")
+                descriptors = index["manifests"]
+                # Docker/containerd may export an OCI index pointing to another
+                # digest-bound index, rather than directly to image manifests.
+                # Descend only through known index media types; each child is
+                # SHA-verified and the actual config still selects the platform.
+                index_types = {
+                    "application/vnd.oci.image.index.v1+json",
+                    "application/vnd.docker.distribution.manifest.list.v2+json",
+                }
+                pending: list[tuple[list[object], int]] = [(descriptors, 0)]
+                seen_indexes: set[str] = set()
+                leaf_descriptors: list[object] = []
+                traversed_entries = 0
+                while pending:
+                    entries, depth = pending.pop()
+                    if depth > 4:
+                        raise IntegrityError("kind OCI nested index depth exceeds limit")
+                    traversed_entries += len(entries)
+                    if traversed_entries > 256:
+                        raise IntegrityError("kind OCI nested index descriptor budget exceeded")
+                    for item in entries:
+                        if not isinstance(item, dict):
+                            continue
+                        if item.get("mediaType") not in index_types:
+                            leaf_descriptors.append(item)
+                            continue
+                        declared = item.get("platform")
+                        if declared is not None and (
+                            not isinstance(declared, dict)
+                            or (
+                                declared.get("os"), declared.get("architecture")
+                            ) not in {
+                                (os_name, architecture), ("unknown", "unknown"),
+                            }
+                        ):
+                            continue
+                        digest = item.get("digest")
+                        if not isinstance(digest, str) or not FULL_SHA256.fullmatch(digest):
+                            raise IntegrityError("kind OCI nested index digest is invalid")
+                        if digest in seen_indexes:
+                            continue
+                        seen_indexes.add(digest)
+                        nested = json.loads(checked_blob(bundle, digest, "nested index"))
+                        if not isinstance(nested, dict) or not isinstance(
+                            nested.get("manifests"), list,
+                        ):
+                            raise IntegrityError("kind OCI nested index is invalid")
+                        pending.append((nested["manifests"], depth + 1))
+                descriptors = leaf_descriptors
+                matching_configs: dict[str, bytes] = {}
+                for item in descriptors:
+                    if not isinstance(item, dict) or item.get("mediaType") not in {
+                        "application/vnd.oci.image.manifest.v1+json",
+                        "application/vnd.docker.distribution.manifest.v2+json",
+                    }:
+                        continue
+                    declared = item.get("platform")
+                    if declared is not None and (
+                        not isinstance(declared, dict)
+                        or (declared.get("os"), declared.get("architecture"))
+                        != (os_name, architecture)
+                    ):
+                        continue
+                    manifest = json.loads(
+                        checked_blob(bundle, item.get("digest"), "manifest")
+                    )
+                    if not isinstance(manifest, dict) or not isinstance(
+                        manifest.get("config"), dict,
+                    ):
+                        raise IntegrityError("kind OCI platform manifest has no config")
+                    candidate = checked_blob(
+                        bundle, manifest["config"].get("digest"), "config",
+                    )
+                    config = json.loads(candidate)
+                    if not isinstance(config, dict) or (
+                        config.get("os"), config.get("architecture")
+                    ) != (os_name, architecture):
+                        if declared is not None:
+                            raise IntegrityError(
+                                "kind OCI archive config architecture differs from selected node"
+                            )
+                        continue
+                    matching_configs[hashlib.sha256(candidate).hexdigest()] = candidate
+                if len(matching_configs) != 1:
+                    # The hosted Docker archive is ephemeral. Expose only
+                    # bounded counts, never untrusted index fields or tags,
+                    # so the real CI failure can distinguish missing labels,
+                    # nested indexes, and genuinely ambiguous image configs.
+                    labels = {"target": 0, "missing": 0, "unknown": 0, "other": 0}
+                    image_manifests = 0
+                    for item in descriptors:
+                        if not isinstance(item, dict) or item.get("mediaType") not in {
+                            "application/vnd.oci.image.manifest.v1+json",
+                            "application/vnd.docker.distribution.manifest.v2+json",
+                        }:
+                            continue
+                        image_manifests += 1
+                        declared = item.get("platform")
+                        if declared is None:
+                            labels["missing"] += 1
+                        elif isinstance(declared, dict) and (
+                            declared.get("os"), declared.get("architecture")
+                        ) == (os_name, architecture):
+                            labels["target"] += 1
+                        elif isinstance(declared, dict) and (
+                            declared.get("os"), declared.get("architecture")
+                        ) == ("unknown", "unknown"):
+                            labels["unknown"] += 1
+                        else:
+                            labels["other"] += 1
+                    raise IntegrityError(
+                        "kind OCI archive has no unique matching platform config "
+                        f"index_entries={len(descriptors)} "
+                        f"image_manifests={image_manifests} "
+                        f"label_target={labels['target']} "
+                        f"label_missing={labels['missing']} "
+                        f"label_unknown={labels['unknown']} "
+                        f"label_other={labels['other']} "
+                        f"matching_configs={len(matching_configs)}"
+                    )
+                config_digest, config_bytes = next(iter(matching_configs.items()))
+            config = json.loads(config_bytes)
+            if not isinstance(config, dict) or (
+                config.get("os"), config.get("architecture")
+            ) != (os_name, architecture):
+                raise IntegrityError(
+                    "kind OCI archive config architecture differs from selected node"
+                )
+            return f"sha256:{config_digest}"
+    except (OSError, tarfile.TarError, UnicodeError, json.JSONDecodeError) as error:
+        raise IntegrityError(
+            f"kind OCI archive config cannot be verified: {type(error).__name__}"
+        ) from error
+
+
+def _load_kind_images(
+    kind: str, cluster: str, local_refs: list[str],
+) -> dict[str, str]:
+    """Use native import first, otherwise return exact archive config IDs."""
     try:
         _run(
             [kind, "load", "docker-image", "--name", cluster, *local_refs],
             capture=True,
             timeout=900,
         )
-        return
+        return {}
     except subprocess.CalledProcessError as error:
         diagnostic = _kind_load_output(error)
-        # kind's documented containerd image-store failure: a multi-platform
-        # docker-save archive refers to a digest not present in that archive.
         if re.search(
             r"content digest sha256:[0-9a-f]{64}: not found",
-            diagnostic,
-            re.IGNORECASE,
+            diagnostic, re.IGNORECASE,
         ) is None:
             raise MirrorError(
                 f"kind OCI image import failed (exit {error.returncode}): "
@@ -922,19 +1129,50 @@ def _load_kind_images(kind: str, cluster: str, local_refs: list[str]) -> None:
             file=sys.stderr,
             flush=True,
         )
+    archive_image_ids: dict[str, str] = {}
     for local_ref in local_refs:
-        # One archive at a time bounds peak temporary space; each image still
-        # passes the same strict post-load CRI identity checks in load_kind().
         with tempfile.TemporaryDirectory(prefix="commonthing-kind-oci-") as directory:
             archive = Path(directory) / "image.tar"
             try:
-                _run(
-                    [
-                        "docker", "image", "save", "--platform", node_platform,
-                        "--output", str(archive), local_ref,
-                    ],
-                    capture=True,
-                    timeout=900,
+                try:
+                    _run(
+                        [
+                            "docker", "image", "save", "--platform",
+                            node_platform, "--output", str(archive), local_ref,
+                        ],
+                        capture=True,
+                        timeout=900,
+                    )
+                except subprocess.CalledProcessError as error:
+                    # The containerd image store may have a valid platform
+                    # config but no matching Docker export target descriptor.
+                    # Allow only this exact known failure, then validate the
+                    # actual archive config and node architecture before load.
+                    detail = _kind_load_output(error).strip()
+                    missing_export_target = (
+                        "Error response from daemon: no suitable export target "
+                        f"found: image with reference {local_ref} was found but "
+                        f"does not provide the specified platform ({node_platform})"
+                    )
+                    if detail != missing_export_target:
+                        raise
+                    print(
+                        "kind OCI image store has no platform-specific export "
+                        f"target for {local_ref}; verifying default archive "
+                        f"against {node_platform}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    _run(
+                        [
+                            "docker", "image", "save",
+                            "--output", str(archive), local_ref,
+                        ],
+                        capture=True,
+                        timeout=900,
+                    )
+                archive_image_ids[local_ref] = _archive_platform_config_id(
+                    archive, node_platform, local_ref,
                 )
                 _run(
                     [kind, "load", "image-archive", str(archive), "--name", cluster],
@@ -948,6 +1186,7 @@ def _load_kind_images(kind: str, cluster: str, local_refs: list[str]) -> None:
                     f"(exit {error.returncode}): "
                     f"{detail[-2400:] or 'no captured diagnostics'}"
                 ) from error
+    return archive_image_ids
 
 
 def load_kind(
@@ -969,7 +1208,7 @@ def load_kind(
         if _local_image(spec) is None:
             raise IntegrityError(f"cannot load unverified mirror image into kind: {name}")
     local_refs = [spec["local_ref"] for _name, spec in selected]
-    _load_kind_images(kind, cluster, local_refs)
+    archive_image_ids = _load_kind_images(kind, cluster, local_refs)
     loaded: dict[str, Any] = {}
     for name, spec in selected:
         verified = _local_image(spec)
@@ -983,7 +1222,7 @@ def load_kind(
                 spec["local_ref"],
                 spec["canonical"],
                 digest,
-                verified["image_id"],
+                archive_image_ids.get(spec["local_ref"], verified["image_id"]),
             )
             for node in nodes
         ]
@@ -997,6 +1236,13 @@ def load_kind(
                 f"kind nodes disagree on CRI image binding for {name}: {bindings}"
             )
         loaded[name] = {
+            **verified,
+            "host_image_id": verified["image_id"],
+            "image_id": next(iter(image_ids)),
+            "image_id_source": (
+                "archive_platform_config"
+                if spec["local_ref"] in archive_image_ids else "docker_host"
+            ),
             "canonical": spec["canonical"],
             "local_ref": spec["local_ref"],
             "digest_ref": digest_ref,
@@ -1005,7 +1251,6 @@ def load_kind(
             "platform_target_digest": next(iter(platform_targets)),
             "cri_image_id": next(iter(image_ids)),
             "nodes": bindings,
-            **verified,
         }
     registry_blockades = [_block_kind_registries(node) for node in nodes]
     receipt = {

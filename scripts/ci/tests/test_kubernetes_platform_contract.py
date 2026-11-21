@@ -1211,6 +1211,409 @@ class KubernetesPlatformContractTests(unittest.TestCase):
                     image_id,
                 )
 
+    def _oci_platform_archive_fixture(
+        self, directory: Path, *, architecture: str = "amd64",
+        corrupt_config: bool = False, legacy: bool = False,
+    ) -> tuple[Path, str]:
+        config = json.dumps({
+            "os": "linux", "architecture": architecture,
+            "config": {"Env": ["PROOF_ONLY=yes"]},
+        }, sort_keys=True).encode()
+        config_digest = hashlib.sha256(config).hexdigest()
+        stored_config = config + (b" " if corrupt_config else b"")
+        manifest = json.dumps({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": f"sha256:{config_digest}",
+                "size": len(config),
+            },
+            "layers": [],
+        }, sort_keys=True).encode()
+        manifest_digest = hashlib.sha256(manifest).hexdigest()
+        index = json.dumps({
+            "schemaVersion": 2,
+            "manifests": [{
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": f"sha256:{manifest_digest}",
+                "platform": {"os": "linux", "architecture": architecture},
+            }],
+        }, sort_keys=True).encode()
+        archive = directory / ("docker.tar" if legacy else "oci.tar")
+        items = (
+            [(f"{config_digest}.json", stored_config),
+             ("manifest.json", json.dumps([{
+                 "Config": f"{config_digest}.json",
+                 "RepoTags": ["quay.io/cilium/cilium:v1.19.5"],
+                 "Layers": [],
+             }]).encode())]
+            if legacy else
+            [("index.json", index),
+             (f"blobs/sha256/{manifest_digest}", manifest),
+             (f"blobs/sha256/{config_digest}", stored_config)]
+        )
+        with tarfile.open(archive, "w") as package:
+            for name, data in items:
+                member = tarfile.TarInfo(name)
+                member.size = len(data)
+                package.addfile(member, io.BytesIO(data))
+        return archive, f"sha256:{config_digest}"
+
+    def _oci_multi_manifest_archive_fixture(
+        self, directory: Path, specs: list[tuple[dict[str, str] | None, str, str]],
+    ) -> tuple[Path, list[str]]:
+        """Create real SHA-bound OCI blobs; index platforms may be absent."""
+        descriptors = []
+        members: dict[str, bytes] = {}
+        config_ids = []
+        for platform_value, architecture, marker in specs:
+            config_bytes = json.dumps({
+                "os": "linux", "architecture": architecture,
+                "config": {"Env": [f"PROOF_ONLY={marker}"]},
+            }, sort_keys=True).encode()
+            config_sha = hashlib.sha256(config_bytes).hexdigest()
+            config_ids.append(f"sha256:{config_sha}")
+            manifest_bytes = json.dumps({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "config": {
+                    "mediaType": "application/vnd.oci.image.config.v1+json",
+                    "digest": f"sha256:{config_sha}",
+                    "size": len(config_bytes),
+                },
+                "layers": [],
+            }, sort_keys=True).encode()
+            manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
+            descriptor = {
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": f"sha256:{manifest_sha}",
+            }
+            if platform_value is not None:
+                descriptor["platform"] = platform_value
+            descriptors.append(descriptor)
+            members[f"blobs/sha256/{manifest_sha}"] = manifest_bytes
+            members[f"blobs/sha256/{config_sha}"] = config_bytes
+        archive = directory / "multi-index.tar"
+        members["index.json"] = json.dumps({
+            "schemaVersion": 2, "manifests": descriptors,
+        }, sort_keys=True).encode()
+        with tarfile.open(archive, "w") as package:
+            for name, content in members.items():
+                entry = tarfile.TarInfo(name)
+                entry.size = len(content)
+                package.addfile(entry, io.BytesIO(content))
+        return archive, config_ids
+
+    def _oci_nested_index_archive_fixture(
+        self, directory: Path,
+        specs: list[tuple[dict[str, str] | None, str, str]],
+        *, depth: int = 1, outer_platform: dict[str, str] | None = None,
+        corrupt_nested: bool = False,
+    ) -> tuple[Path, list[str]]:
+        """Wrap real SHA-bound manifest/config blobs in one or more OCI indexes."""
+        archive, config_ids = self._oci_multi_manifest_archive_fixture(
+            directory, specs,
+        )
+        members: dict[str, bytes] = {}
+        with tarfile.open(archive, "r:") as package:
+            for member in package.getmembers():
+                stream = package.extractfile(member)
+                if stream is None:
+                    raise AssertionError("fixture has a non-file member")
+                with stream:
+                    members[member.name] = stream.read()
+        index_bytes = members["index.json"]
+        for level in range(depth):
+            index_digest = hashlib.sha256(index_bytes).hexdigest()
+            stored = (
+                index_bytes + b" "
+                if corrupt_nested and level == 0 else index_bytes
+            )
+            members[f"blobs/sha256/{index_digest}"] = stored
+            descriptor: dict[str, object] = {
+                "mediaType": "application/vnd.oci.image.index.v1+json",
+                "digest": f"sha256:{index_digest}",
+            }
+            if outer_platform is not None and level == depth - 1:
+                descriptor["platform"] = outer_platform
+            index_bytes = json.dumps({
+                "schemaVersion": 2, "manifests": [descriptor],
+            }, sort_keys=True).encode()
+        members["index.json"] = index_bytes
+        with tarfile.open(archive, "w") as package:
+            for name, data in members.items():
+                member = tarfile.TarInfo(name)
+                member.size = len(data)
+                package.addfile(member, io.BytesIO(data))
+        return archive, config_ids
+
+    def test_oci_platform_archive_nested_index_resolves_verified_target_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            archive, ids = self._oci_nested_index_archive_fixture(
+                Path(tmp), [
+                    (None, "amd64", "main"),
+                    ({"os": "linux", "architecture": "arm64"}, "arm64", "arm"),
+                ],
+                outer_platform={"os": "unknown", "architecture": "unknown"},
+            )
+            self.assertEqual(
+                self.oci_mirror._archive_platform_config_id(
+                    archive, "linux/amd64", "quay.io/cilium/cilium:v1.19.5",
+                ), ids[0],
+            )
+
+    def test_oci_platform_archive_nested_index_rejects_tampered_index_blob(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            archive, _ = self._oci_nested_index_archive_fixture(
+                Path(tmp), [(None, "amd64", "main")], corrupt_nested=True,
+            )
+            with self.assertRaisesRegex(
+                self.oci_mirror.IntegrityError, "index.*digest",
+            ):
+                self.oci_mirror._archive_platform_config_id(
+                    archive, "linux/amd64", "quay.io/cilium/cilium:v1.19.5",
+                )
+
+    def test_oci_platform_archive_nested_index_distinct_configs_stay_ambiguous(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            archive, _ = self._oci_nested_index_archive_fixture(
+                Path(tmp), [(None, "amd64", "one"), (None, "amd64", "two")],
+            )
+            with self.assertRaisesRegex(
+                self.oci_mirror.IntegrityError, "matching_configs=2",
+            ):
+                self.oci_mirror._archive_platform_config_id(
+                    archive, "linux/amd64", "quay.io/cilium/cilium:v1.19.5",
+                )
+
+    def test_oci_platform_archive_nested_index_depth_is_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            archive, _ = self._oci_nested_index_archive_fixture(
+                Path(tmp), [(None, "amd64", "main")], depth=6,
+            )
+            with self.assertRaisesRegex(
+                self.oci_mirror.IntegrityError, "nested index depth",
+            ):
+                self.oci_mirror._archive_platform_config_id(
+                    archive, "linux/amd64", "quay.io/cilium/cilium:v1.19.5",
+                )
+
+    def test_oci_platform_archive_nested_index_descriptor_budget_is_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            archive, _ = self._oci_nested_index_archive_fixture(
+                Path(tmp), [(None, "amd64", "same")] * 257,
+            )
+            with self.assertRaisesRegex(
+                self.oci_mirror.IntegrityError, "nested index descriptor budget",
+            ):
+                self.oci_mirror._archive_platform_config_id(
+                    archive, "linux/amd64", "quay.io/cilium/cilium:v1.19.5",
+                )
+
+    def test_oci_platform_archive_nested_index_wrong_label_cannot_select_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            archive, _ = self._oci_nested_index_archive_fixture(
+                Path(tmp), [(None, "amd64", "main")],
+                outer_platform={"os": "linux", "architecture": "arm64"},
+            )
+            with self.assertRaises(self.oci_mirror.IntegrityError):
+                self.oci_mirror._archive_platform_config_id(
+                    archive, "linux/amd64", "quay.io/cilium/cilium:v1.19.5",
+                )
+
+    def test_oci_platform_archive_unlabelled_manifest_matches_config_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            archive, ids = self._oci_multi_manifest_archive_fixture(
+                Path(tmp), [
+                    (None, "amd64", "main"),
+                    ({"os": "linux", "architecture": "arm64"}, "arm64", "arm"),
+                ],
+            )
+            self.assertEqual(
+                self.oci_mirror._archive_platform_config_id(
+                    archive, "linux/amd64", "quay.io/cilium/cilium:v1.19.5",
+                ), ids[0],
+            )
+
+    def test_oci_platform_archive_repeated_manifest_same_config_is_unique(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            archive, ids = self._oci_multi_manifest_archive_fixture(
+                Path(tmp), [(None, "amd64", "same"), (None, "amd64", "same")],
+            )
+            self.assertEqual(
+                self.oci_mirror._archive_platform_config_id(
+                    archive, "linux/amd64", "quay.io/cilium/cilium:v1.19.5",
+                ), ids[0],
+            )
+
+    def test_oci_platform_archive_two_distinct_target_configs_remain_ambiguous(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            archive, ids = self._oci_multi_manifest_archive_fixture(
+                Path(tmp), [(None, "amd64", "one"), (None, "amd64", "two")],
+            )
+            self.assertNotEqual(ids[0], ids[1])
+            with self.assertRaisesRegex(
+                self.oci_mirror.IntegrityError, "unique|ambiguous",
+            ):
+                self.oci_mirror._archive_platform_config_id(
+                    archive, "linux/amd64", "quay.io/cilium/cilium:v1.19.5",
+                )
+
+    def test_oci_platform_archive_no_target_config_remains_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            archive, _ = self._oci_multi_manifest_archive_fixture(
+                Path(tmp), [(None, "arm64", "wrong"), (None, "arm64", "also-wrong")],
+            )
+            with self.assertRaises(self.oci_mirror.IntegrityError):
+                self.oci_mirror._archive_platform_config_id(
+                    archive, "linux/amd64", "quay.io/cilium/cilium:v1.19.5",
+                )
+
+    def test_oci_platform_archive_failure_classifies_safe_platform_labels(self) -> None:
+        # A real HA runner error lacks the containerd export's index metadata.
+        # Only fixed count labels, never arbitrary index strings, may reach CI.
+        with tempfile.TemporaryDirectory() as tmp:
+            archive, _ = self._oci_multi_manifest_archive_fixture(
+                Path(tmp), [
+                    ({"os": "unknown", "architecture": "unknown"}, "amd64", "x"),
+                    ({"os": "linux", "architecture": "arm64"}, "arm64", "arm"),
+                    ({"os": "private-token-secret", "architecture": "leak"}, "amd64", "bad"),
+                ],
+            )
+            with self.assertRaises(self.oci_mirror.IntegrityError) as caught:
+                self.oci_mirror._archive_platform_config_id(
+                    archive, "linux/amd64", "quay.io/cilium/cilium:v1.19.5",
+                )
+            message = str(caught.exception)
+            for observed in (
+                "index_entries=3", "image_manifests=3",
+                "label_target=0", "label_missing=0",
+                "label_unknown=1", "label_other=2", "matching_configs=0",
+            ):
+                self.assertIn(observed, message)
+            self.assertNotIn("private-token-secret", message)
+            self.assertLess(len(message), 350)
+
+    def test_oci_platform_archive_failure_reports_distinct_config_count(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            archive, _ = self._oci_multi_manifest_archive_fixture(
+                Path(tmp), [(None, "amd64", "one"), (None, "amd64", "two")],
+            )
+            with self.assertRaises(self.oci_mirror.IntegrityError) as caught:
+                self.oci_mirror._archive_platform_config_id(
+                    archive, "linux/amd64", "quay.io/cilium/cilium:v1.19.5",
+                )
+            message = str(caught.exception)
+            self.assertIn("label_missing=2", message)
+            self.assertIn("matching_configs=2", message)
+
+    def test_oci_platform_archive_matching_descriptor_wrong_config_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            archive, _ = self._oci_multi_manifest_archive_fixture(
+                Path(tmp),
+                [({"os": "linux", "architecture": "amd64"}, "arm64", "mismatch"),
+                 (None, "amd64", "other")],
+            )
+            with self.assertRaises(self.oci_mirror.IntegrityError):
+                self.oci_mirror._archive_platform_config_id(
+                    archive, "linux/amd64", "quay.io/cilium/cilium:v1.19.5",
+                )
+
+    def test_oci_platform_archive_id_uses_verified_config_not_host_index(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            archive, expected = self._oci_platform_archive_fixture(Path(directory))
+            self.assertEqual(
+                self.oci_mirror._archive_platform_config_id(
+                    archive, "linux/amd64", "quay.io/cilium/cilium:v1.19.5",
+                ),
+                expected,
+            )
+
+    def test_oci_platform_archive_rejects_config_digest_tampering(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            archive, _ = self._oci_platform_archive_fixture(
+                Path(directory), corrupt_config=True,
+            )
+            with self.assertRaisesRegex(
+                self.oci_mirror.IntegrityError, "config.*digest|digest.*config",
+            ):
+                self.oci_mirror._archive_platform_config_id(
+                    archive, "linux/amd64", "quay.io/cilium/cilium:v1.19.5",
+                )
+
+    def test_oci_platform_archive_rejects_wrong_platform(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            archive, _ = self._oci_platform_archive_fixture(
+                Path(directory), architecture="arm64",
+            )
+            with self.assertRaises(self.oci_mirror.IntegrityError):
+                self.oci_mirror._archive_platform_config_id(
+                    archive, "linux/amd64", "quay.io/cilium/cilium:v1.19.5",
+                )
+
+    def test_oci_platform_archive_legacy_config_id_is_hashed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            archive, expected = self._oci_platform_archive_fixture(
+                Path(directory), legacy=True,
+            )
+            self.assertEqual(
+                self.oci_mirror._archive_platform_config_id(
+                    archive, "linux/amd64", "quay.io/cilium/cilium:v1.19.5",
+                ),
+                expected,
+            )
+
+    def test_oci_kind_receipt_separates_verified_host_index_and_cri_config(self) -> None:
+        host_id = "sha256:" + "a" * 64
+        config_id = "sha256:" + "b" * 64
+        runtime_ref = "quay.io/cilium/cilium:v1.19.5"
+        target = "sha256:" + "c" * 64
+        spec = {
+            "local_ref": runtime_ref, "canonical": f"{runtime_ref}@{host_id}",
+            "digest": host_id,
+            "load_into_kind": True,
+        }
+        node_binding = {
+            "node": "proof-control-plane",
+            "runtime_ref": runtime_ref,
+            "image_id": config_id,
+            "platform_target_digest": target,
+        }
+        with mock.patch.object(
+            self.oci_mirror, "_load_lock",
+            return_value={"generation": {}, "images": {}},
+        ), mock.patch.object(
+            self.oci_mirror, "_selected_images",
+            return_value=[("cilium_agent", spec)],
+        ), mock.patch.object(
+            self.oci_mirror, "_kind_nodes", return_value=["proof-control-plane"],
+        ), mock.patch.object(
+            self.oci_mirror, "_local_image",
+            return_value={"image_id": host_id, "source": "local-verified"},
+        ), mock.patch.object(
+            self.oci_mirror, "_load_kind_images",
+            return_value={runtime_ref: config_id},
+        ), mock.patch.object(
+            self.oci_mirror, "_kind_cri_image_binding",
+            return_value=node_binding,
+        ) as verify_cri, mock.patch.object(
+            self.oci_mirror, "_block_kind_registries",
+            return_value={"node": "proof-control-plane", "registries": {}},
+        ), mock.patch.object(
+            self.oci_mirror, "_lock_sha256", return_value="f" * 64,
+        ), mock.patch.object(self.oci_mirror, "_atomic_write"):
+            receipt = self.oci_mirror.load_kind(
+                Path("/tmp/mock-oci-state"), ["kind-gitops"], "kind", "proof",
+            )
+        self.assertEqual(verify_cri.call_args.args[-1], config_id)
+        binding = receipt["images"]["cilium_agent"]
+        self.assertEqual(binding["host_image_id"], host_id)
+        self.assertEqual(binding["image_id"], config_id)
+        self.assertEqual(binding["cri_image_id"], config_id)
+        self.assertEqual(binding["image_id_source"], "archive_platform_config")
+        self.assertEqual(binding["platform_target_digest"], target)
+
     def test_oci_kind_import_keeps_existing_batch_on_success(self) -> None:
         refs = ["quay.io/cilium/cilium:v1.19.5", "postgres:16"]
         with mock.patch.object(self.oci_mirror, "_run") as run:
@@ -1227,12 +1630,18 @@ class KubernetesPlatformContractTests(unittest.TestCase):
             1, ["kind", "load"], stderr=f"ctr: content digest {digest}: not found"
         )
         refs = ["quay.io/cilium/cilium:v1.19.5", "postgres:16"]
+        expected_ids = ["sha256:" + "1" * 64, "sha256:" + "2" * 64]
         with mock.patch.object(
             self.oci_mirror, "_run", side_effect=[error, None, None, None, None]
         ) as run, mock.patch.object(
+            self.oci_mirror, "_archive_platform_config_id",
+            side_effect=expected_ids,
+        ) as config_id, mock.patch.object(
             self.oci_mirror.platform, "machine", return_value="x86_64"
         ):
-            self.oci_mirror._load_kind_images("kind", "proof", refs)
+            imported = self.oci_mirror._load_kind_images("kind", "proof", refs)
+        self.assertEqual(imported, dict(zip(refs, expected_ids, strict=True)))
+        self.assertEqual(config_id.call_count, len(refs))
         commands = [call.args[0] for call in run.call_args_list]
         self.assertEqual(
             commands[0], ["kind", "load", "docker-image", "--name", "proof", *refs]
@@ -1249,6 +1658,99 @@ class KubernetesPlatformContractTests(unittest.TestCase):
             )
             self.assertFalse(Path(save[6]).exists())
         self.assertEqual(run.call_count, 5)
+
+    def test_oci_kind_archive_falls_back_when_docker_lacks_platform_export(self) -> None:
+        ref = "quay.io/jetstack/cert-manager-cainjector:weltgewebe-test"
+        digest = "sha256:" + "a" * 64
+        kind_error = subprocess.CalledProcessError(
+            1, ["kind", "load"],
+            stderr=f"ctr: content digest {digest}: not found",
+        )
+        export_error = subprocess.CalledProcessError(
+            1, ["docker", "image", "save"],
+            stderr=(
+                "Error response from daemon: no suitable export target found: "
+                f"image with reference {ref} was found but does not provide "
+                "the specified platform (linux/amd64)"
+            ),
+        )
+        expected_id = "sha256:" + "b" * 64
+        with mock.patch.object(
+            self.oci_mirror, "_run",
+            side_effect=[kind_error, export_error, None, None],
+        ) as run, mock.patch.object(
+            self.oci_mirror, "_archive_platform_config_id",
+            return_value=expected_id,
+        ) as config_id, mock.patch.object(
+            self.oci_mirror.platform, "machine", return_value="x86_64",
+        ):
+            ids = self.oci_mirror._load_kind_images("kind", "proof", [ref])
+        self.assertEqual(ids, {ref: expected_id})
+        self.assertEqual(run.call_count, 4)
+        platform_save = run.call_args_list[1].args[0]
+        fallback_save = run.call_args_list[2].args[0]
+        kind_load = run.call_args_list[3].args[0]
+        self.assertEqual(platform_save[:6], [
+            "docker", "image", "save", "--platform", "linux/amd64", "--output",
+        ])
+        self.assertEqual(platform_save[-1], ref)
+        self.assertEqual(fallback_save, [
+            "docker", "image", "save", "--output", platform_save[6], ref,
+        ])
+        self.assertEqual(
+            kind_load,
+            ["kind", "load", "image-archive", platform_save[6], "--name", "proof"],
+        )
+        config_id.assert_called_once_with(
+            Path(platform_save[6]), "linux/amd64", ref,
+        )
+        self.assertFalse(Path(platform_save[6]).exists())
+
+    def test_oci_kind_unplatformed_save_rejects_wrong_config_architecture(self) -> None:
+        ref = "quay.io/cilium/cilium:v1.19.5"
+        digest = "sha256:" + "a" * 64
+        kind_error = subprocess.CalledProcessError(
+            1, ["kind", "load"],
+            stderr=f"ctr: content digest {digest}: not found",
+        )
+        export_error = subprocess.CalledProcessError(
+            1, ["docker", "image", "save"],
+            stderr=(
+                "Error response from daemon: no suitable export target found: "
+                f"image with reference {ref} was found but does not provide "
+                "the specified platform (linux/amd64)"
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            fixture, _ = self._oci_platform_archive_fixture(
+                Path(directory), architecture="arm64", legacy=True,
+            )
+            def run_command(argv, *, capture=False, timeout=120):
+                del capture, timeout
+                if argv[:3] == ["kind", "load", "docker-image"]:
+                    raise kind_error
+                if argv[:6] == [
+                    "docker", "image", "save", "--platform",
+                    "linux/amd64", "--output",
+                ]:
+                    raise export_error
+                if argv[:4] == ["docker", "image", "save", "--output"]:
+                    Path(argv[4]).write_bytes(fixture.read_bytes())
+                    return
+                raise AssertionError(f"unverified archive was loaded: {argv}")
+            with mock.patch.object(
+                self.oci_mirror, "_run", side_effect=run_command,
+            ) as run, mock.patch.object(
+                self.oci_mirror.platform, "machine", return_value="x86_64",
+            ):
+                with self.assertRaisesRegex(
+                    self.oci_mirror.IntegrityError,
+                    "config architecture differs",
+                ):
+                    self.oci_mirror._load_kind_images(
+                        "kind", "proof", [ref],
+                    )
+            self.assertEqual(run.call_count, 3)
 
     def test_oci_kind_import_unrelated_failure_does_not_retry(self) -> None:
         error = subprocess.CalledProcessError(
@@ -2581,6 +3083,25 @@ class KubernetesPlatformContractTests(unittest.TestCase):
         )
 
         ha = named_steps("kind-ha-recovery-proof")
+        docker = ha["Use complete Docker image archives for HA proof"]
+        self.assertEqual(
+            docker["if"], "steps.proof-cache.outputs.cache-hit != 'true'",
+        )
+        self.assertIn("containerd-snapshotter", docker["run"])
+        self.assertIn("sudo systemctl restart docker", docker["run"])
+        self.assertIn('test "$driver" = "overlay2"', docker["run"])
+        ha_order = [
+            step.get("name")
+            for step in workflow["jobs"]["kind-ha-recovery-proof"]["steps"]
+        ]
+        self.assertLess(
+            ha_order.index("Use complete Docker image archives for HA proof"),
+            ha_order.index("Initialize isolated OCI mirror credentials"),
+        )
+        self.assertNotIn(
+            "Use complete Docker image archives for HA proof",
+            named_steps("kind-gitops-proof"),
+        )
         stage_receipt = ha["Stage HA recovery receipt"]
         self.assertEqual(stage_receipt["if"], "success()")
         self.assertIn(
@@ -3431,6 +3952,53 @@ class KubernetesPlatformContractTests(unittest.TestCase):
             }
             with mock.patch.object(self.proof_identity, "ROOT", root):
                 self.proof_identity._validate_controlled_oci_proof(identity, proof)
+                # Image archive exports contain one platform's config, whose
+                # CRI id differs from Docker's verified host OCI index id.
+                archive_receipt = json.loads(json.dumps(proof))
+                archive_image = archive_receipt["oci_controlled_source"]["cluster"][
+                    "images"
+                ]["runtime"]
+                config_id = "sha256:" + "d" * 64
+                archive_image.update({
+                    "host_image_id": image_id,
+                    "image_id": config_id,
+                    "cri_image_id": config_id,
+                    "image_id_source": "archive_platform_config",
+                })
+                archive_image["nodes"][0]["image_id"] = config_id
+                self.proof_identity._validate_controlled_oci_proof(
+                    identity, archive_receipt,
+                )
+                invalid_host = json.loads(json.dumps(archive_receipt))
+                invalid_host["oci_controlled_source"]["cluster"]["images"][
+                    "runtime"
+                ]["host_image_id"] = "sha256:" + "e" * 64
+                with self.assertRaisesRegex(
+                    self.proof_identity.IdentityError, "image binding is invalid",
+                ):
+                    self.proof_identity._validate_controlled_oci_proof(
+                        identity, invalid_host,
+                    )
+                invalid_kind = json.loads(json.dumps(archive_receipt))
+                invalid_kind["oci_controlled_source"]["cluster"]["images"][
+                    "runtime"
+                ]["image_id_source"] = "unknown"
+                with self.assertRaisesRegex(
+                    self.proof_identity.IdentityError, "image binding is invalid",
+                ):
+                    self.proof_identity._validate_controlled_oci_proof(
+                        identity, invalid_kind,
+                    )
+                invalid_cri = json.loads(json.dumps(archive_receipt))
+                invalid_cri["oci_controlled_source"]["cluster"]["images"][
+                    "runtime"
+                ]["cri_image_id"] = image_id
+                with self.assertRaisesRegex(
+                    self.proof_identity.IdentityError, "image binding is invalid",
+                ):
+                    self.proof_identity._validate_controlled_oci_proof(
+                        identity, invalid_cri,
+                    )
                 drifted = json.loads(json.dumps(proof))
                 drifted["oci_controlled_source"]["cluster"]["registry_blockades"] = []
                 with self.assertRaisesRegex(

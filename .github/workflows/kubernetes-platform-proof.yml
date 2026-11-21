@@ -481,6 +481,46 @@ jobs:
         with:
           path: .cache/weltgewebe-platform/downloads
           key: weltgewebe-platform-downloads-${{ runner.os }}-${{ hashFiles('platform/toolchain.lock.json') }}
+      - name: Use complete Docker image archives for HA proof
+        if: steps.proof-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Docker's containerd image store exports indexes containing
+          # descriptors for platform blobs that were never pulled locally.
+          # kind imports all descriptors and fails before any HA scenario.
+          # This ephemeral CI runner switches before pulling the private
+          # digest-locked mirror, without changing Kind's own containerd.
+          driver_status="$(docker info --format '{{json .DriverStatus}}')"
+          if [[ "$driver_status" == *"io.containerd.snapshotter.v1"* ]]; then
+            daemon_tmp="$(mktemp "$RUNNER_TEMP/commonthing-ha-docker.XXXXXXXX")"
+            if sudo test -f /etc/docker/daemon.json; then
+              sudo cat /etc/docker/daemon.json |
+                jq -e '
+                  if type == "object" and ((.features // {}) | type == "object")
+                  then .features = ((.features // {}) + {"containerd-snapshotter": false})
+                  else error("invalid Docker daemon configuration") end
+                ' > "$daemon_tmp"
+            else
+              jq -n '{"features":{"containerd-snapshotter":false}}' > "$daemon_tmp"
+            fi
+            sudo install -D -m 0644 "$daemon_tmp" /etc/docker/daemon.json
+            rm -- "$daemon_tmp"
+            sudo systemctl restart docker
+          fi
+          for attempt in {1..20}; do
+            if docker info --format '{{.Driver}}' >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          driver="$(docker info --format '{{.Driver}}')"
+          test "$driver" = "overlay2"
+          if docker info --format '{{json .DriverStatus}}' |
+            grep -q 'io.containerd.snapshotter.v1'; then
+            echo "HA proof still uses incomplete containerd Docker image store" >&2
+            exit 1
+          fi
       - name: Initialize isolated OCI mirror credentials
         if: steps.proof-cache.outputs.cache-hit != 'true'
         run: |
