@@ -960,36 +960,45 @@ def _archive_platform_config_id(
                 ):
                     raise IntegrityError("kind OCI archive index is invalid")
                 descriptors = index["manifests"]
-                matches = [
-                    item for item in descriptors
-                    if isinstance(item, dict) and item.get("mediaType") in {
+                matching_configs: dict[str, bytes] = {}
+                for item in descriptors:
+                    if not isinstance(item, dict) or item.get("mediaType") not in {
                         "application/vnd.oci.image.manifest.v1+json",
                         "application/vnd.docker.distribution.manifest.v2+json",
-                    }
-                    and (
-                        (
-                            isinstance(item.get("platform"), dict)
-                            and item["platform"].get("os") == os_name
-                            and item["platform"].get("architecture") == architecture
-                        )
-                        or (len(descriptors) == 1 and item.get("platform") is None)
+                    }:
+                        continue
+                    declared = item.get("platform")
+                    if declared is not None and (
+                        not isinstance(declared, dict)
+                        or (declared.get("os"), declared.get("architecture"))
+                        != (os_name, architecture)
+                    ):
+                        continue
+                    manifest = json.loads(
+                        checked_blob(bundle, item.get("digest"), "manifest")
                     )
-                ]
-                if len(matches) != 1:
+                    if not isinstance(manifest, dict) or not isinstance(
+                        manifest.get("config"), dict,
+                    ):
+                        raise IntegrityError("kind OCI platform manifest has no config")
+                    candidate = checked_blob(
+                        bundle, manifest["config"].get("digest"), "config",
+                    )
+                    config = json.loads(candidate)
+                    if not isinstance(config, dict) or (
+                        config.get("os"), config.get("architecture")
+                    ) != (os_name, architecture):
+                        if declared is not None:
+                            raise IntegrityError(
+                                "kind OCI archive config architecture differs from selected node"
+                            )
+                        continue
+                    matching_configs[hashlib.sha256(candidate).hexdigest()] = candidate
+                if len(matching_configs) != 1:
                     raise IntegrityError(
-                        "kind OCI archive has no unique matching platform manifest"
+                        "kind OCI archive has no unique matching platform config"
                     )
-                manifest = json.loads(
-                    checked_blob(bundle, matches[0].get("digest"), "manifest")
-                )
-                if not isinstance(manifest, dict) or not isinstance(
-                    manifest.get("config"), dict,
-                ):
-                    raise IntegrityError("kind OCI platform manifest has no config")
-                config_bytes = checked_blob(
-                    bundle, manifest["config"].get("digest"), "config",
-                )
-                config_digest = hashlib.sha256(config_bytes).hexdigest()
+                config_digest, config_bytes = next(iter(matching_configs.items()))
             config = json.loads(config_bytes)
             if not isinstance(config, dict) or (
                 config.get("os"), config.get("architecture")

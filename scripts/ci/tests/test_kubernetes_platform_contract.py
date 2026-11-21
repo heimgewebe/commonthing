@@ -1260,6 +1260,111 @@ class KubernetesPlatformContractTests(unittest.TestCase):
                 package.addfile(member, io.BytesIO(data))
         return archive, f"sha256:{config_digest}"
 
+    def _oci_multi_manifest_archive_fixture(
+        self, directory: Path, specs: list[tuple[dict[str, str] | None, str, str]],
+    ) -> tuple[Path, list[str]]:
+        """Create real SHA-bound OCI blobs; index platforms may be absent."""
+        descriptors = []
+        members: dict[str, bytes] = {}
+        config_ids = []
+        for platform_value, architecture, marker in specs:
+            config_bytes = json.dumps({
+                "os": "linux", "architecture": architecture,
+                "config": {"Env": [f"PROOF_ONLY={marker}"]},
+            }, sort_keys=True).encode()
+            config_sha = hashlib.sha256(config_bytes).hexdigest()
+            config_ids.append(f"sha256:{config_sha}")
+            manifest_bytes = json.dumps({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "config": {
+                    "mediaType": "application/vnd.oci.image.config.v1+json",
+                    "digest": f"sha256:{config_sha}",
+                    "size": len(config_bytes),
+                },
+                "layers": [],
+            }, sort_keys=True).encode()
+            manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
+            descriptor = {
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": f"sha256:{manifest_sha}",
+            }
+            if platform_value is not None:
+                descriptor["platform"] = platform_value
+            descriptors.append(descriptor)
+            members[f"blobs/sha256/{manifest_sha}"] = manifest_bytes
+            members[f"blobs/sha256/{config_sha}"] = config_bytes
+        archive = directory / "multi-index.tar"
+        members["index.json"] = json.dumps({
+            "schemaVersion": 2, "manifests": descriptors,
+        }, sort_keys=True).encode()
+        with tarfile.open(archive, "w") as package:
+            for name, content in members.items():
+                entry = tarfile.TarInfo(name)
+                entry.size = len(content)
+                package.addfile(entry, io.BytesIO(content))
+        return archive, config_ids
+
+    def test_oci_platform_archive_unlabelled_manifest_matches_config_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            archive, ids = self._oci_multi_manifest_archive_fixture(
+                Path(tmp), [
+                    (None, "amd64", "main"),
+                    ({"os": "linux", "architecture": "arm64"}, "arm64", "arm"),
+                ],
+            )
+            self.assertEqual(
+                self.oci_mirror._archive_platform_config_id(
+                    archive, "linux/amd64", "quay.io/cilium/cilium:v1.19.5",
+                ), ids[0],
+            )
+
+    def test_oci_platform_archive_repeated_manifest_same_config_is_unique(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            archive, ids = self._oci_multi_manifest_archive_fixture(
+                Path(tmp), [(None, "amd64", "same"), (None, "amd64", "same")],
+            )
+            self.assertEqual(
+                self.oci_mirror._archive_platform_config_id(
+                    archive, "linux/amd64", "quay.io/cilium/cilium:v1.19.5",
+                ), ids[0],
+            )
+
+    def test_oci_platform_archive_two_distinct_target_configs_remain_ambiguous(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            archive, ids = self._oci_multi_manifest_archive_fixture(
+                Path(tmp), [(None, "amd64", "one"), (None, "amd64", "two")],
+            )
+            self.assertNotEqual(ids[0], ids[1])
+            with self.assertRaisesRegex(
+                self.oci_mirror.IntegrityError, "unique|ambiguous",
+            ):
+                self.oci_mirror._archive_platform_config_id(
+                    archive, "linux/amd64", "quay.io/cilium/cilium:v1.19.5",
+                )
+
+    def test_oci_platform_archive_no_target_config_remains_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            archive, _ = self._oci_multi_manifest_archive_fixture(
+                Path(tmp), [(None, "arm64", "wrong"), (None, "arm64", "also-wrong")],
+            )
+            with self.assertRaises(self.oci_mirror.IntegrityError):
+                self.oci_mirror._archive_platform_config_id(
+                    archive, "linux/amd64", "quay.io/cilium/cilium:v1.19.5",
+                )
+
+    def test_oci_platform_archive_matching_descriptor_wrong_config_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            archive, _ = self._oci_multi_manifest_archive_fixture(
+                Path(tmp),
+                [({"os": "linux", "architecture": "amd64"}, "arm64", "mismatch"),
+                 (None, "amd64", "other")],
+            )
+            with self.assertRaises(self.oci_mirror.IntegrityError):
+                self.oci_mirror._archive_platform_config_id(
+                    archive, "linux/amd64", "quay.io/cilium/cilium:v1.19.5",
+                )
+
     def test_oci_platform_archive_id_uses_verified_config_not_host_index(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             archive, expected = self._oci_platform_archive_fixture(Path(directory))
