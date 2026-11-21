@@ -209,27 +209,24 @@ impl WebPushService {
             .send()
             .await
             .context("Web Push provider request failed")?;
-        let status = response.status();
-        if status.is_success() {
-            return Ok(PushSendOutcome::Sent);
-        }
-        if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::GONE {
-            return Ok(PushSendOutcome::Gone(format!(
-                "push provider returned HTTP {}",
-                status.as_u16()
-            )));
-        }
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-            return Ok(PushSendOutcome::Retry(format!(
-                "push provider returned HTTP {}",
-                status.as_u16()
-            )));
-        }
-        Ok(PushSendOutcome::Quarantined(format!(
-            "push provider rejected request with HTTP {}",
-            status.as_u16()
-        )))
+        Ok(classify_push_provider_status(response.status()))
     }
+}
+
+fn classify_push_provider_status(status: reqwest::StatusCode) -> PushSendOutcome {
+    if status.is_success() {
+        return PushSendOutcome::Sent;
+    }
+    if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::GONE {
+        return PushSendOutcome::Gone(format!("push provider returned HTTP {}", status.as_u16()));
+    }
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+        return PushSendOutcome::Retry(format!("push provider returned HTTP {}", status.as_u16()));
+    }
+    PushSendOutcome::Quarantined(format!(
+        "push provider rejected request with HTTP {}",
+        status.as_u16()
+    ))
 }
 
 fn vapid_authorization(
@@ -1471,5 +1468,59 @@ mod tests {
         ] {
             assert!(normalize_host_suffix(invalid).is_err());
         }
+    }
+
+    #[test]
+    fn base64url_encoded_off_curve_and_short_auth_keys_are_rejected() {
+        let (recipient, auth) = ece::generate_keypair_and_auth_secret().unwrap();
+        let valid_public_key = URL_SAFE_NO_PAD.encode(recipient.pub_as_raw().unwrap());
+        let valid_auth = URL_SAFE_NO_PAD.encode(auth);
+        let mut off_curve_key = [0xff_u8; 65];
+        off_curve_key[0] = 0x04;
+        let off_curve = URL_SAFE_NO_PAD.encode(off_curve_key);
+        let short_auth = URL_SAFE_NO_PAD.encode([0x42_u8; 15]);
+
+        assert_eq!(
+            decode_subscription_keys(&off_curve, &valid_auth)
+                .unwrap_err()
+                .to_string(),
+            "p256dh is not a valid P-256 public key"
+        );
+        assert_eq!(
+            decode_subscription_keys(&valid_public_key, &short_auth)
+                .unwrap_err()
+                .to_string(),
+            "push auth secret must decode to exactly 16 bytes"
+        );
+    }
+
+    #[test]
+    fn push_provider_http_status_keeps_retry_vs_permanent_semantics() {
+        use reqwest::StatusCode;
+
+        assert!(matches!(
+            classify_push_provider_status(StatusCode::ACCEPTED),
+            PushSendOutcome::Sent
+        ));
+        for status in [StatusCode::NOT_FOUND, StatusCode::GONE] {
+            assert!(matches!(
+                classify_push_provider_status(status),
+                PushSendOutcome::Gone(_)
+            ));
+        }
+        for status in [
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::BAD_GATEWAY,
+        ] {
+            assert!(matches!(
+                classify_push_provider_status(status),
+                PushSendOutcome::Retry(_)
+            ));
+        }
+        assert!(matches!(
+            classify_push_provider_status(StatusCode::FORBIDDEN),
+            PushSendOutcome::Quarantined(_)
+        ));
     }
 }
