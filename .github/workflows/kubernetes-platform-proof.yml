@@ -493,24 +493,19 @@ jobs:
           # digest-locked mirror, without changing Kind's own containerd.
           driver_status="$(docker info --format '{{json .DriverStatus}}')"
           if [[ "$driver_status" == *"io.containerd.snapshotter.v1"* ]]; then
-            sudo python3 - <<'PY'
-          import json
-          from pathlib import Path
-
-          path = Path("/etc/docker/daemon.json")
-          config = json.loads(path.read_text()) if path.exists() else {}
-          if not isinstance(config, dict):
-              raise SystemExit("Docker daemon configuration must be an object")
-          features = config.setdefault("features", {})
-          if not isinstance(features, dict):
-              raise SystemExit("Docker daemon features must be an object")
-          features["containerd-snapshotter"] = False
-          path.parent.mkdir(parents=True, exist_ok=True)
-          temp = path.with_suffix(".commonthing-ha.tmp")
-          temp.write_text(json.dumps(config, sort_keys=True) + "\n")
-          temp.chmod(0o644)
-          temp.replace(path)
-          PY
+            daemon_tmp="$(mktemp "$RUNNER_TEMP/commonthing-ha-docker.XXXXXXXX")"
+            if sudo test -f /etc/docker/daemon.json; then
+              sudo cat /etc/docker/daemon.json |
+                jq -e '
+                  if type == "object" and ((.features // {}) | type == "object")
+                  then .features = ((.features // {}) + {"containerd-snapshotter": false})
+                  else error("invalid Docker daemon configuration") end
+                ' > "$daemon_tmp"
+            else
+              jq -n '{"features":{"containerd-snapshotter":false}}' > "$daemon_tmp"
+            fi
+            sudo install -D -m 0644 "$daemon_tmp" /etc/docker/daemon.json
+            rm -- "$daemon_tmp"
             sudo systemctl restart docker
           fi
           for attempt in {1..20}; do
