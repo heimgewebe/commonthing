@@ -960,6 +960,54 @@ def _archive_platform_config_id(
                 ):
                     raise IntegrityError("kind OCI archive index is invalid")
                 descriptors = index["manifests"]
+                # Docker/containerd may export an OCI index pointing to another
+                # digest-bound index, rather than directly to image manifests.
+                # Descend only through known index media types; each child is
+                # SHA-verified and the actual config still selects the platform.
+                index_types = {
+                    "application/vnd.oci.image.index.v1+json",
+                    "application/vnd.docker.distribution.manifest.list.v2+json",
+                }
+                pending: list[tuple[list[object], int]] = [(descriptors, 0)]
+                seen_indexes: set[str] = set()
+                leaf_descriptors: list[object] = []
+                traversed_entries = 0
+                while pending:
+                    entries, depth = pending.pop()
+                    if depth > 4:
+                        raise IntegrityError("kind OCI nested index depth exceeds limit")
+                    traversed_entries += len(entries)
+                    if traversed_entries > 256:
+                        raise IntegrityError("kind OCI nested index descriptor budget exceeded")
+                    for item in entries:
+                        if not isinstance(item, dict):
+                            continue
+                        if item.get("mediaType") not in index_types:
+                            leaf_descriptors.append(item)
+                            continue
+                        declared = item.get("platform")
+                        if declared is not None and (
+                            not isinstance(declared, dict)
+                            or (
+                                declared.get("os"), declared.get("architecture")
+                            ) not in {
+                                (os_name, architecture), ("unknown", "unknown"),
+                            }
+                        ):
+                            continue
+                        digest = item.get("digest")
+                        if not isinstance(digest, str) or not FULL_SHA256.fullmatch(digest):
+                            raise IntegrityError("kind OCI nested index digest is invalid")
+                        if digest in seen_indexes:
+                            continue
+                        seen_indexes.add(digest)
+                        nested = json.loads(checked_blob(bundle, digest, "nested index"))
+                        if not isinstance(nested, dict) or not isinstance(
+                            nested.get("manifests"), list,
+                        ):
+                            raise IntegrityError("kind OCI nested index is invalid")
+                        pending.append((nested["manifests"], depth + 1))
+                descriptors = leaf_descriptors
                 matching_configs: dict[str, bytes] = {}
                 for item in descriptors:
                     if not isinstance(item, dict) or item.get("mediaType") not in {

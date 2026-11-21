@@ -1305,6 +1305,123 @@ class KubernetesPlatformContractTests(unittest.TestCase):
                 package.addfile(entry, io.BytesIO(content))
         return archive, config_ids
 
+    def _oci_nested_index_archive_fixture(
+        self, directory: Path,
+        specs: list[tuple[dict[str, str] | None, str, str]],
+        *, depth: int = 1, outer_platform: dict[str, str] | None = None,
+        corrupt_nested: bool = False,
+    ) -> tuple[Path, list[str]]:
+        """Wrap real SHA-bound manifest/config blobs in one or more OCI indexes."""
+        archive, config_ids = self._oci_multi_manifest_archive_fixture(
+            directory, specs,
+        )
+        members: dict[str, bytes] = {}
+        with tarfile.open(archive, "r:") as package:
+            for member in package.getmembers():
+                stream = package.extractfile(member)
+                if stream is None:
+                    raise AssertionError("fixture has a non-file member")
+                with stream:
+                    members[member.name] = stream.read()
+        index_bytes = members["index.json"]
+        for level in range(depth):
+            index_digest = hashlib.sha256(index_bytes).hexdigest()
+            stored = (
+                index_bytes + b" "
+                if corrupt_nested and level == 0 else index_bytes
+            )
+            members[f"blobs/sha256/{index_digest}"] = stored
+            descriptor: dict[str, object] = {
+                "mediaType": "application/vnd.oci.image.index.v1+json",
+                "digest": f"sha256:{index_digest}",
+            }
+            if outer_platform is not None and level == depth - 1:
+                descriptor["platform"] = outer_platform
+            index_bytes = json.dumps({
+                "schemaVersion": 2, "manifests": [descriptor],
+            }, sort_keys=True).encode()
+        members["index.json"] = index_bytes
+        with tarfile.open(archive, "w") as package:
+            for name, data in members.items():
+                member = tarfile.TarInfo(name)
+                member.size = len(data)
+                package.addfile(member, io.BytesIO(data))
+        return archive, config_ids
+
+    def test_oci_platform_archive_nested_index_resolves_verified_target_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            archive, ids = self._oci_nested_index_archive_fixture(
+                Path(tmp), [
+                    (None, "amd64", "main"),
+                    ({"os": "linux", "architecture": "arm64"}, "arm64", "arm"),
+                ],
+                outer_platform={"os": "unknown", "architecture": "unknown"},
+            )
+            self.assertEqual(
+                self.oci_mirror._archive_platform_config_id(
+                    archive, "linux/amd64", "quay.io/cilium/cilium:v1.19.5",
+                ), ids[0],
+            )
+
+    def test_oci_platform_archive_nested_index_rejects_tampered_index_blob(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            archive, _ = self._oci_nested_index_archive_fixture(
+                Path(tmp), [(None, "amd64", "main")], corrupt_nested=True,
+            )
+            with self.assertRaisesRegex(
+                self.oci_mirror.IntegrityError, "index.*digest",
+            ):
+                self.oci_mirror._archive_platform_config_id(
+                    archive, "linux/amd64", "quay.io/cilium/cilium:v1.19.5",
+                )
+
+    def test_oci_platform_archive_nested_index_distinct_configs_stay_ambiguous(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            archive, _ = self._oci_nested_index_archive_fixture(
+                Path(tmp), [(None, "amd64", "one"), (None, "amd64", "two")],
+            )
+            with self.assertRaisesRegex(
+                self.oci_mirror.IntegrityError, "matching_configs=2",
+            ):
+                self.oci_mirror._archive_platform_config_id(
+                    archive, "linux/amd64", "quay.io/cilium/cilium:v1.19.5",
+                )
+
+    def test_oci_platform_archive_nested_index_depth_is_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            archive, _ = self._oci_nested_index_archive_fixture(
+                Path(tmp), [(None, "amd64", "main")], depth=6,
+            )
+            with self.assertRaisesRegex(
+                self.oci_mirror.IntegrityError, "nested index depth",
+            ):
+                self.oci_mirror._archive_platform_config_id(
+                    archive, "linux/amd64", "quay.io/cilium/cilium:v1.19.5",
+                )
+
+    def test_oci_platform_archive_nested_index_descriptor_budget_is_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            archive, _ = self._oci_nested_index_archive_fixture(
+                Path(tmp), [(None, "amd64", "same")] * 257,
+            )
+            with self.assertRaisesRegex(
+                self.oci_mirror.IntegrityError, "nested index descriptor budget",
+            ):
+                self.oci_mirror._archive_platform_config_id(
+                    archive, "linux/amd64", "quay.io/cilium/cilium:v1.19.5",
+                )
+
+    def test_oci_platform_archive_nested_index_wrong_label_cannot_select_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            archive, _ = self._oci_nested_index_archive_fixture(
+                Path(tmp), [(None, "amd64", "main")],
+                outer_platform={"os": "linux", "architecture": "arm64"},
+            )
+            with self.assertRaises(self.oci_mirror.IntegrityError):
+                self.oci_mirror._archive_platform_config_id(
+                    archive, "linux/amd64", "quay.io/cilium/cilium:v1.19.5",
+                )
+
     def test_oci_platform_archive_unlabelled_manifest_matches_config_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             archive, ids = self._oci_multi_manifest_archive_fixture(
