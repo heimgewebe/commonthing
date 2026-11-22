@@ -35,6 +35,7 @@
   let circleLoadError = $state("");
   let privateCreatedNodeId: string | null = $state(null);
   let createdNodeId: string | null = $state(null);
+  let staleCreatedNode = $state(false);
   let activeCircles = $derived(
     availableCircleList.filter(
       (circle) =>
@@ -263,6 +264,10 @@
         // als Projektion derselben Webungsaktion erzeugt oder die Anfrage
         // fehlgeschlagen zurückgegeben.
         await finalizeSuccess(node.id);
+      } else if ($systemState === "komposition") {
+        // A new map point replaced this draft while the earlier POST was
+        // pending. Keep the committed result visible without re-posting it.
+        staleCreatedNode = true;
       }
     } catch (err) {
       formError = createdNodeId
@@ -284,6 +289,26 @@
       <button type="button" class="btn btn-secondary" onclick={handleCancel}
         >Schließen</button
       >
+    </div>
+  {:else if staleCreatedNode && createdNodeId}
+    <div
+      class="state-set"
+      role="status"
+      data-testid="node-creation-stale-draft"
+    >
+      <p><strong>Knoten gespeichert</strong></p>
+      <p>
+        Während des Speicherns wurde ein anderer Kartenort gewählt. Der Knoten
+        wurde am ursprünglich gewählten Ort gespeichert.
+      </p>
+      <a href={"/map?focus=node:" + encodeURIComponent(createdNodeId)}>
+        Gespeicherten Knoten öffnen
+      </a>
+      <div class="actions">
+        <button type="button" class="btn btn-secondary" onclick={handleCancel}>
+          Zur Karte
+        </button>
+      </div>
     </div>
   {:else if placingGarnrolle}
     <div data-testid="garnrolle-placement">
