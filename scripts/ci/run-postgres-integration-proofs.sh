@@ -383,18 +383,18 @@ targets=(
   sqlx_postgres_direct_session_crud
 )
 
-
 # Fail when a new ignored db_* PostgreSQL test is missing from the default suite.
 # db_node_conversations runs below; db_governance_conversation_target runs in api.yml.
 for source in "${SCRIPT_DIR}/../../apps/api/tests"/db_*.rs; do
   if grep -Eq '^[[:space:]]*#\[ignore' "$source"; then
-    target="${source##*/}"; target="${target%.rs}"
+    target="${source##*/}"
+    target="${target%.rs}"
     case " ${targets[*]} " in
       *" ${target} "*) ;;
       *) if [[ "$target" != db_node_conversations && "$target" != db_governance_conversation_target ]]; then
-           echo "Ignored PostgreSQL test missing from CI: ${target}" >&2
-           exit 1
-         fi ;;
+        echo "Ignored PostgreSQL test missing from CI: ${target}" >&2
+        exit 1
+      fi ;;
     esac
   fi
 done
