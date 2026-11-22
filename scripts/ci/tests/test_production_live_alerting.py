@@ -418,6 +418,73 @@ class ClassifyProductionLiveStateTest(unittest.TestCase):
             self.assertEqual(CLASSIFY.main(args), 1)
             self.assertIn("unreadable", json.loads(output.read_text())["reason"])
 
+    def test_young_schaubild_promotion_lag_is_not_an_app_alert(self) -> None:
+        import datetime as dt
+        import time
+
+        def stamp(age: int) -> str:
+            moment = dt.datetime.fromtimestamp(time.time() - age, dt.timezone.utc)
+            return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        pending = {
+            "schema_version": CLASSIFY.SCHAUBILD_SCHEMA,
+            "state": "promotion_pending",
+            "action_required": True,
+            "locked_source_commit": A,
+            "locked_image_digest": "sha256:" + "e" * 64,
+            "desired_source_commit": B,
+            "desired_workflow_run_id": 4242,
+            "desired_published_at": stamp(60),
+            "pending_since": stamp(3600),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            receipt_path = Path(tmp) / "receipt.json"
+            schaubild = Path(tmp) / "schaubild.json"
+            output = Path(tmp) / "state.json"
+            args = ["--receipt", str(receipt_path), "--expected-commit", C, "--main-commit", C,
+                    "--repo", tmp, "--schaubild-receipt", str(schaubild),
+                    "--schaubild-pending-grace-seconds", "7200", "--output", str(output)]
+
+            def run(app: dict, schaubild_payload: dict | None) -> tuple[int, dict]:
+                receipt_path.write_text(json.dumps(app))
+                if schaubild_payload is not None:
+                    schaubild.write_text(json.dumps(schaubild_payload))
+                code = CLASSIFY.main(args)
+                return code, json.loads(output.read_text())
+
+            # App live and exact, Schaubild young pending: green, separately visible.
+            code, payload = run(receipt(C, passed=True), pending)
+            self.assertEqual((code, payload["state"], payload["alert"]), (0, "current", False))
+            self.assertEqual(payload["schaubild"], "pending")
+            self.assertIn(B, payload["schaubild_note"])
+            # Not part of the fingerprint: no new alert identity, so no noise.
+            self.assertEqual(payload["fingerprint"], f"current:{C}")
+
+            # App failures stay red whatever Schaubild says.
+            for broken in (receipt(None), receipt(C, passed=False), receipt(A, passed=True)):
+                code, payload = run(broken, pending)
+                self.assertEqual(code, 1, payload)
+                self.assertTrue(payload["alert"])
+                self.assertEqual(payload["schaubild"], "pending")
+
+            # Overdue, undated, future-dated, invalid and unproven lag all alert.
+            for bad in (
+                {**pending, "pending_since": stamp(7300)},
+                {k: v for k, v in pending.items() if k != "pending_since"},
+                {**pending, "pending_since": "yesterday"},
+                {**pending, "pending_since": stamp(-600)},
+                {**pending, "locked_image_digest": "latest"},
+                {**pending, "action_required": False},
+                {**pending, "state": "invalid"},
+                {"state": "invalid", "action_required": True, "error": "lookup failed"},
+            ):
+                code, payload = run(receipt(C, passed=True), bad)
+                self.assertEqual((code, payload["state"]), (1, "invalid"), bad)
+                self.assertEqual(payload["schaubild"], "only")
+            schaubild.unlink()
+            code, payload = run(receipt(C, passed=True), None)
+            self.assertEqual((code, payload["schaubild"]), (1, "only"))
+
     def test_schaubild_schema_matches_the_producer(self) -> None:
         producer = (OPS.parent / "preflight/schauwerk_release_convergence.py").read_text(
             encoding="utf-8"

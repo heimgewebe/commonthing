@@ -26,7 +26,11 @@ human. This classifier separates them:
 The Schaubild release convergence is a mandatory part of the same contract.
 When ``--schaubild-receipt`` is given and that receipt is missing or not
 ``current``, an otherwise non-alerting state becomes ``invalid``; no run can
-resolve an alert while Schaubild has not converged.
+resolve an alert while Schaubild has not converged. The one exception is a
+fully proven ``promotion_pending`` whose promotion has been owed for less than
+``--schaubild-pending-grace-seconds``: the app state stays as classified and
+the result carries ``schaubild: "pending"``. Unknown, unproven, invalid or
+overdue lag still alerts.
 
 Only ``current``, ``superseded`` and ``pending`` exit 0.
 """
@@ -51,6 +55,9 @@ IMAGE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 DEFAULT_PENDING_GRACE_SECONDS = 1200
 NON_ALERTING_STATES = frozenset({"current", "superseded", "pending"})
 SCHAUBILD_SCHEMA = "weltgewebe-schauwerk-release-convergence.v1"
+# Promotion of a published Schaubild release is a reviewed consumer PR, not an
+# automatic rollout; hours of lag are routine, a day of it is not.
+DEFAULT_SCHAUBILD_PENDING_GRACE_SECONDS = 21600
 
 
 @dataclass(frozen=True)
@@ -66,7 +73,10 @@ class Classification:
     api_commit: str | None = None
     # "only" when Schaubild is the sole alert cause, "also" when it fails next
     # to another alert, so recovery of either cause changes the fingerprint.
+    # "pending" is an excused, still-young promotion lag: never an alert and
+    # not part of the fingerprint.
     schaubild: str | None = None
+    schaubild_note: str | None = None
     # The failed contract checks behind an ``invalid`` state, so a change of
     # cause on the same commit (one check repaired, another broken) is visible.
     causes: tuple[str, ...] = ()
@@ -82,7 +92,9 @@ class Classification:
         if self.causes:
             digest = hashlib.sha256("\n".join(sorted(self.causes)).encode()).hexdigest()
             identity = f"{identity}#{digest[:12]}"
-        return f"{identity}+schaubild-{self.schaubild}" if self.schaubild else identity
+        if self.schaubild in ("only", "also"):
+            return f"{identity}+schaubild-{self.schaubild}"
+        return identity
 
 
 def _is_commit(value: Any) -> bool:
@@ -387,6 +399,41 @@ def _schaubild_proof_problem(payload: dict[str, Any]) -> str | None:
     return None
 
 
+def schaubild_pending_note(path: Path, *, now: float, grace_seconds: int) -> str | None:
+    """Note for a proven promotion lag younger than the grace, else None.
+
+    Everything but a well-formed ``promotion_pending`` with a valid
+    ``pending_since`` inside the grace stays a failure.
+    """
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("state") != "promotion_pending" or payload.get("action_required") is not True:
+        return None
+    locked, desired = payload.get("locked_source_commit"), payload.get("desired_source_commit")
+    if not (_is_commit(locked) and _is_commit(desired)) or locked == desired:
+        return None
+    # Same proof fields as a current receipt, except that the pair differs.
+    if _schaubild_proof_problem({**payload, "locked_source_commit": desired}):
+        return None
+    try:
+        since = datetime.fromisoformat(str(payload.get("pending_since")).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if since.tzinfo is None:
+        return None
+    age = int(now - since.timestamp())
+    if age < 0 or age >= grace_seconds:
+        return None
+    return (
+        f"Schaubild promotion to {desired} pending for {age}s "
+        f"(grace {grace_seconds}s), locked {locked}"
+    )
+
+
 def with_schaubild(classification: Classification, failure: str | None) -> Classification:
     if failure is None:
         return classification
@@ -418,6 +465,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--pending-grace-seconds", type=int, default=DEFAULT_PENDING_GRACE_SECONDS
     )
     parser.add_argument("--schaubild-receipt", type=Path)
+    parser.add_argument(
+        "--schaubild-pending-grace-seconds",
+        type=int,
+        default=DEFAULT_SCHAUBILD_PENDING_GRACE_SECONDS,
+    )
     parser.add_argument("--output", type=Path, required=True)
     return parser
 
@@ -436,8 +488,8 @@ def main(argv: list[str] | None = None) -> int:
         if not COMMIT_RE.fullmatch(getattr(args, name)):
             print(f"ERROR: --{name.replace('_', '-')} must be a full SHA", file=sys.stderr)
             return 2
-    if args.pending_grace_seconds < 0:
-        print("ERROR: --pending-grace-seconds must not be negative", file=sys.stderr)
+    if args.pending_grace_seconds < 0 or args.schaubild_pending_grace_seconds < 0:
+        print("ERROR: grace seconds must not be negative", file=sys.stderr)
         return 2
 
     classification = classify(
@@ -450,11 +502,20 @@ def main(argv: list[str] | None = None) -> int:
         rollout_start=lambda live, target: git_rollout_start(args.repo, live, target),
     )
     if args.schaubild_receipt is not None:
-        classification = with_schaubild(classification, schaubild_failure(args.schaubild_receipt))
+        failure = schaubild_failure(args.schaubild_receipt)
+        note = failure and schaubild_pending_note(
+            args.schaubild_receipt, now=time.time(), grace_seconds=args.schaubild_pending_grace_seconds
+        )
+        if note:
+            classification = replace(classification, schaubild="pending", schaubild_note=note)
+        else:
+            classification = with_schaubild(classification, failure)
     payload = asdict(classification)
     payload["fingerprint"] = classification.fingerprint()
     args.output.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
     print(f"production_live_state={classification.state} reason={classification.reason}")
+    if classification.schaubild_note:
+        print(f"schaubild_convergence=pending {classification.schaubild_note}")
     return 1 if classification.alert else 0
 
 
