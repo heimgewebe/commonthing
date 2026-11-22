@@ -34,6 +34,8 @@
   let chosenCircleIds: string[] = $state([]);
   let circleLoadError = $state("");
   let privateCreatedNodeId: string | null = $state(null);
+  let createdNodeId: string | null = $state(null);
+  let staleCreatedNode = $state(false);
   let activeCircles = $derived(
     availableCircleList.filter(
       (circle) =>
@@ -60,6 +62,7 @@
     const selected: NodeAudienceScope = audienceScope;
     return (
       privateCreatedNodeId === null &&
+      createdNodeId === null &&
       !!title.trim() &&
       isNodeKind(nodeType) &&
       (!geographic || !!$kompositionDraft?.lngLat) &&
@@ -185,7 +188,7 @@
     e.preventDefault();
     // Creation has already succeeded: never re-POST this canonical node after
     // its separate audience grant fails. Open the persisted private node.
-    if (privateCreatedNodeId !== null) return;
+    if (privateCreatedNodeId !== null || createdNodeId !== null) return;
     formError = null;
     titleError = !title.trim();
 
@@ -230,6 +233,7 @@
           circle_ids: selectedCircleIds,
         }),
       });
+      createdNodeId = node.id;
 
       if (audienceScope === "circles") {
         if (!creator || $authStore.account_id !== creator) {
@@ -260,9 +264,15 @@
         // als Projektion derselben Webungsaktion erzeugt oder die Anfrage
         // fehlgeschlagen zurückgegeben.
         await finalizeSuccess(node.id);
+      } else if ($systemState === "komposition") {
+        // A new map point replaced this draft while the earlier POST was
+        // pending. Keep the committed result visible without re-posting it.
+        staleCreatedNode = true;
       }
     } catch (err) {
-      formError = describeCreateNodeError(err);
+      formError = createdNodeId
+        ? "Der Knoten wurde gespeichert, aber die Anzeige konnte nicht aktualisiert werden. Öffne den gespeicherten Knoten über den Link."
+        : describeCreateNodeError(err);
     } finally {
       isSubmitting = false;
     }
@@ -279,6 +289,26 @@
       <button type="button" class="btn btn-secondary" onclick={handleCancel}
         >Schließen</button
       >
+    </div>
+  {:else if staleCreatedNode && createdNodeId}
+    <div
+      class="state-set"
+      role="status"
+      data-testid="node-creation-stale-draft"
+    >
+      <p><strong>Knoten gespeichert</strong></p>
+      <p>
+        Während des Speicherns wurde ein anderer Kartenort gewählt. Der Knoten
+        wurde am ursprünglich gewählten Ort gespeichert.
+      </p>
+      <a href={"/map?focus=node:" + encodeURIComponent(createdNodeId)}>
+        Gespeicherten Knoten öffnen
+      </a>
+      <div class="actions">
+        <button type="button" class="btn btn-secondary" onclick={handleCancel}>
+          Zur Karte
+        </button>
+      </div>
     </div>
   {:else if placingGarnrolle}
     <div data-testid="garnrolle-placement">
@@ -369,6 +399,10 @@
               href={`/map?focus=node:${encodeURIComponent(privateCreatedNodeId)}`}
             >
               Privat gespeicherten Knoten öffnen
+            </a>
+          {:else if createdNodeId}
+            <a href={"/map?focus=node:" + encodeURIComponent(createdNodeId)}>
+              Gespeicherten Knoten öffnen
             </a>
           {/if}
         </div>

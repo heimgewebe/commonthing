@@ -24,9 +24,9 @@ async function gotoMapAs(
   await page.waitForSelector('[data-testid="tool-fan"]', { timeout: 10000 });
 }
 
-async function longPressMapCenter(page: Page) {
+async function longPressMapCenter(page: Page, position = { x: 50, y: 50 }) {
   const mapContainer = page.locator("#map");
-  await mapContainer.hover({ position: { x: 50, y: 50 } });
+  await mapContainer.hover({ position });
   await page.mouse.down();
   await page.waitForTimeout(1000); // 800ms threshold
   await page.mouse.up();
@@ -89,6 +89,55 @@ test.describe("Komposition Flow (weber)", () => {
     expect(payload.location.lat).toBeLessThanOrEqual(90);
     expect(payload.location.lon).toBeGreaterThanOrEqual(-180);
     expect(payload.location.lon).toBeLessThanOrEqual(180);
+  });
+
+  test("switching the map draft during POST shows the saved node without a duplicate POST", async ({
+    page,
+  }) => {
+    let nodeCreates = 0;
+    let notifyPost!: () => void;
+    let releasePost!: () => void;
+    const postStarted = new Promise<void>((resolve) => {
+      notifyPost = resolve;
+    });
+    const postCanFinish = new Promise<void>((resolve) => {
+      releasePost = resolve;
+    });
+    // Delay only the request; the regular mock API still creates the real
+    // test node and its derived edge exactly once when the response resumes.
+    await page.route("**/api/nodes", async (route) => {
+      if (route.request().method() !== "POST") return route.fallback();
+      nodeCreates += 1;
+      notifyPost();
+      await postCanFinish;
+      return route.fallback();
+    });
+
+    await activateToolFanAction(page, "weave");
+    const panel = page.getByTestId("context-panel");
+    await longPressMapCenter(page, { x: 50, y: 50 });
+    await panel.locator("#title").fill("Gespeicherter Kartenknoten");
+    await panel.locator("#nodeType").selectOption("resource");
+    await panel.getByRole("button", { name: "Knoten knüpfen" }).click();
+    await postStarted;
+
+    // A second longpress replaces kompositionDraft while the first request
+    // is still pending. This is a new location, not another submit action.
+    await longPressMapCenter(page, { x: 110, y: 110 });
+    releasePost();
+
+    const saved = panel.getByTestId("node-creation-stale-draft");
+    await expect(saved).toContainText("Knoten gespeichert");
+    await expect(saved).toContainText("ursprünglich gewählten Ort");
+    await expect(
+      saved.getByRole("link", { name: "Gespeicherten Knoten öffnen" }),
+    ).toHaveAttribute("href", /focus=node:mock-node-1/);
+    await expect(
+      panel.getByRole("button", { name: "Knoten knüpfen" }),
+    ).toHaveCount(0);
+    expect(nodeCreates).toBe(1);
+    await saved.getByRole("button", { name: "Zur Karte" }).click();
+    await expect(panel).toBeHidden();
   });
 
   test("Nongeographic Komposition requires a kind and a name but no map location", async ({
