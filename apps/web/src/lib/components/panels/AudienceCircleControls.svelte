@@ -27,6 +27,7 @@
   let error = $state("");
   let notice = $state("");
   let chosenCircle = $state("");
+  let otherGarnrolleCode = $state("");
   let memberList: AudienceCircleMember[] = $state([]);
   let memberCircle = $state("");
   let memberLoading = $state(false);
@@ -49,6 +50,7 @@
     const selected = selectedAccountId;
     circles = [];
     chosenCircle = "";
+    otherGarnrolleCode = "";
     memberList = [];
     memberCircle = "";
     memberLoading = false;
@@ -142,6 +144,27 @@
     }
   }
 
+  async function copyOwnCode() {
+    if (!ownView || !selectedAccountId) return;
+    try {
+      await navigator.clipboard.writeText(selectedAccountId);
+      error = "";
+      notice = "Deine Garnrollen-Kennung wurde kopiert.";
+    } catch {
+      error =
+        "Kopieren nicht möglich. Du kannst die Kennung im Feld selbst markieren und kopieren.";
+    }
+  }
+
+  function proposeHouseholdByCode() {
+    const targetId = otherGarnrolleCode.trim();
+    if (!ownView || !targetId || targetId === selectedAccountId) return;
+    void perform(async () => {
+      await createHousehold(targetId);
+      otherGarnrolleCode = "";
+    }, "Hausgemeinschaft vorgeschlagen. Sie wird erst durch Annahme aktiv.");
+  }
+
   async function toggleMembers(id: string) {
     if (memberCircle === id) {
       memberCircle = "";
@@ -187,7 +210,7 @@
       {#if households.length === 0}
         <p class="hint">
           Noch keine Hausgemeinschaft. Öffne eine andere Garnrolle auf der
-          Karte, um eine gemeinsame Hausgemeinschaft vorzuschlagen.
+          Karte oder gib unten ihre freiwillig geteilte Kennung ein.
         </p>
       {:else}
         <ul class="circles">
@@ -265,6 +288,39 @@
           {/each}
         </ul>
       {/if}
+      <div class="invite-by-code" data-testid="household-offmap-invite">
+        <p class="hint">
+          Auch ohne Kartenort: Tausche deine Garnrollen-Kennung direkt mit einer
+          anderen Person, um eine Hausgemeinschaft vorzuschlagen.
+        </p>
+        <label for="own-garnrolle-code">Deine Garnrollen-Kennung</label>
+        <input
+          id="own-garnrolle-code"
+          type="text"
+          value={selectedAccountId}
+          readonly
+          aria-label="Deine Garnrollen-Kennung"
+        />
+        <button type="button" onclick={copyOwnCode}>Kennung kopieren</button>
+        <label for="other-garnrolle-code">Kennung der anderen Person</label>
+        <input
+          id="other-garnrolle-code"
+          type="text"
+          autocomplete="off"
+          spellcheck="false"
+          maxlength="200"
+          bind:value={otherGarnrolleCode}
+          placeholder="Kennung einfügen"
+        />
+        <button
+          type="button"
+          disabled={busy ||
+            loading ||
+            !otherGarnrolleCode.trim() ||
+            otherGarnrolleCode.trim() === selectedAccountId}
+          onclick={proposeHouseholdByCode}>Hausgemeinschaft vorschlagen</button
+        >
+      </div>
     {:else}
       {#if activeHouseholds.length > 0}
         <label for="household-choice"
@@ -345,6 +401,30 @@
   select:focus-visible {
     border-color: var(--accent);
   }
+  .invite-by-code {
+    display: grid;
+    gap: 0.3rem;
+    padding-top: 0.65rem;
+    margin-top: 0.65rem;
+    border-top: 1px solid var(--panel-border-strong);
+  }
+
+  .invite-by-code input {
+    width: 100%;
+    min-width: 0;
+    box-sizing: border-box;
+    padding: 0.55rem 0.65rem;
+    background: var(--panel-solid);
+    color: var(--text);
+    border: 1px solid var(--panel-border-strong);
+    border-radius: 8px;
+  }
+
+  .invite-by-code input[readonly] {
+    font-family: ui-monospace, monospace;
+    font-size: 0.85rem;
+  }
+
   .circles,
   .members {
     list-style: none;
