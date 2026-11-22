@@ -179,6 +179,16 @@ describe("voluntary audience circle API", () => {
     );
   });
 
+  it("reports an unknown invitation code instead of claiming the service is unavailable", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response(null, { status: 404 })),
+    );
+    await expect(createHousehold("missing-account")).rejects.toThrow(
+      "Garnrollen-Kennung wurde nicht gefunden",
+    );
+  });
+
   it("reports an existing household without pretending a new one was created", async () => {
     vi.stubGlobal(
       "fetch",

@@ -198,6 +198,96 @@ test("Erfolgreiche Ablehnung bleibt trotz fehlerhafter Lesebestätigung sichtbar
   await expect(page).toHaveURL(/nachrichten/);
 });
 
+test("Unverortete Garnrollen können die Hausgemeinschaft über freiwillig geteilte Kennungen vorschlagen", async ({
+  page,
+}) => {
+  let createdFor: string | null = null;
+  let proposals = 0;
+  await mockApiResponses(page, {
+    auth: { authenticated: true, account_id: "personal-a", role: "gast" },
+  });
+  await page.route("**/api/circles/me*", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(
+        proposals > 0
+          ? [
+              {
+                id: "22222222-2222-4222-8222-222222222222",
+                name: "Hausgemeinschaft",
+                kind: "household",
+                state: "forming",
+                membership_status: "active",
+              },
+            ]
+          : [],
+      ),
+    }),
+  );
+  await page.route("**/api/circles", (route) => {
+    if (route.request().method() !== "POST") return route.fallback();
+    const payload = route.request().postDataJSON();
+    expect(payload.kind).toBe("household");
+    expect(payload).not.toHaveProperty("location");
+    createdFor = payload.invitee_account_id;
+    proposals += 1;
+    return route.fulfill({
+      status: 201,
+      contentType: "application/json",
+      body: JSON.stringify({
+        id: "22222222-2222-4222-8222-222222222222",
+        name: "Hausgemeinschaft",
+        kind: "household",
+        state: "forming",
+        membership_status: "active",
+      }),
+    });
+  });
+
+  await page.goto("/settings");
+  const controls = page.getByTestId("audience-circle-controls");
+  const code = controls.getByRole("textbox", {
+    name: "Deine Garnrollen-Kennung",
+  });
+  const other = controls.getByRole("textbox", {
+    name: "Kennung der anderen Person",
+  });
+  const send = controls.getByRole("button", {
+    name: "Hausgemeinschaft vorschlagen",
+  });
+
+  await expect(code).toHaveValue("personal-a");
+  await expect(code).toHaveAttribute("readonly", "");
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+  await controls.getByRole("button", { name: "Kennung kopieren" }).click();
+  await expect
+    .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+    .toBe("personal-a");
+  await expect(send).toBeDisabled();
+  await other.fill(" personal-a ");
+  await expect(send).toBeDisabled();
+  await other.fill(" personal-b ");
+  await expect(send).toBeEnabled();
+  await send.click();
+
+  await expect.poll(() => proposals).toBe(1);
+  expect(createdFor).toBe("personal-b");
+  await expect(other).toHaveValue("");
+  await expect(
+    controls.getByText("Hausgemeinschaft vorgeschlagen.", { exact: false }),
+  ).toBeVisible();
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(code).toBeVisible();
+  await expect(other).toBeVisible();
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= window.innerWidth + 2,
+    ),
+  ).toBe(true);
+});
+
 test("Alte Hausgemeinschaftsoberfläche darf nach Annahme anderswo keine Mitgliedschaft löschen", async ({
   page,
 }) => {

@@ -87,6 +87,12 @@ export const createHousehold = (inviteeAccountId: string) =>
       invitee_account_id: inviteeAccountId,
     }),
   }).catch((error: unknown) => {
+    if (error instanceof AudienceCircleError && error.status === 404) {
+      throw new AudienceCircleError(
+        404,
+        "Diese Garnrollen-Kennung wurde nicht gefunden. Bitte prüfe den Code.",
+      );
+    }
     if (error instanceof AudienceCircleError && error.status === 409) {
       throw new AudienceCircleError(
         409,
