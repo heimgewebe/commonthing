@@ -438,3 +438,17 @@
   .circles strong,
   .circles span {
     display: block;
+  }
+  .members {
+    padding: 0.3rem 0.6rem;
+  }
+  .members li {
+    padding: 0.15rem 0;
+  }
+  .notice {
+    color: var(--text);
+  }
+  .error {
+    color: var(--error, #a02020);
+  }
+</style>
