@@ -288,6 +288,55 @@ test("Unverortete Garnrollen können die Hausgemeinschaft über freiwillig getei
   ).toBe(true);
 });
 
+test("Erfolgreicher Hausgemeinschaftsvorschlag bleibt bei fehlgeschlagenem Nachladen erfolgreich", async ({
+  page,
+}) => {
+  let proposals = 0;
+  await mockApiResponses(page, {
+    auth: { authenticated: true, account_id: "personal-a", role: "gast" },
+  });
+  await page.route("**/api/circles/me*", (route) =>
+    route.fulfill({
+      status: proposals > 0 ? 503 : 200,
+      contentType: "application/json",
+      body: proposals > 0 ? "{}" : "[]",
+    }),
+  );
+  await page.route("**/api/circles", (route) => {
+    if (route.request().method() !== "POST") return route.fallback();
+    proposals += 1;
+    return route.fulfill({
+      status: 201,
+      contentType: "application/json",
+      body: JSON.stringify({
+        id: "22222222-2222-4222-8222-222222222222",
+        kind: "household",
+        name: "Hausgemeinschaft",
+        state: "forming",
+        membership_status: "active",
+      }),
+    });
+  });
+
+  await page.goto("/settings");
+  const controls = page.getByTestId("audience-circle-controls");
+  await controls
+    .getByRole("textbox", { name: "Kennung der anderen Person" })
+    .fill("personal-b");
+  await controls
+    .getByRole("button", { name: "Hausgemeinschaft vorschlagen" })
+    .click();
+
+  await expect(controls.getByRole("status")).toContainText(
+    "Hausgemeinschaft vorgeschlagen.",
+  );
+  await expect(controls.getByRole("status")).toContainText(
+    "Die Anzeige konnte nicht aktualisiert werden.",
+  );
+  await expect(controls.getByRole("alert")).toHaveCount(0);
+  expect(proposals).toBe(1);
+});
+
 test("Alte Hausgemeinschaftsoberfläche darf nach Annahme anderswo keine Mitgliedschaft löschen", async ({
   page,
 }) => {

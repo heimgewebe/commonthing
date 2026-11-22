@@ -487,6 +487,7 @@
         : {};
 
     isSaving = true;
+    let profileCommitted = false;
     try {
       const savedProfile = await updateOwnGarnrolle(
         {
@@ -502,6 +503,7 @@
         },
         controller.signal,
       );
+      profileCommitted = true;
       if (!isCurrentSave()) return;
 
       applyProfile(savedProfile);
@@ -518,6 +520,11 @@
       });
     } catch (error) {
       if (isCurrentSave() && !isAbortError(error)) {
+        if (profileCommitted) {
+          saveMessage =
+            "Garnrolle gespeichert. Die Anzeige konnte nicht vollständig aktualisiert werden. Bitte lade die Seite neu.";
+          return;
+        }
         // The status texts live in the lazy module; a failed load of it
         // still reports the generic failure.
         let message = "Speichern fehlgeschlagen. Versuche es erneut.";
@@ -629,9 +636,7 @@
 
   {#if !$authStore.authenticated}
     <div class="empty-card" data-testid="my-garnrolle-anonymous">
-      <p>
-        Nach der Registrierung richtest du hier deine Garnrolle ein.
-      </p>
+      <p>Nach der Registrierung richtest du hier deine Garnrolle ein.</p>
       <a class="btn btn-primary" href="/login">Login starten</a>
     </div>
   {:else}
@@ -668,9 +673,7 @@
     >
       <fieldset disabled={formDisabled}>
         <legend>1. Garnrolle beschreiben</legend>
-        <p class="field-intro">
-          Nur der Anzeigename ist Pflicht.
-        </p>
+        <p class="field-intro">Nur der Anzeigename ist Pflicht.</p>
         <label>
           Anzeigename
           <input
@@ -751,9 +754,9 @@
           </small>
         {/if}
         <p class="field-intro" data-testid="garnrolle-public-tags-notice">
-          Profil-Tags sind immer öffentlich, auch bei privatem Kartenanker.
-          Für private oder gemeinschaftssichtbare Güter und Fähigkeiten nutze
-          eigene Knoten; trage sie nicht zusätzlich als Profil-Tag ein.
+          Profil-Tags sind immer öffentlich, auch bei privatem Kartenanker. Für
+          private oder gemeinschaftssichtbare Güter und Fähigkeiten nutze eigene
+          Knoten; trage sie nicht zusätzlich als Profil-Tag ein.
         </p>
         <button
           type="button"

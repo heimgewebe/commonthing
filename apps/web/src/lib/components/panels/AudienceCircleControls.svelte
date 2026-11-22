@@ -98,8 +98,10 @@
     busy = true;
     error = "";
     notice = "";
+    let actionCommitted = false;
     try {
       await action();
+      actionCommitted = true;
       if ($authStore.account_id !== actor || selectedAccountId !== selected)
         return;
       // A revoked circle membership must discard already loaded private map,
@@ -110,7 +112,7 @@
         return;
       }
       // New memberships may reveal additional canonical map nodes.
-      void invalidate("weltgewebe:domain-data");
+      await invalidate("weltgewebe:domain-data");
       const items = await listMyCircles();
       if ($authStore.account_id !== actor || selectedAccountId !== selected)
         return;
@@ -133,10 +135,16 @@
       notice = success;
     } catch (cause) {
       if ($authStore.account_id === actor && selectedAccountId === selected) {
-        error =
-          cause instanceof AudienceCircleError
-            ? cause.message
-            : "Die Aktion konnte nicht abgeschlossen werden.";
+        if (actionCommitted) {
+          notice =
+            success +
+            " Die Anzeige konnte nicht aktualisiert werden. Bitte lade die Seite neu.";
+        } else {
+          error =
+            cause instanceof AudienceCircleError
+              ? cause.message
+              : "Die Aktion konnte nicht abgeschlossen werden.";
+        }
       }
     } finally {
       if ($authStore.account_id === actor && selectedAccountId === selected)
@@ -209,8 +217,8 @@
     {:else if ownView}
       {#if households.length === 0}
         <p class="hint">
-          Noch keine Hausgemeinschaft. Öffne eine andere Garnrolle auf der
-          Karte oder gib unten ihre freiwillig geteilte Kennung ein.
+          Noch keine Hausgemeinschaft. Öffne eine andere Garnrolle auf der Karte
+          oder gib unten ihre freiwillig geteilte Kennung ein.
         </p>
       {:else}
         <ul class="circles">

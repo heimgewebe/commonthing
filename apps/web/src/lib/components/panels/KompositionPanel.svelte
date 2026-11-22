@@ -34,6 +34,7 @@
   let chosenCircleIds: string[] = $state([]);
   let circleLoadError = $state("");
   let privateCreatedNodeId: string | null = $state(null);
+  let createdNodeId: string | null = $state(null);
   let activeCircles = $derived(
     availableCircleList.filter(
       (circle) =>
@@ -60,6 +61,7 @@
     const selected: NodeAudienceScope = audienceScope;
     return (
       privateCreatedNodeId === null &&
+      createdNodeId === null &&
       !!title.trim() &&
       isNodeKind(nodeType) &&
       (!geographic || !!$kompositionDraft?.lngLat) &&
@@ -185,7 +187,7 @@
     e.preventDefault();
     // Creation has already succeeded: never re-POST this canonical node after
     // its separate audience grant fails. Open the persisted private node.
-    if (privateCreatedNodeId !== null) return;
+    if (privateCreatedNodeId !== null || createdNodeId !== null) return;
     formError = null;
     titleError = !title.trim();
 
@@ -230,6 +232,7 @@
           circle_ids: selectedCircleIds,
         }),
       });
+      createdNodeId = node.id;
 
       if (audienceScope === "circles") {
         if (!creator || $authStore.account_id !== creator) {
@@ -262,7 +265,9 @@
         await finalizeSuccess(node.id);
       }
     } catch (err) {
-      formError = describeCreateNodeError(err);
+      formError = createdNodeId
+        ? "Der Knoten wurde gespeichert, aber die Anzeige konnte nicht aktualisiert werden. Öffne den gespeicherten Knoten über den Link."
+        : describeCreateNodeError(err);
     } finally {
       isSubmitting = false;
     }
@@ -369,6 +374,10 @@
               href={`/map?focus=node:${encodeURIComponent(privateCreatedNodeId)}`}
             >
               Privat gespeicherten Knoten öffnen
+            </a>
+          {:else if createdNodeId}
+            <a href={"/map?focus=node:" + encodeURIComponent(createdNodeId)}>
+              Gespeicherten Knoten öffnen
             </a>
           {/if}
         </div>
