@@ -164,7 +164,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # tag: v2
       - name: Install cargo-deny
-        run: cargo install cargo-deny --locked --force
+        run: cargo install cargo-deny --version 0.21.0 --locked --force
       - name: Run cargo deny (JSON report)
         shell: bash
         run: |
