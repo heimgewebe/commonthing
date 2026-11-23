@@ -1,0 +1,228 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://weltgewebe.org/schemas/domain/personal-event.schema.json",
+  "title": "PersonalEvent",
+  "description": "A private, account-owned system notification about an audience circle. The content lives in a canonical message (message.schema.json, author_account_id NULL) inside the recipient's single account_event conversation. The top level describes the typed routing envelope in PostgreSQL (domain_personal_event_messages). Events are written by database triggers on membership transitions, in the same transaction, never by an HTTP 2xx alone.",
+  "type": "object",
+  "properties": {
+    "message_id": {
+      "description": "Primary key and reference to the canonical message.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "circle_id": {
+      "description": "NULL after the circle row is deleted. Historic mail stays.",
+      "type": ["string", "null"],
+      "format": "uuid"
+    },
+    "event_kind": {
+      "description": "circle_invited: to the invitee. circle_invitation_sent: to the inviter. circle_joined, circle_left: to every other active member. circle_declined: to the inviter. circle_withdrawn: to the former invitee.",
+      "type": "string",
+      "enum": [
+        "circle_invited",
+        "circle_invitation_sent",
+        "circle_joined",
+        "circle_declined",
+        "circle_withdrawn",
+        "circle_left"
+      ]
+    },
+    "subject_account_id": {
+      "description": "The other account the event is about (inviter for circle_invited and circle_withdrawn, invitee for circle_invitation_sent and circle_declined, the joining or leaving member otherwise). NULL if that account no longer exists. Never part of an HTTP response.",
+      "type": ["string", "null"],
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "invitation_created_at": {
+      "description": "Binds an invitation event to the exact membership row revision, so old mail stays inert after a re-invitation. Set exactly for circle_invited and circle_invitation_sent.",
+      "type": ["string", "null"],
+      "format": "date-time"
+    },
+    "read_at": {
+      "description": "Set by POST /api/personal-events/{id}/read. circle_invitation_sent is created already read.",
+      "type": ["string", "null"],
+      "format": "date-time"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "required": [
+    "message_id",
+    "circle_id",
+    "event_kind",
+    "subject_account_id",
+    "invitation_created_at",
+    "read_at",
+    "created_at"
+  ],
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "event_kind": { "enum": ["circle_invited", "circle_invitation_sent"] }
+        },
+        "required": ["event_kind"]
+      },
+      "then": {
+        "properties": { "invitation_created_at": { "type": "string" } }
+      },
+      "else": {
+        "properties": { "invitation_created_at": { "type": "null" } }
+      }
+    },
+    {
+      "if": {
+        "properties": { "event_kind": { "const": "circle_invitation_sent" } },
+        "required": ["event_kind"]
+      },
+      "then": {
+        "properties": { "read_at": { "type": "string" } }
+      }
+    }
+  ],
+  "definitions": {
+    "event": {
+      "description": "Item of GET /api/personal-events, visible only to the inbox owner. circle_id and circle_name are present only while the reader still has a membership row (invited or active) in a circle that is not inactive; a former member keeps a neutral notice without circle identity. No other member's account id is exposed, except target_account_id for the inviter's own still-pending invitation.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "description": "message_id of the envelope.",
+          "type": "string",
+          "format": "uuid"
+        },
+        "event_kind": {
+          "type": "string",
+          "enum": [
+            "circle_invited",
+            "circle_invitation_sent",
+            "circle_joined",
+            "circle_declined",
+            "circle_withdrawn",
+            "circle_left"
+          ]
+        },
+        "content": {
+          "description": "Fixed neutral German notice text; it never names the circle or another person.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4000
+        },
+        "created_at": { "type": "string", "format": "date-time" },
+        "read_at": { "type": ["string", "null"], "format": "date-time" },
+        "circle_id": { "type": ["string", "null"], "format": "uuid" },
+        "circle_name": {
+          "type": ["string", "null"],
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "target_account_id": {
+          "description": "Only on circle_invitation_sent, only while that exact invitation is still pending and the reader is still an active member: the invitee, so the inviter can withdraw it.",
+          "type": ["string", "null"],
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "invitation_created_at": {
+          "description": "Copied from the envelope; set exactly for circle_invited and circle_invitation_sent, also after the invitation is no longer actionable.",
+          "type": ["string", "null"],
+          "format": "date-time"
+        },
+        "actionable": {
+          "description": "True only while the exact invitation revision is still pending in a circle that is not inactive: for the invitee on circle_invited (accept or decline), for the active inviter on circle_invitation_sent (withdraw).",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "event_kind",
+        "content",
+        "created_at",
+        "read_at",
+        "circle_id",
+        "circle_name",
+        "target_account_id",
+        "invitation_created_at",
+        "actionable"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "event_kind": {
+                "enum": ["circle_invited", "circle_invitation_sent"]
+              }
+            },
+            "required": ["event_kind"]
+          },
+          "then": {
+            "properties": { "invitation_created_at": { "type": "string" } }
+          },
+          "else": {
+            "properties": {
+              "invitation_created_at": { "type": "null" },
+              "actionable": { "const": false },
+              "target_account_id": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "event_kind": { "const": "circle_invitation_sent" }
+            },
+            "required": ["event_kind"]
+          },
+          "then": {
+            "properties": { "read_at": { "type": "string" } }
+          },
+          "else": {
+            "properties": { "target_account_id": { "type": "null" } }
+          }
+        },
+        {
+          "if": {
+            "properties": { "circle_id": { "type": "null" } },
+            "required": ["circle_id"]
+          },
+          "then": {
+            "properties": {
+              "circle_name": { "type": "null" },
+              "actionable": { "const": false },
+              "target_account_id": { "type": "null" }
+            }
+          },
+          "else": {
+            "properties": { "circle_name": { "type": "string" } }
+          }
+        },
+        {
+          "if": {
+            "properties": { "target_account_id": { "type": "string" } },
+            "required": ["target_account_id"]
+          },
+          "then": {
+            "properties": { "actionable": { "const": true } }
+          }
+        }
+      ]
+    },
+    "event_page": {
+      "description": "GET /api/personal-events: newest first by (created_at, id), at most 50 items. The next page is requested with before=<id of the last item>. unread_count covers the whole inbox, not only this page.",
+      "type": "object",
+      "properties": {
+        "items": {
+          "type": "array",
+          "maxItems": 50,
+          "items": { "$ref": "#/definitions/event" }
+        },
+        "unread_count": { "type": "integer", "minimum": 0 },
+        "has_more": { "type": "boolean" }
+      },
+      "required": ["items", "unread_count", "has_more"],
+      "additionalProperties": false
+    }
+  }
+}

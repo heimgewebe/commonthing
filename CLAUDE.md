@@ -269,6 +269,9 @@ JSON Schema files in `contracts/domain/` define the authoritative domain model:
 - `account.schema.json` — Account
 - `message.schema.json` — Message
 - `conversation.schema.json` — Conversation
+- `audience-circle.schema.json` — Audience circle (household/community)
+- `audience-circle-membership.schema.json` — Circle membership and member view
+- `personal-event.schema.json` — Personal circle event and inbox page
 
 Changes here require `just contracts-domain-check` to pass.
 

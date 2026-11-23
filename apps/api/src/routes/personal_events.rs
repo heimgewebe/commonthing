@@ -266,3 +266,87 @@ pub async fn mark_personal_event_read(
     )
         .into_response())
 }
+
+#[cfg(test)]
+mod contract_tests {
+    use super::{PersonalEventPage, PersonalEventView, PAGE_SIZE};
+    use serde_json::Value;
+    use std::collections::BTreeSet;
+
+    const MIGRATION: &str =
+        include_str!("../../migrations/20261112000001_household_personal_events.up.sql");
+
+    fn contract() -> Value {
+        serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../contracts/domain/personal-event.schema.json"
+        )))
+        .unwrap()
+    }
+
+    fn keys(value: &Value) -> BTreeSet<String> {
+        value.as_object().unwrap().keys().cloned().collect()
+    }
+
+    fn strings(value: &Value) -> BTreeSet<String> {
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item.as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn personal_event_views_match_the_domain_contract() {
+        let schema = contract();
+        let event = &schema["definitions"]["event"];
+        let page = &schema["definitions"]["event_page"];
+        let wire = serde_json::to_value(PersonalEventPage {
+            items: vec![PersonalEventView {
+                id: uuid::Uuid::nil(),
+                event_kind: "circle_invited".into(),
+                content: "x".into(),
+                created_at: chrono::Utc::now(),
+                read_at: None,
+                circle_id: None,
+                circle_name: None,
+                target_account_id: None,
+                invitation_created_at: None,
+                actionable: false,
+            }],
+            unread_count: 0,
+            has_more: false,
+        })
+        .unwrap();
+        assert_eq!(page["additionalProperties"], false);
+        assert_eq!(keys(&wire), keys(&page["properties"]));
+        assert_eq!(keys(&wire), strings(&page["required"]));
+        assert_eq!(event["additionalProperties"], false);
+        assert_eq!(keys(&wire["items"][0]), keys(&event["properties"]));
+        assert_eq!(keys(&wire["items"][0]), strings(&event["required"]));
+        assert_eq!(page["properties"]["items"]["maxItems"], PAGE_SIZE);
+    }
+
+    /// The contract, the PostgreSQL CHECK and the trigger's notice texts must
+    /// name the same event kinds; a new kind cannot appear in only one place.
+    #[test]
+    fn event_kinds_match_postgres_check_and_trigger() {
+        let schema = contract();
+        let contract_kinds = strings(&schema["properties"]["event_kind"]["enum"]);
+        assert_eq!(
+            schema["definitions"]["event"]["properties"]["event_kind"]["enum"],
+            schema["properties"]["event_kind"]["enum"]
+        );
+        assert_eq!(
+            contract_kinds,
+            crate::routes::circles::tests::sql_check_values(MIGRATION, "event_kind")
+        );
+        for kind in &contract_kinds {
+            assert!(
+                MIGRATION.contains(&format!("WHEN '{kind}' THEN notice :=")),
+                "{kind} has no notice text in weltgewebe_deliver_circle_event"
+            );
+        }
+    }
+}
