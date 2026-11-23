@@ -22,9 +22,11 @@ export class AudienceCircleError extends Error {
       detail ??
         (status === 401
           ? "Bitte melde dich erneut an."
-          : status === 503 || status === 404
-            ? "Die Hausgemeinschaft ist derzeit nicht verfügbar."
-            : "Die Aktion konnte nicht abgeschlossen werden."),
+          : status === 429
+            ? "Zu viele Einladungen in kurzer Zeit. Bitte versuche es später erneut."
+            : status === 503 || status === 404
+              ? "Die Hausgemeinschaft ist derzeit nicht verfügbar."
+              : "Die Aktion konnte nicht abgeschlossen werden."),
     );
     this.name = "AudienceCircleError";
   }
