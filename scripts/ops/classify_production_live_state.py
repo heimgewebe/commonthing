@@ -425,6 +425,12 @@ def schaubild_pending_note(path: Path, *, now: float, grace_seconds: int) -> str
         return None
     if since.tzinfo is None:
         return None
+    # The first unpromoted publish cannot be newer than the latest one; a
+    # receipt claiming a young lag behind an older release is contradictory.
+    # desired_published_at is already validated by _schaubild_proof_problem.
+    published = datetime.fromisoformat(str(payload["desired_published_at"]).replace("Z", "+00:00"))
+    if since > published:
+        return None
     age = int(now - since.timestamp())
     if age < 0 or age >= grace_seconds:
         return None

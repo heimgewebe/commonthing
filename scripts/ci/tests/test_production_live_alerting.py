@@ -473,6 +473,8 @@ class ClassifyProductionLiveStateTest(unittest.TestCase):
                 {k: v for k, v in pending.items() if k != "pending_since"},
                 {**pending, "pending_since": "yesterday"},
                 {**pending, "pending_since": stamp(-600)},
+                # A young lag behind an older latest release contradicts itself.
+                {**pending, "desired_published_at": stamp(2 * 86400)},
                 {**pending, "locked_image_digest": "latest"},
                 {**pending, "action_required": False},
                 {**pending, "state": "invalid"},

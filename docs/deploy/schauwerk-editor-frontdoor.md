@@ -133,7 +133,8 @@ the locked one, so later publishes do not restart the clock) younger than
 `--schaubild-pending-grace-seconds` (21600 in the workflow) leaves the app
 state as classified and is reported as `schaubild: "pending"` in
 `production-live-state.json`, without changing the alert fingerprint. Overdue,
-undated, unproven, `invalid` or missing convergence evidence stays an
+undated, contradictory (`pending_since` after `desired_published_at`),
+unproven, `invalid` or missing convergence evidence stays an
 `invalid` alert with `schaubild: "only"`/`"also"`; app failures stay alerts
 regardless. This keeps "new release not promoted" distinct from unrelated
 production drift without a second state machine.
