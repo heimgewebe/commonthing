@@ -577,44 +577,22 @@ class TestMain(unittest.TestCase):
             os.unlink(path)
 
     def test_module_cli_smoke_covers_valid_and_missing_task(self):
-        """Exercise the real -m entrypoint formerly duplicated by CI steps."""
-        root = Path(__file__).resolve().parents[3]
+        """Check real module CLI invocation; the unit suite covers its semantics."""
         path = self._task_file()
         try:
-            valid = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "scripts.agent.check_agent_preflight",
-                    "--task-file",
-                    path,
-                    "--changed-paths",
-                    "docs/security/agent-write-scope-baseline.md",
-                    "--mode",
-                    "report-only",
-                ],
-                cwd=root,
-                capture_output=True,
-                text=True,
-                check=False,
+            cases = (
+                (0, ["--task-file", path, "--changed-paths",
+                     "docs/security/agent-write-scope-baseline.md", "--mode", "report-only"]),
+                (2, ["--task-file", "/nonexistent/task.yaml"]),
             )
-            self.assertEqual(valid.returncode, 0, valid.stderr)
-            self.assertEqual(json.loads(valid.stdout)["findings_count"], 0)
-            missing = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "scripts.agent.check_agent_preflight",
-                    "--task-file",
-                    "/nonexistent/task.yaml",
-                ],
-                cwd=root,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(missing.returncode, 2)
-            self.assertIn("Task-Datei nicht gefunden", missing.stderr)
+            for expected_rc, args in cases:
+                with self.subTest(expected_rc=expected_rc):
+                    result = subprocess.run(
+                        [sys.executable, "-m", "scripts.agent.check_agent_preflight", *args],
+                        cwd=Path(__file__).resolve().parents[3],
+                        capture_output=True, text=True, check=False,
+                    )
+                    self.assertEqual(result.returncode, expected_rc, result.stderr)
         finally:
             os.unlink(path)
 
