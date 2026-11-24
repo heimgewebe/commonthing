@@ -6,7 +6,7 @@ export const searchQuery = writable<string>("");
 // One explicit cross-view handoff, kept in memory only. Never put owner-only
 // results or search terms in the address bar, history state or local storage.
 type DiscoveryView = "commons" | "map";
-let discoveryTransfer: { target: DiscoveryView; query: string } | null = null;
+let discoveryTransfer: [DiscoveryView, string] | undefined;
 
 export function stageDiscoverySearch(
   event: Pick<
@@ -24,7 +24,7 @@ export function stageDiscoverySearch(
   // Native new-tab/window and cancelled activations must not alter this tab.
   if (
     event.defaultPrevented ||
-    event.button !== 0 ||
+    event.button ||
     event.altKey ||
     event.ctrlKey ||
     event.metaKey ||
@@ -32,15 +32,14 @@ export function stageDiscoverySearch(
   )
     return;
 
-  const term = query.trim();
-  discoveryTransfer = term ? { target, query: term } : null;
+  discoveryTransfer = [target, query.trim()];
 }
 
 export function takeDiscoverySearch(target: DiscoveryView): string | null {
-  if (discoveryTransfer?.target !== target) return null;
-  const query = discoveryTransfer.query;
-  discoveryTransfer = null;
-  return query;
+  if (discoveryTransfer?.[0] !== target) return null;
+  const query = discoveryTransfer[1];
+  discoveryTransfer = undefined;
+  return query || null;
 }
 
 export function toggleSearch() {
