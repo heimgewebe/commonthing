@@ -56,12 +56,35 @@ validiert, sind aber für neue Releases **nicht nötig**. Ein privater age-Key
 auf dem getrennten Wiederherstellungsrechner genügt; ein dritter Offline-Rechner
 ist keine Release-Bedingung.
 
-Die Freigabe gilt ausschließlich für den angegebenen Main-Commit und
-Schaubild-OCI-Digest. Fortschreitendes `main` benötigt eine neue dokumentierte
-Freigabe; ein Timer darf nie automatisch einen neueren Commit durchwinken.
-Zum erneuten HOLD die Root-Freigabe entziehen und den Timer unter der zuständigen
-Operatorautorität deaktivieren. Bereits laufende Deployments benötigen zusätzlich
-sicheres Betriebshandling; die reine Dateientfernung ist kein atomarer Kill-Switch.
+Standardmäßig gilt die Freigabe ausschließlich für den angegebenen Main-Commit
+und Schaubild-OCI-Digest. Nach erfolgreichem Erststart kann der zuständige
+Root-Operator zusätzlich `"routine_web_releases": true` setzen. Dies ist eine
+ausdrückliche Dauerentscheidung für kleine UI-Folgereleases, keine allgemeine
+Produktionsfreigabe. Sie setzt tatsächlich gelesene Off-Host- und Restic-
+Recovery-Belege voraus.
+
+Der bestehende Reconciler prüft einen neuen Zielcommit unter seinem
+Produktionslock: Nachfolger des freigegebenen Commits (und der letzten
+Routinezulassung), ausschließlich reguläre Dateien unter `apps/web/src/`,
+`apps/web/tests/` oder die bestehende Performance-Policy (ausgenommen
+Authentifizierungs- und Service-Worker-Einstiegspfade), unveränderter
+Schaubild-OCI-Digest, erfolgreiche exakte Main-Push-CI sowie frische vorhandene
+lokale Backup- und Restore-Belege (26 beziehungsweise 192 Stunden).
+GitHub-Störung, fehlende CI, Scope- oder Recovery-Abweichung lassen den alten
+Stand aktiv; besondere Releases benötigen weiterhin eine exakte Entscheidung.
+
+Die automatisch erzeugte, root-eigene Datei
+`/etc/weltgewebe/production-routine-release.json` bindet genau einen Zielcommit
+und CI-Lauf an den Hash der unveränderten Operatorentscheidung. Alle bestehenden
+Deploy-Helfer prüfen den Zielcommit weiterhin exakt. Der Reconciler ändert
+niemals die Operatorentscheidung selbst. Eine Änderung, Rücknahme oder das
+Entfernen der Root-Freigabe entwertet die abgeleitete Zulassung sofort bei
+der nächsten Prüfung. Für einen ausdrücklichen HOLD die Root-Freigabe entziehen
+und den Timer deaktivieren; bereits laufende Deployments benötigen weiterhin
+sicheres Betriebshandling. Vor einem Rollback die gewünschte exakte Version
+und die Recovery-Belege prüfen. Unabhängige Off-Host-Wiederherstellung und
+Restic werden weiterhin separat nachgewiesen und überwacht; der lokale
+Restore-Proof ersetzt sie nicht.
 
 ## Recovery-Frische und Alarmierung im Betrieb
 
