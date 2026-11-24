@@ -89,6 +89,25 @@ test("replaces the loading state with a recoverable error when the map runtime c
     name: "nodes",
   });
 
+  // The list must stay usable independently of the map runtime.
+  await page.route("**/api/public/nodes*", (route) =>
+    route.fulfill({
+      json: {
+        items: [
+          {
+            id: "fallback-node",
+            title: "Gemeinschaftswerkstatt",
+            kind: "Project",
+            summary: "Ein gemeinschaftliches Vorhaben",
+            location: null,
+            search_visibility: "public",
+          },
+        ],
+        page: { limit: 50, next_cursor: null, has_more: false },
+      },
+    }),
+  );
+
   // The map runtime is imported early; failing it must not strand the overlay.
   await page.route(`**/${nodesFile}`, (route) => route.abort());
 
@@ -99,4 +118,15 @@ test("replaces the loading state with a recoverable error when the map runtime c
   await expect(error).toHaveAttribute("role", "alert");
   await expect(page.getByTestId("map-init-error-retry")).toBeVisible();
   await expect(page.locator(".loading-overlay")).toHaveCount(0);
+
+  const listLink = error.getByRole("link", {
+    name: "Einträge als Liste öffnen",
+  });
+  await expect(listLink).toHaveAttribute("href", "/commons");
+  await listLink.focus();
+  await page.keyboard.press("Enter");
+  await expect(page).toHaveURL(/\/commons\/?$/);
+  await expect(
+    page.getByRole("link", { name: "Gemeinschaftswerkstatt" }),
+  ).toBeVisible();
 });
