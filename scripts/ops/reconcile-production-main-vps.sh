@@ -1634,7 +1634,7 @@ if ! approval_error="$(python3 -I "$AUTHORIZER" --commit "$preflight_main" 2>&1)
       fail "routine source object fetch failed"
   fi
   if ! python3 -I "$AUTHORIZER" --admit-routine "$preflight_main" \
-      --source-repository "$SOURCE_CHECKOUT" --production-lock-file "$PRODUCTION_LOCK_FILE"; then
+    --source-repository "$SOURCE_CHECKOUT" --production-lock-file "$PRODUCTION_LOCK_FILE"; then
     echo "production_reconcile=awaiting_approval approved=$approved_commit remote=$preflight_main no_deploy_effects=true"
     exit "$EXIT_APPROVAL_PENDING"
   fi
