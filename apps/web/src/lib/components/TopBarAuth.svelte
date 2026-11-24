@@ -79,10 +79,14 @@
     </summary>
     <nav id="site-menu-links" class="site-menu-links" aria-label="Hauptmenü">
       <a href="/map" onclick={closeMenuOnNavigation}>Karte</a>
+      <a href="/commons" onclick={closeMenuOnNavigation}>Alle Einträge</a>
       {#if authView.showAccountLink}
         <a href="/nachrichten" onclick={closeMenuOnNavigation}>Nachrichten</a>
         <a href="/settings#meine-garnrolle" onclick={closeMenuOnNavigation}
           >Mein Profil (Garnrolle)</a
+        >
+        <a href="/settings#meine-gemeinschaften" onclick={closeMenuOnNavigation}
+          >Meine Gemeinschaften</a
         >
       {/if}
       <a href="/antraege" onclick={closeMenuOnNavigation}
