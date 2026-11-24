@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 import { mockApiResponses } from "./fixtures/mockApi";
 import { centerDemoNode } from "./fixtures/mapCamera";
 import { activateToolFanAction } from "./fixtures/toolFan";
@@ -76,9 +76,10 @@ test("keeps interaction-only map chunks outside the startup request path", async
   await expect.poll(() => requested.has(contextFile)).toBe(true);
 });
 
-test("replaces the loading state with a recoverable error when the map runtime chunk fails", async ({
-  page,
-}) => {
+async function verifyMapFallback(
+  page: Page,
+  interaction: "keyboard" | "touch",
+) {
   await mockApiResponses(page);
 
   const manifest = JSON.parse(
@@ -88,6 +89,25 @@ test("replaces the loading state with a recoverable error when the map runtime c
     source: "src/lib/map/overlay/nodes.ts",
     name: "nodes",
   });
+
+  // The list must stay usable independently of the map runtime.
+  await page.route("**/api/public/nodes*", (route) =>
+    route.fulfill({
+      json: {
+        items: [
+          {
+            id: "fallback-node",
+            title: "Gemeinschaftswerkstatt",
+            kind: "Project",
+            summary: "Ein gemeinschaftliches Vorhaben",
+            location: null,
+            search_visibility: "public",
+          },
+        ],
+        page: { limit: 50, next_cursor: null, has_more: false },
+      },
+    }),
+  );
 
   // The map runtime is imported early; failing it must not strand the overlay.
   await page.route(`**/${nodesFile}`, (route) => route.abort());
@@ -99,4 +119,40 @@ test("replaces the loading state with a recoverable error when the map runtime c
   await expect(error).toHaveAttribute("role", "alert");
   await expect(page.getByTestId("map-init-error-retry")).toBeVisible();
   await expect(page.locator(".loading-overlay")).toHaveCount(0);
+
+  const listLink = error.getByRole("link", {
+    name: "Einträge als Liste öffnen",
+  });
+  await expect(listLink).toHaveAttribute("href", "/commons");
+  await expect(page.getByTestId("map-welcome")).toHaveCount(0);
+  if (interaction === "touch") {
+    await listLink.tap();
+  } else {
+    await listLink.focus();
+    await page.keyboard.press("Enter");
+  }
+  await expect(page).toHaveURL(/\/commons\/?$/);
+  await expect(
+    page.getByRole("link", { name: "Gemeinschaftswerkstatt" }),
+  ).toBeVisible();
+}
+
+test("replaces the loading state with a recoverable error when the map runtime chunk fails", async ({
+  page,
+}) => {
+  await verifyMapFallback(page, "keyboard");
+});
+
+test.describe("mobile map fallback", () => {
+  test.use({
+    viewport: { width: 390, height: 844 },
+    hasTouch: true,
+    isMobile: true,
+  });
+
+  test("first-visit welcome cannot cover the fallback touch target", async ({
+    page,
+  }) => {
+    await verifyMapFallback(page, "touch");
+  });
 });

@@ -1,6 +1,10 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { searchNodes } from "$lib/api/search";
+  import {
+    stageDiscoverySearch,
+    takeDiscoverySearch,
+  } from "$lib/stores/searchStore";
   import type { Node } from "$lib/map/types";
 
   let query = $state("");
@@ -76,6 +80,7 @@
   }
 
   onMount(() => {
+    query = takeDiscoverySearch("commons") ?? "";
     void load();
     return () => controller?.abort();
   });
@@ -86,7 +91,11 @@
   <h1>Knoten im Gewebe</h1>
   <p>Orte, Wissen, digitale Commons und Vorhaben – mit oder ohne Kartenort.</p>
   <nav aria-label="Knotenansichten">
-    <a href="/map">Karte öffnen</a>
+    <a
+      href={query.trim() ? "/map?lens=search" : "/map"}
+      onclick={(event) => stageDiscoverySearch(event, "map", query)}
+      >Karte öffnen</a
+    >
     <a href="/map?compose=node">Knoten knüpfen</a>
   </nav>
   <form

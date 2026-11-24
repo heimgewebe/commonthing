@@ -299,3 +299,60 @@ test("create, search, link, open and edit Commons without a map location", async
     panel.getByText("Commons bearbeitet", { exact: true }).first(),
   ).toBeVisible();
 });
+
+test("explicit map/list switches preserve the search term without putting it into the URL", async ({
+  page,
+}) => {
+  await mockApiResponses(page);
+  const requests: string[] = [];
+  await page.route("**/api/search?**", (route) => {
+    const term = new URL(route.request().url()).searchParams.get("q") ?? "";
+    requests.push(term);
+    return route.fulfill({
+      json: {
+        items: [
+          {
+            id: "discovery-off-map",
+            title: "Digitales Wissen",
+            kind: "resource",
+            summary: "Nicht räumlich verortet",
+            location: null,
+            search_visibility: "public",
+          },
+        ],
+        mode: "lexical_fallback",
+        generation_id: "test",
+        offset: 0,
+      },
+    });
+  });
+
+  await page.goto("/map?lens=search");
+  const mapSearch = page.getByRole("combobox", { name: "Suchbegriff" });
+  await mapSearch.fill("Digitales Wissen");
+  await expect.poll(() => requests.length).toBeGreaterThan(0);
+  await page
+    .getByRole("link", { name: "Alle Einträge – auch ohne Kartenort" })
+    .click();
+  await expect(page).toHaveURL(/\/commons\/?$/);
+  await expect(page.getByLabel("Knoten suchen")).toHaveValue(
+    "Digitales Wissen",
+  );
+  await expect(
+    page.getByRole("link", { name: "Digitales Wissen", exact: true }),
+  ).toBeVisible();
+  await expect
+    .poll(() => requests.filter((q) => q === "Digitales Wissen").length)
+    .toBeGreaterThan(1);
+
+  await page.getByLabel("Knoten suchen").fill("Wissen teilen");
+  await page.getByRole("link", { name: "Karte öffnen", exact: true }).click();
+  await expect(page).toHaveURL(/\/map\?lens=search$/);
+  await expect(mapSearch).toHaveValue("Wissen teilen");
+  await expect.poll(() => requests.includes("Wissen teilen")).toBe(true);
+
+  // A normal menu visit opens the public catalog, not a stale private search.
+  await page.getByTestId("site-menu-trigger").click();
+  await page.getByRole("link", { name: "Alle Einträge", exact: true }).click();
+  await expect(page.getByLabel("Knoten suchen")).toHaveValue("");
+});

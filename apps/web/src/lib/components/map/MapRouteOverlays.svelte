@@ -18,6 +18,7 @@
   } from "$lib/components/map/mapRouteEvents";
 
   interface Props {
+    initFailed?: boolean;
     mapEntities?: MapEntityViewModel[];
     selectedEntityId?: string | null;
     filteredResults?: MapEntityViewModel[];
@@ -33,6 +34,7 @@
   }
 
   let {
+    initFailed = false,
     mapEntities = [],
     selectedEntityId = null,
     filteredResults = [],
@@ -150,5 +152,7 @@
   totalCount={filterTotalCount}
   {allTopicsCount}
 />
-<MapWelcome />
+{#if !initFailed}
+  <MapWelcome />
+{/if}
 <ToolFan />

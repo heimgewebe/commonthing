@@ -53,6 +53,7 @@
     isSearchOpen,
     searchQuery,
     closeSearch,
+    takeDiscoverySearch,
   } from "$lib/stores/searchStore";
   import {
     openSearchExclusive,
@@ -604,6 +605,8 @@
       return;
     }
     if (parsed.lens === "search") {
+      const transferredQuery = takeDiscoverySearch("map");
+      if (transferredQuery !== null) searchQuery.set(transferredQuery);
       openSearchExclusive();
       return;
     }
@@ -1556,6 +1559,7 @@
     on:retry={retryMapInitialisation}
   />
   <MapRouteOverlays
+    initFailed={mapInitFailed}
     mapEntities={visibleMapEntities}
     selectedEntityId={$selection?.id ?? null}
     {filteredResults}
