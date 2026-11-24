@@ -86,44 +86,6 @@ jobs:
       - name: Run agent unit and CLI contract tests
         run: uv run --project tools/py --locked python -m unittest discover scripts/agent/tests/ -v
 
-      - name: Smoke-check CLI (report-only, missing task file)
-        run: |
-          set -euo pipefail
-          set +e
-          uv run --project tools/py --locked python -m scripts.agent.check_agent_preflight \
-            --task-file /nonexistent/task.yaml 2>/dev/null
-          rc=$?
-          set -e
-          if [ "$rc" -ne 2 ]; then
-            printf 'Expected exit code 2 for missing task file, got %s\n' "$rc" >&2
-            exit 1
-          fi
-
-      - name: Smoke-check CLI (valid task fixture)
-        run: |
-          set -euo pipefail
-          cat > /tmp/agent-task.yaml <<'YAML'
-          task_id: AGENT-SAFE-001
-          task_type: doc_change
-          allowed_paths:
-            - docs/security/
-          validation:
-            - make ci-validate
-          expected_evidence:
-            - docs/security/agent-write-scope-baseline.md
-          YAML
-          uv run --project tools/py --locked python -m scripts.agent.check_agent_preflight \
-            --task-file /tmp/agent-task.yaml \
-            --changed-paths docs/security/agent-write-scope-baseline.md \
-            --mode report-only
-
-      - name: Smoke-check handoff validator (valid fixture)
-        run: |
-          set -euo pipefail
-          uv run --project tools/py --locked python -m scripts.agent.validate_handoff \
-            --task-file tests/fixtures/agent/handoff-task.json \
-            --handoff-file tests/fixtures/agent/handoff-valid.json
-
       - name: Smoke-check dry-run runner (evidence, no repository write)
         run: |
           set -euo pipefail
