@@ -61,9 +61,11 @@
 {#if initFailed}
   <div class="map-init-error" role="alert" data-testid="map-init-error">
     <p>
-      Die Karte konnte nicht geladen werden. Möglicherweise ist die Verbindung
-      unterbrochen oder eine Programmdatei fehlt.
+      Die Karte kann gerade nicht dargestellt werden. Das kann an der
+      Grafikunterstützung deines Browsers oder an der Verbindung liegen.
     </p>
+    <a class="map-init-error__list" href="/commons">Einträge als Liste öffnen</a
+    >
     <button
       type="button"
       class="map-init-error__retry"
@@ -124,7 +126,12 @@
     max-width: 32rem;
     color: var(--text);
   }
+  .map-init-error__list,
   .map-init-error__retry {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 44px;
     padding: 10px 18px;
     border: 1px solid var(--accent);
     border-radius: 8px;
@@ -133,6 +140,11 @@
     font: inherit;
     cursor: pointer;
   }
+  .map-init-error__list {
+    font-weight: 600;
+    text-decoration: underline;
+  }
+  .map-init-error__list:hover,
   .map-init-error__retry:hover {
     background: var(--accent);
   }
