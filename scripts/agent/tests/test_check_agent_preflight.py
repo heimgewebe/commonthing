@@ -8,8 +8,11 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 from scripts.agent.check_agent_preflight import (
     _parse_simple_yaml,
@@ -570,6 +573,26 @@ class TestMain(unittest.TestCase):
         try:
             rc = main(["--task-file", path])
             self.assertEqual(rc, 0)
+        finally:
+            os.unlink(path)
+
+    def test_module_cli_smoke_covers_valid_and_missing_task(self):
+        """Check real module CLI invocation; the unit suite covers its semantics."""
+        path = self._task_file()
+        try:
+            cases = (
+                (0, ["--task-file", path, "--changed-paths",
+                     "docs/security/agent-write-scope-baseline.md", "--mode", "report-only"]),
+                (2, ["--task-file", "/nonexistent/task.yaml"]),
+            )
+            for expected_rc, args in cases:
+                with self.subTest(expected_rc=expected_rc):
+                    result = subprocess.run(
+                        [sys.executable, "-m", "scripts.agent.check_agent_preflight", *args],
+                        cwd=Path(__file__).resolve().parents[3],
+                        capture_output=True, text=True, check=False,
+                    )
+                    self.assertEqual(result.returncode, expected_rc, result.stderr)
         finally:
             os.unlink(path)
 
