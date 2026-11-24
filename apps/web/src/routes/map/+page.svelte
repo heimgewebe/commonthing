@@ -1559,6 +1559,7 @@
     on:retry={retryMapInitialisation}
   />
   <MapRouteOverlays
+    initFailed={mapInitFailed}
     mapEntities={visibleMapEntities}
     selectedEntityId={$selection?.id ?? null}
     {filteredResults}
