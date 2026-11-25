@@ -3629,5 +3629,143 @@ class WatchTests(unittest.TestCase):
             )
             self.assertFalse((directory / "events.jsonl").exists())
 
+
+class BackupObservationTests(unittest.TestCase):
+
+    def sources(self, *, now=NOW, daily_age=2, restore_age=48,
+                offhost_age=3, pulled_age=1, daily_result="success",
+                restore_result="success", offhost_result="success",
+                missing=(), daily_stamp=True):
+        def unit(name, age, result, stamp=True):
+            completed = "@" + str(int((now - timedelta(hours=age)).timestamp())) if stamp else ""
+            return "\n".join((
+                f"Id={watch.BACKUP_UNITS[name]}", "LoadState=loaded",
+                f"Result={result}", f"ExecMainStatus={0 if result == 'success' else 1}",
+                f"ExecMainExitTimestamp={completed}",
+            ))
+        backup_name = (now - timedelta(hours=offhost_age)).strftime("%Y%m%dT%H%M%SZ")
+        pulled_at = (now - timedelta(hours=pulled_age)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        rows = {
+            "server": unit("backup_daily", daily_age, daily_result, daily_stamp)
+                      + "\n\n" + unit("backup_restore", restore_age, restore_result),
+            "offhost_unit": unit("backup_offhost", pulled_age, offhost_result, False),
+            "offhost_receipt": (
+                "contract=weltgewebe-offhost-backup-pull-v2\n"
+                f"file=weltgewebe-postgres-{backup_name}.sql.gz.age\n"
+                f"pulled_at={pulled_at}\nresult=ok\n"
+            ),
+        }
+        def read(name):
+            if name in missing:
+                raise OSError("private reader unavailable")
+            return rows[name]
+        return read
+
+    def observe(self, reader, *, now=NOW, previous=None, product=None):
+        return watch.evaluate(
+            now, product or WatchTests().fixtures(), backup_reader=reader,
+            previous_backup_success=previous,
+        )
+
+    def codes(self, result, severity="P1"):
+        return {issue["code"] for issue in result["issues"]
+                if issue["severity"] == severity}
+
+    def test_healthy_fresh_proofs_even_after_user_manager_restart(self):
+        result = self.observe(self.sources())
+        self.assertEqual(result["status"], "HEALTHY")
+        self.assertEqual(set(result["backup_success"]), set(watch.BACKUP_UNITS))
+
+    def test_all_three_failed_runs_are_actionable_even_with_recent_receipt(self):
+        result = self.observe(self.sources(
+            daily_result="exit-code", restore_result="timeout", offhost_result="exit-code",
+        ))
+        self.assertEqual(self.codes(result), {
+            "backup_daily_failed", "backup_restore_failed", "backup_offhost_failed",
+        })
+        self.assertEqual(result["status"], "ALARM")
+
+    def test_overdue_runs_and_old_dump_are_not_refreshed_by_new_receipt(self):
+        result = self.observe(self.sources(
+            daily_age=31, restore_age=193, offhost_age=31, pulled_age=1,
+        ))
+        self.assertEqual(self.codes(result), {
+            "backup_daily_stale", "backup_restore_stale", "backup_offhost_stale",
+        })
+
+    def test_empty_exit_timestamp_is_not_a_success_proof(self):
+        result = self.observe(self.sources(daily_stamp=False))
+        self.assertIn("backup_daily_unverified", self.codes(result))
+        self.assertNotIn("backup_daily", result["backup_success"])
+
+    def test_temporary_reader_loss_has_grace_but_stale_evidence_alerts(self):
+        baseline = self.observe(self.sources())
+        absent = self.sources(missing=("server", "offhost_unit", "offhost_receipt"))
+        temporary = self.observe(absent, previous=baseline["backup_success"])
+        self.assertEqual(self.codes(temporary), set())
+        self.assertEqual(self.codes(temporary, "P2"), {
+            "backup_daily_unverified", "backup_restore_unverified", "backup_offhost_unverified",
+        })
+        overdue = self.observe(absent, now=NOW + timedelta(hours=31),
+                               previous=baseline["backup_success"])
+        self.assertEqual(self.codes(overdue), {
+            "backup_daily_unverified", "backup_offhost_unverified",
+        })
+        self.assertIn("backup_restore_unverified", self.codes(overdue, "P2"))
+        self.assertEqual(overdue["backup_success"], baseline["backup_success"])
+
+    def test_new_failure_journal_deduplicates_and_no_false_recovery_on_timeout(self):
+        import json
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            healthy = self.observe(self.sources())
+            self.assertIsNone(watch.record(healthy, directory))
+            prior = json.loads((directory / "state.json").read_text())["backup_success"]
+            failed = self.observe(self.sources(daily_result="exit-code"), previous=prior)
+            self.assertEqual(watch.record(failed, directory), "ALARM")
+            repeated = self.observe(self.sources(daily_result="exit-code"), previous=prior)
+            self.assertIsNone(watch.record(repeated, directory))
+            uncertain = self.observe(self.sources(missing=("server",)), previous=prior)
+            watch.record(uncertain, directory)
+            self.assertEqual(uncertain["status"], "ALARM")
+            self.assertIn("backup_daily_failed",
+                          {row[0] for row in uncertain["retained_prior_p1"]})
+            journal = directory / "events.jsonl"
+            def transitions():
+                return [json.loads(row)["event"] for row in journal.read_text().splitlines()
+                        if json.loads(row)["event"] in {"ALARM", "RECOVERY"}]
+            self.assertEqual(transitions(), ["ALARM"])
+            recovered = self.observe(self.sources(), previous=prior)
+            self.assertEqual(watch.record(recovered, directory), "RECOVERY")
+            self.assertEqual(transitions(), ["ALARM", "RECOVERY"])
+
+    def test_backup_observation_never_suppresses_product_alarm(self):
+        result = self.observe(self.sources(), product=WatchTests().fixtures(
+            frontend=OLD, api=MAIN,
+        ))
+        self.assertIn("frontend_api_diverge", self.codes(result))
+        self.assertEqual(result["status"], "ALARM")
+
+    def test_future_or_inconsistent_receipt_is_unverified(self):
+        result = self.observe(self.sources(offhost_age=1, pulled_age=3))
+        self.assertIn("backup_offhost_unverified", self.codes(result))
+        self.assertNotIn("backup_offhost", result["backup_success"])
+
+    def test_ssh_command_is_fixed_and_strict_and_reader_is_opt_in(self):
+        from unittest.mock import patch
+        with patch.object(watch.subprocess, "run") as run:
+            with self.assertRaises(ValueError):
+                watch._fetch_backup("server", "-oProxyCommand=bad")
+            run.assert_not_called()
+            run.return_value.returncode = 0
+            run.return_value.stdout = "fixture"
+            self.assertEqual(watch._fetch_backup("server", "alex@reader.example"), "fixture")
+            argv = run.call_args.args[0]
+            self.assertIn("StrictHostKeyChecking=yes", argv)
+            self.assertIn("alex@reader.example", argv)
+            self.assertIn("systemctl show --timestamp=unix", argv[-1])
+            self.assertIn(watch.BACKUP_UNITS["backup_restore"], argv[-1])
+            self.assertEqual(run.call_args.kwargs["timeout"], 18)
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Off-GitHub read-only Commonthing production checker.
 
-Only reads public URLs. Writes evidence to the local per-user state directory.
+Reads public URLs and, when configured, private backup status over existing SSH.
+Writes evidence to the local per-user state directory.
 No GitHub mutation, email, webhook or claimed notification delivery.
 """
 import argparse
@@ -12,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -85,6 +87,178 @@ P1_UNVERIFIABLE_ON = {
         "invalid_commit_api", "invalid_commit_main",
     },
 }
+
+
+# Optional backup observations reuse the existing incident journal and dispatcher.
+BACKUP_MAX_AGE = {
+    "backup_daily": 30 * 3600,
+    "backup_restore": 8 * 86400,
+    "backup_offhost": 30 * 3600,
+}
+BACKUP_UNITS = {
+    "backup_daily": "weltgewebe-postgres-backup.service",
+    "backup_restore": "weltgewebe-postgres-restore-proof.service",
+    "backup_offhost": "weltgewebe-postgres-offhost-pull.service",
+}
+BACKUP_PROPERTIES = ("Id", "LoadState", "Result", "ExecMainStatus",
+                     "ExecMainExitTimestamp")
+for _component in BACKUP_UNITS:
+    for _fault in ("failed", "stale", "unverified"):
+        P1_UNVERIFIABLE_ON[f"{_component}_{_fault}"] = {f"{_component}_unverified"}
+
+
+def _fetch_backup(name, host):
+    # The configured host already has read access to the production host.
+    # Never interpolate an arbitrary remote command or loosen SSH trust.
+    if not isinstance(host, str) or not re.fullmatch(
+        r"(?:[A-Za-z0-9][A-Za-z0-9_.-]*@)?[A-Za-z0-9][A-Za-z0-9.-]*", host
+    ):
+        raise ValueError("backup reader host missing or invalid")
+    ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+           "-o", "StrictHostKeyChecking=yes", "-o", "ServerAliveInterval=5",
+           "-o", "ServerAliveCountMax=1"]
+    show = ["systemctl", "show", "--timestamp=unix"]
+    fields = [arg for key in BACKUP_PROPERTIES for arg in ("-p", key)]
+    commands = {
+        "server": [*ssh, "commonserver", *show,
+                   BACKUP_UNITS["backup_daily"], BACKUP_UNITS["backup_restore"], *fields],
+        "offhost_unit": ["systemctl", "--user", "show", "--timestamp=unix",
+                         BACKUP_UNITS["backup_offhost"], *fields],
+        "offhost_receipt": ["grep", "-E", "^(contract|pulled_at|file|result)=",
+                            "/home/alex/merges/weltgewebe-production-backups/latest-pull.receipt"],
+    }
+    result = subprocess.run([*ssh, host, shlex.join(commands[name])],
+                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, text=True, timeout=18,
+                            check=False)
+    if result.returncode or len(result.stdout) > 4096:
+        raise ValueError("backup observation unavailable")
+    return result.stdout
+
+
+def _backup_fields(raw):
+    fields = {}
+    for line in raw.strip().splitlines():
+        key, separator, value = line.partition("=")
+        if not separator or not key or key in fields:
+            raise ValueError("invalid backup observation fields")
+        fields[key] = value
+    return fields
+
+
+def _backup_units(raw):
+    units = {}
+    for block in re.split(r"\n\s*\n", raw.strip()):
+        fields = _backup_fields(block)
+        unit = fields.get("Id")
+        if not unit or unit in units:
+            raise ValueError("invalid backup unit identity")
+        units[unit] = fields
+    return units
+
+
+def _backup_epoch(value, now):
+    return value if type(value) is int and 0 < value <= now + 300 else None
+
+
+def _backup_exit(fields, unit):
+    if fields.get("Id") != unit or fields.get("LoadState") != "loaded":
+        raise ValueError("backup service not loaded")
+    status = fields.get("Result")
+    exit_code = fields.get("ExecMainStatus", "")
+    if not status or not re.fullmatch(r"\d+", exit_code):
+        raise ValueError("missing backup result")
+    if status != "success" or int(exit_code) != 0:
+        return False, None
+    stamp = fields.get("ExecMainExitTimestamp", "")
+    if not stamp:
+        return True, None  # systemd manager restarted; no success proof
+    if not re.fullmatch(r"@\d+", stamp):
+        raise ValueError("invalid backup exit timestamp")
+    return True, int(stamp[1:])
+
+
+def _offhost_receipt(raw, now):
+    fields = _backup_fields(raw)
+    if (fields.get("contract") != "weltgewebe-offhost-backup-pull-v2"
+            or fields.get("result") != "ok"):
+        raise ValueError("invalid off-host completion receipt")
+    match = re.fullmatch(r"weltgewebe-postgres-(\d{8}T\d{6}Z)\.sql\.gz\.age",
+                         fields.get("file", ""))
+    pulled = timestamp(fields.get("pulled_at"))
+    if match is None or pulled is None:
+        raise ValueError("missing off-host backup timestamp")
+    created = datetime.strptime(match.group(1), "%Y%m%dT%H%M%SZ").replace(tzinfo=UTC)
+    stamps = (int(created.timestamp()), int(pulled.timestamp()))
+    if any(_backup_epoch(value, now) is None for value in stamps) or stamps[0] > stamps[1]:
+        raise ValueError("invalid off-host receipt chronology")
+    # A freshly rewritten pull receipt cannot make an old dump fresh.
+    return min(stamps)
+
+
+def check_backup_health(now, reader, previous, issues):
+    """Classify confirmed failures, overdue proofs and unavailable observations.
+
+    Keep only last confirmed completion timestamps in the existing state
+    snapshot. A temporarily unreachable Heim-PC is not a failed backup.
+    After the normal interval plus grace, missing proof is itself actionable.
+    """
+    epoch = int(now.timestamp())
+    previous = previous if isinstance(previous, dict) else {}
+    success = {name: previous[name] for name in BACKUP_UNITS
+               if _backup_epoch(previous.get(name), epoch) is not None}
+
+    def report(name, fault, actual, severity="P1"):
+        issues.append({
+            "code": f"{name}_{fault}", "component": BACKUP_UNITS[name],
+            "actual": actual, "expected": "successful fresh backup or restore evidence",
+            "source": ("heim-pc off-host receipt and systemd" if name == "backup_offhost"
+                       else "commonserver systemd via existing private reader"),
+            "severity": severity,
+        })
+
+    def unknown(name):
+        last = success.get(name)
+        severity = ("P2" if last is not None and epoch - last < BACKUP_MAX_AGE[name]
+                    else "P1")
+        report(name, "unverified", "completion status unavailable", severity)
+
+    def confirm(name, stamp):
+        if _backup_epoch(stamp, epoch) is None:
+            unknown(name)
+            return
+        success[name] = stamp
+        if epoch - stamp >= BACKUP_MAX_AGE[name]:
+            report(name, "stale", "last confirmed completion is overdue")
+
+    try:
+        server = _backup_units(reader("server"))
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        server = {}
+    for name in ("backup_daily", "backup_restore"):
+        unit = BACKUP_UNITS[name]
+        try:
+            ok, stamp = _backup_exit(server.get(unit, {}), unit)
+        except ValueError:
+            unknown(name)
+            continue
+        if not ok:
+            report(name, "failed", "systemd reports a failed run")
+        else:
+            confirm(name, stamp)
+
+    name = "backup_offhost"
+    unit = BACKUP_UNITS[name]
+    try:
+        ok, _stamp = _backup_exit(_backup_fields(reader("offhost_unit")), unit)
+        if not ok:
+            report(name, "failed", "systemd reports a failed transfer")
+        else:
+            # A durable pull receipt remains useful across a user-manager restart.
+            confirm(name, _offhost_receipt(reader("offhost_receipt"), epoch))
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        unknown(name)
+    return success
 
 
 def timestamp(value):
@@ -195,7 +369,8 @@ def fetch(name):
     raise ValueError(f"two reads failed: {error}")
 
 
-def evaluate(now, reader=fetch, *, previous_main_observation=None, issue_sink=None):
+def evaluate(now, reader=fetch, *, previous_main_observation=None, issue_sink=None,
+             backup_reader=None, previous_backup_success=None):
     data, headers = {}, {}
     issues = issue_sink if issue_sink is not None else []
     def flag(code, component, actual, expected, source, severity="P1", duration=None):
@@ -247,6 +422,9 @@ def evaluate(now, reader=fetch, *, previous_main_observation=None, issue_sink=No
         flag("frontend_api_diverge", "production commits",
              {"frontend": commits["frontend"], "api": commits["api"]},
              "frontend == API", "frontend")
+
+    backup_success = (check_backup_health(now, backup_reader, previous_backup_success, issues)
+                      if backup_reader is not None else None)
 
     observe("main")
     if "main" in data:
@@ -381,6 +559,7 @@ def evaluate(now, reader=fetch, *, previous_main_observation=None, issue_sink=No
                   else "HEALTHY",
         "commits": commits, "main_observation": main_observation,
         "latest_schedule": newest_schedule, "issues": issues,
+        **({"backup_success": backup_success} if backup_success is not None else {}),
     }
 
 
@@ -1491,6 +1670,11 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
                 "main_observation": current_main,
                 "checked_at_utc": result["checked_at_utc"],
             }
+            backup_success = result.get("backup_success")
+            if not isinstance(backup_success, dict) and isinstance(previous, dict):
+                backup_success = previous.get("backup_success")
+            if isinstance(backup_success, dict):
+                state_snapshot["backup_success"] = backup_success
             for key in ("pending_transitions", "pending_surge_overflow"):
                 if key in result:
                     state_snapshot[key] = result[key]
@@ -1734,8 +1918,22 @@ def _evaluate_cycle(directory):
                 "source": str(directory / "state.json"),
                 "severity": "P2",
             })
+        backup_host = os.environ.get("COMMONTHING_BACKUP_READER")
+        # Use the same durable state, not a separate scheduler or database.
+        try:
+            prior_state = json.loads((directory / "state.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            prior_state = {}
+        prior_backup = prior_state.get("backup_success") if isinstance(prior_state, dict) else None
+        backup_options = {}
+        if backup_host or isinstance(prior_backup, dict):
+            backup_options = {
+                "backup_reader": lambda name: _fetch_backup(name, backup_host),
+                "previous_backup_success": prior_backup,
+            }
         return evaluate(
             now, previous_main_observation=previous, issue_sink=observed_issues,
+            **backup_options,
         )
     except (WatchRuntimeExceeded, Exception) as exc:
         # Only preserve confirmed P1s collected before the failing read.

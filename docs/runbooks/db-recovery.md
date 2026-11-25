@@ -800,3 +800,45 @@ Eine aktuelle Backupaussage braucht mindestens:
 - Off-Host-Pull-Receipt;
 - Snapshotbeleg des bestehenden Restic-Laufs;
 - Datum, Commit/Image und offene Lücken.
+
+
+## Backup- und Restore-Alarmierung über den bestehenden Wächter
+
+Der unabhängige Commonthing-Wächter auf Heimberry kann optional die
+Sicherungskette mitprüfen. Dazu erhält **die vorhandene** Cron-Invocation
+des Wächters die Umgebungsvariable `COMMONTHING_BACKUP_READER` mit dem
+bereits autorisierten SSH-Ziel des Heim-PC (SSH-Hostalias oder
+`benutzer@host`). Die konkrete private Adresse gehört ausschließlich in
+die lokale Konfiguration. Der Heim-PC liest die beiden Systemd-Dienste auf
+commonserver über seine vorhandene SSH-Verbindung und stellt den eigenen
+Transferstatus und die ausgewählten Felder aus `latest-pull.receipt` bereit.
+Hostkeys und bestehende Anmeldeberechtigungen bleiben unverändert; der
+Wächter braucht keine neuen Schlüssel oder Zugriff auf Dumpinhalte.
+
+Ein fehlgeschlagener Lauf alarmiert unmittelbar. Ein ausbleibender
+Erfolgsnachweis ist nach 30 Stunden für tägliches Backup und Off-Host-Pull
+bzw. nach acht Tagen für den wöchentlichen Restore-Proof alarmwürdig.
+Beim Off-Host-Pull müssen sowohl Dumpdatum als auch Pull-Zeit frisch sein;
+ein frisch geschriebener Receipt für einen alten Dump genügt nicht.
+Ein leerer Exit-Zeitstempel nach Neustart eines Systemd-Managers ist kein
+Erfolgsbeleg. Beim Off-Host-Pull bleibt der dauerhafte Receipt nutzbar.
+
+Bei kurzzeitig nicht erreichbarem Heim-PC wird der letzte belegte
+Sicherungszeitpunkt nicht durch eine Beobachtungszeit ersetzt. Solange
+dieser frisch ist, meldet der Wächter Beobachtungsunsicherheit statt
+eines bestätigten Backupfehlers. Ist er überfällig oder fehlt ein
+Erstnachweis, alarmiert er über den fehlenden Beleg. Ein bereits
+bestätigter Fehler darf durch einen Timeout nicht als behoben gelten.
+Die bestehende Zustandsdatei, Alarm-/Recovery-Journalierung und der
+bestehende ntfy-Dispatcher bleiben der einzige Meldeweg. Die Lesekette
+hängt vom Heim-PC ab; ist dieser ausgeschaltet, ist commonserver-Status
+über diese Kette nicht beobachtbar. Das ist kein Nachweis eines Ausfalls
+des produktiven Backups.
+
+Vor Aktivierung: die konfigurierte SSH-Kette mit unveränderten Hostkeys
+testen, einen Dry-Run mit frischen Belegen lesen, bestehende
+Produktionsalarme und den Dispatcher prüfen. Eine kontrollierte
+Alarm-/Recovery-Probe darf keine echte Sicherung oder Restore-Daten
+verändern. Den Empfang auf dem Zielgerät getrennt von der ntfy-HTTP-Annahme
+bewerten. Bei Rollback die frühere Wächterrevision und Konfiguration
+wiederherstellen; bestehende Sicherungen nicht ändern.
