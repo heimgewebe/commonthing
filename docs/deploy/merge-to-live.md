@@ -89,6 +89,13 @@ jedem abgeschlossenen Lauf erneut mit einem Abstand von zwei Minuten. Der Dienst
 Der Produktionsserver benötigt dadurch weder den Heim-PC noch einen allgemein
 berechtigten GitHub-Runner, um einen gemergten Stand auszuliefern.
 
+Nach dem einmaligen ausdrücklichen Root-Opt-in für UI-Folgereleases kann der
+Reconciler den neuen Main selbst exakt zulassen. Er prüft dabei Git-Abstammung,
+den begrenzten UI-Diff, den unveränderten OCI-Digest, den erfolgreichen
+Main-CI-Push und bestehende frische lokale Recovery-Belege. Die
+Operatorentscheidung bleibt unverändert; besondere Änderungen benötigen
+weiterhin eine exakte Freigabe. Siehe [Production HOLD](production-hold-first-start.md).
+
 Der Build-Headroom wird als `WELTGEWEBE_PRODUCTION_BUILD_MIN_FREE_BYTES` in der
 root-eigenen `/etc/weltgewebe/production-reconciler.env` installiert. Der kanonische
 Default beträgt 51.539.607.552 Bytes (48 GiB). Der Wert ist kein pauschales

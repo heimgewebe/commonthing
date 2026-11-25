@@ -25,69 +25,69 @@ tooling:
 tasks:
   up:
     desc: "Dev-Umgebung hochfahren (Container/venv/tooling bootstrap)"
-    sh:
-      - |
-        if command -v devcontainer >/dev/null 2>&1 || [ -f .devcontainer/devcontainer.json ]; then
-          echo "[wgx.up] devcontainer context detected"
+    cmd: |
+      set -e
+      if command -v devcontainer >/dev/null 2>&1 || [ -f .devcontainer/devcontainer.json ]; then
+        echo "[wgx.up] devcontainer context detected"
+      fi
+      if command -v uv >/dev/null 2>&1; then
+        uv --version || true
+        if [ -f pyproject.toml ]; then
+          uv sync --frozen
         fi
-        if command -v uv >/dev/null 2>&1; then
-          uv --version || true
-          if [ -f pyproject.toml ]; then
-            uv sync --frozen
-          fi
-        fi
-        if [ -f .pre-commit-config.yaml ] && command -v pre-commit >/dev/null 2>&1; then
-          pre-commit install
-        fi
+      fi
+      if [ -f .pre-commit-config.yaml ] && command -v pre-commit >/dev/null 2>&1; then
+        pre-commit install
+      fi
   lint:
     desc: "Schnelle statische Checks (Rust/Python/Markdown/YAML)"
-    sh:
-      - |
-        if [ -f Cargo.toml ]; then
-          cargo fmt --all -- --check
-          cargo clippy --all-targets --all-features -- -D warnings
-        fi
-        if [ -f pyproject.toml ] && command -v uv >/dev/null 2>&1; then
-          uv run ruff check .
-          uv run ruff format --check .
-        fi
-        if command -v markdownlint >/dev/null 2>&1; then
-          markdownlint "**/*.md" "!**/node_modules/**" "!**/dist/**" "!**/.git/**"
-        fi
-        if command -v yamllint >/dev/null 2>&1; then
-          yamllint .
-        fi
+    cmd: |
+      set -e
+      if [ -f Cargo.toml ]; then
+        cargo fmt --all -- --check
+        cargo clippy --all-targets --all-features -- -D warnings
+      fi
+      if [ -f pyproject.toml ] && command -v uv >/dev/null 2>&1; then
+        uv run ruff check .
+        uv run ruff format --check .
+      fi
+      if command -v markdownlint >/dev/null 2>&1; then
+        markdownlint "**/*.md" "!**/node_modules/**" "!**/dist/**" "!**/.git/**"
+      fi
+      if command -v yamllint >/dev/null 2>&1; then
+        yamllint .
+      fi
   test:
     desc: "Testsuite"
-    sh:
-      - |
-        if [ -f Cargo.toml ]; then
-          cargo test --all --all-features
-        fi
-        if [ -f pyproject.toml ] && command -v uv >/dev/null 2>&1; then
-          uv run pytest -q
-        fi
+    cmd: |
+      set -e
+      if [ -f Cargo.toml ]; then
+        cargo test --all --all-features
+      fi
+      if [ -f pyproject.toml ] && command -v uv >/dev/null 2>&1; then
+        uv run pytest -q
+      fi
   build:
     desc: "Build-Artefakte erstellen"
-    sh:
-      - |
-        if [ -f Cargo.toml ]; then
-          cargo build --release
-        fi
-        if [ -f pyproject.toml ] && command -v uv >/dev/null 2>&1; then
-          uv build
-        fi
+    cmd: |
+      set -e
+      if [ -f Cargo.toml ]; then
+        cargo build --release
+      fi
+      if [ -f pyproject.toml ] && command -v uv >/dev/null 2>&1; then
+        uv build
+      fi
   smoke:
     desc: "Schnelle Smoke-Checks (läuft <60s)"
-    sh:
-      - |
-        echo "[wgx.smoke] repo=$(basename "$(git rev-parse --show-toplevel)")"
-        if [ -f Cargo.toml ]; then
-          cargo metadata --no-deps > /dev/null
-        fi
-        if [ -f pyproject.toml ]; then
-          grep -q '\[project\]' pyproject.toml
-        fi
+    cmd: |
+      set -e
+      echo "[wgx.smoke] repo=$(basename "$(git rev-parse --show-toplevel)")"
+      if [ -f Cargo.toml ]; then
+        cargo metadata --no-deps > /dev/null
+      fi
+      if [ -f pyproject.toml ]; then
+        grep -q '\[project\]' pyproject.toml
+      fi
 
 wgx:
   org: heimgewebe
