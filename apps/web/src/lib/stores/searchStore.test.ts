@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { stageDiscoverySearch, takeDiscoverySearch } from "./searchStore";
+import {
+  bindDiscoveryHistoryAccount,
+  enterDiscoveryHistory,
+  rememberDiscoveryHistory,
+  stageDiscoverySearch,
+  takeDiscoverySearch,
+} from "./searchStore";
 
 const click = {
   button: 0,
@@ -46,5 +52,69 @@ describe("discovery search handoff", () => {
     stageDiscoverySearch(click, "commons", "old");
     stageDiscoverySearch(click, "commons", " ");
     expect(takeDiscoverySearch("commons")).toBeNull();
+  });
+});
+
+describe("transient discovery history", () => {
+  it("restores each distinct history entry but never a normal or reloaded entry", () => {
+    bindDiscoveryHistoryAccount("history-owner");
+    const a = enterDiscoveryHistory("map", undefined, "enter");
+    rememberDiscoveryHistory(a.id, "map", "first");
+    stageDiscoverySearch(click, "commons", "first");
+    const b = enterDiscoveryHistory("commons", undefined, "link");
+    expect(b.query).toBe("first");
+    rememberDiscoveryHistory(b.id, "commons", "second");
+    stageDiscoverySearch(click, "map", "second");
+    const c = enterDiscoveryHistory("map", undefined, "link");
+    expect(c.query).toBe("second");
+    expect(new Set([a.id, b.id, c.id]).size).toBe(3);
+    expect(enterDiscoveryHistory("commons", b.id, "popstate")).toEqual({
+      id: b.id,
+      query: "second",
+    });
+    expect(enterDiscoveryHistory("map", a.id, "popstate").query).toBe("first");
+    expect(enterDiscoveryHistory("map", c.id, "popstate").query).toBe("second");
+    expect(enterDiscoveryHistory("commons", b.id, "link").query).toBeNull();
+    expect(enterDiscoveryHistory("map", c.id, "enter").query).toBeNull();
+    expect(enterDiscoveryHistory("map", b.id, "popstate").query).toBeNull();
+  });
+
+  it("drops history and pending handoff on account change without rebinding old entries", () => {
+    bindDiscoveryHistoryAccount("owner-a");
+    const entry = enterDiscoveryHistory("commons", undefined, "enter");
+    rememberDiscoveryHistory(entry.id, "commons", "owner-a private draft");
+    stageDiscoverySearch(click, "map", "owner-a private draft");
+    bindDiscoveryHistoryAccount("owner-b");
+    expect(takeDiscoverySearch("map")).toBeNull();
+    rememberDiscoveryHistory(entry.id, "commons", "must not rebind");
+    expect(
+      enterDiscoveryHistory("commons", entry.id, "popstate").query,
+    ).toBeNull();
+    bindDiscoveryHistoryAccount("owner-a");
+    expect(
+      enterDiscoveryHistory("commons", entry.id, "popstate").query,
+    ).toBeNull();
+  });
+
+  it("does not carry a pending explicit handoff into a history navigation", () => {
+    bindDiscoveryHistoryAccount("history-cancel");
+    stageDiscoverySearch(click, "commons", "unconsumed");
+    expect(
+      enterDiscoveryHistory("commons", "unknown", "popstate").query,
+    ).toBeNull();
+    expect(
+      enterDiscoveryHistory("commons", undefined, "link").query,
+    ).toBeNull();
+  });
+
+  it("bounds history and never recreates evicted entries while leaving", () => {
+    bindDiscoveryHistoryAccount("history-capacity");
+    const first = enterDiscoveryHistory("map", undefined, "enter");
+    rememberDiscoveryHistory(first.id, "map", "old");
+    for (let i = 0; i < 64; i++) {
+      enterDiscoveryHistory("commons", undefined, "link");
+    }
+    rememberDiscoveryHistory(first.id, "map", "must not reappear");
+    expect(enterDiscoveryHistory("map", first.id, "popstate").query).toBeNull();
   });
 });

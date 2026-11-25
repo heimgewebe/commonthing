@@ -1,9 +1,12 @@
 <script lang="ts">
-  import { onMount, tick } from "svelte";
+  import { onDestroy, tick } from "svelte";
+  import { afterNavigate, beforeNavigate, replaceState } from "$app/navigation";
+  import { page } from "$app/stores";
   import { searchNodes } from "$lib/api/search";
   import {
     stageDiscoverySearch,
-    takeDiscoverySearch,
+    enterDiscoveryHistory,
+    rememberDiscoveryHistory,
   } from "$lib/stores/searchStore";
   import type { Node } from "$lib/map/types";
 
@@ -88,11 +91,24 @@
     resultHeading?.focus();
   }
 
-  onMount(() => {
-    query = takeDiscoverySearch("commons") ?? "";
-    void load();
-    return () => controller?.abort();
+  let discoveryHistoryId: string | undefined;
+  beforeNavigate(() => {
+    rememberDiscoveryHistory(discoveryHistoryId, "commons", query.trim());
   });
+  afterNavigate(({ type }) => {
+    const entry = enterDiscoveryHistory(
+      "commons",
+      $page.state.discoveryHistoryId,
+      type,
+    );
+    discoveryHistoryId = entry.id;
+    if ($page.state.discoveryHistoryId !== entry.id) {
+      replaceState("", { ...$page.state, discoveryHistoryId: entry.id });
+    }
+    query = entry.query ?? "";
+    void load();
+  });
+  onDestroy(() => controller?.abort());
 </script>
 
 <svelte:head><title>Knoten · commonThing</title></svelte:head>

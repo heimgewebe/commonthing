@@ -31,7 +31,12 @@
   } from "$lib/map/searchNavigation";
 
   import { page } from "$app/stores";
-  import { invalidate } from "$app/navigation";
+  import {
+    afterNavigate,
+    beforeNavigate,
+    invalidate,
+    replaceState,
+  } from "$app/navigation";
 
   import {
     view,
@@ -53,7 +58,8 @@
     isSearchOpen,
     searchQuery,
     closeSearch,
-    takeDiscoverySearch,
+    enterDiscoveryHistory,
+    rememberDiscoveryHistory,
   } from "$lib/stores/searchStore";
   import {
     openSearchExclusive,
@@ -605,14 +611,42 @@
       return;
     }
     if (parsed.lens === "search") {
-      const transferredQuery = takeDiscoverySearch("map");
-      if (transferredQuery !== null) searchQuery.set(transferredQuery);
+      searchQuery.set("");
       openSearchExclusive();
       return;
     }
     closeSearch();
     closeFilter();
   }
+
+  let discoveryHistoryId: string | undefined;
+  beforeNavigate(() => {
+    rememberDiscoveryHistory(
+      discoveryHistoryId,
+      "map",
+      $isSearchOpen ? $searchQuery.trim() : null,
+    );
+  });
+  afterNavigate(({ type }) => {
+    const entry = enterDiscoveryHistory(
+      "map",
+      $page.state.discoveryHistoryId,
+      type,
+    );
+    discoveryHistoryId = entry.id;
+    if ($page.state.discoveryHistoryId !== entry.id) {
+      replaceState("", { ...$page.state, discoveryHistoryId: entry.id });
+    }
+    // Explicit focus, composition and filter URLs still win over a search.
+    const parsed = parseMapUrlState($page.url.searchParams);
+    if (parsed.compose || parsed.focus || parsed.lens === "filter") return;
+    if (entry.query !== null || parsed.lens === "search") {
+      searchQuery.set(entry.query ?? "");
+      openSearchExclusive();
+    } else {
+      closeSearch();
+    }
+  });
 
   function tryApplyFocusMapUrlAddressing(
     parsed: ParsedMapUrlState,

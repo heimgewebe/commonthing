@@ -417,8 +417,100 @@ test("explicit map/list switches preserve the search term without putting it int
   await expect(mapSearch).toHaveValue("Wissen teilen");
   await expect.poll(() => requests.includes("Wissen teilen")).toBe(true);
 
+  // Each history entry retains its own draft in memory, not in history state.
+  await page.goBack();
+  await expect(page).toHaveURL(/\/commons\/?$/);
+  await expect(page.getByLabel("Knoten suchen")).toHaveValue("Wissen teilen");
+  await page.goBack();
+  await expect(page).toHaveURL(/\/map\?lens=search$/);
+  await expect(mapSearch).toHaveValue("Digitales Wissen");
+  await page.goForward();
+  await expect(page).toHaveURL(/\/commons\/?$/);
+  await expect(page.getByLabel("Knoten suchen")).toHaveValue("Wissen teilen");
+  await page.goForward();
+  await expect(page).toHaveURL(/\/map\?lens=search$/);
+  await expect(mapSearch).toHaveValue("Wissen teilen");
+  const persisted = await page.evaluate(() =>
+    JSON.stringify({
+      history: history.state,
+      local: Object.entries(localStorage),
+      session: Object.entries(sessionStorage),
+    }),
+  );
+  expect(persisted).not.toContain("Wissen teilen");
+  expect(persisted).not.toContain("Digitales Wissen");
+
   // A normal menu visit opens the public catalog, not a stale private search.
   await page.getByTestId("site-menu-trigger").click();
   await page.getByRole("link", { name: "Alle Einträge", exact: true }).click();
   await expect(page.getByLabel("Knoten suchen")).toHaveValue("");
+  await page.goBack();
+  await expect(mapSearch).toHaveValue("Wissen teilen");
+  await page.goForward();
+  await expect(page.getByLabel("Knoten suchen")).toHaveValue("");
+  await page.goBack();
+  await expect(mapSearch).toHaveValue("Wissen teilen");
+  await page.reload();
+  await expect(mapSearch).toHaveValue("");
+});
+
+test("discovery history never restores a previous account's search", async ({
+  page,
+}) => {
+  let accountId = "history-owner-a";
+  await mockApiResponses(page, {
+    auth: { authenticated: true, account_id: accountId, role: "weber" },
+  });
+  await page.route("**/api/auth/me", (route) =>
+    route.fulfill({
+      json: { authenticated: true, account_id: accountId, role: "weber" },
+    }),
+  );
+  await page.route("**/api/search?**", (route) =>
+    route.fulfill({
+      json: {
+        items: [],
+        mode: "lexical_fallback",
+        generation_id: "test",
+        offset: 0,
+      },
+    }),
+  );
+  const recheckAuth = () =>
+    page.evaluate(async () => {
+      const recheck = (
+        window as Window & {
+          __commonthingE2ERecheckAuth?: () => Promise<unknown>;
+        }
+      ).__commonthingE2ERecheckAuth;
+      if (!recheck) throw new Error("Auth recheck test seam unavailable");
+      await recheck();
+    });
+
+  await page.goto("/map?lens=search");
+  const mapSearch = page.getByRole("combobox", { name: "Suchbegriff" });
+  await expect(mapSearch).toBeVisible();
+  await recheckAuth();
+  await mapSearch.fill("Suchentwurf nur für A");
+  await page
+    .getByRole("link", { name: "Alle Einträge – auch ohne Kartenort" })
+    .click();
+  await expect(page.getByLabel("Knoten suchen")).toHaveValue(
+    "Suchentwurf nur für A",
+  );
+  await page.getByRole("link", { name: "Karte öffnen", exact: true }).click();
+  await expect(mapSearch).toHaveValue("Suchentwurf nur für A");
+
+  accountId = "history-owner-b";
+  await recheckAuth();
+  await page.goBack();
+  await expect(page.getByLabel("Knoten suchen")).toHaveValue("");
+  await page.goBack();
+  await expect(mapSearch).toHaveValue("");
+  accountId = "history-owner-a";
+  await recheckAuth();
+  await page.goForward();
+  await expect(page.getByLabel("Knoten suchen")).toHaveValue("");
+  await page.goForward();
+  await expect(mapSearch).toHaveValue("");
 });
