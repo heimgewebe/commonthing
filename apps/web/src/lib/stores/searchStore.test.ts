@@ -1,8 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { get } from "svelte/store";
 import {
   bindDiscoveryHistoryAccount,
   enterDiscoveryHistory,
   rememberDiscoveryHistory,
+  onDiscoveryAccountChange,
+  searchQuery,
   stageDiscoverySearch,
   takeDiscoverySearch,
 } from "./searchStore";
@@ -94,6 +97,30 @@ describe("transient discovery history", () => {
     expect(
       enterDiscoveryHistory("commons", entry.id, "popstate").query,
     ).toBeNull();
+  });
+
+  it("notifies mounted views only on a changed authoritative account", () => {
+    bindDiscoveryHistoryAccount("notification-owner-a");
+    const listener = vi.fn(() => {
+      expect(get(searchQuery)).toBe("");
+      expect(takeDiscoverySearch("map")).toBeNull();
+    });
+    const unsubscribe = onDiscoveryAccountChange(listener);
+    try {
+      searchQuery.set("owner-a draft");
+      stageDiscoverySearch(click, "map", "owner-a draft");
+      bindDiscoveryHistoryAccount("notification-owner-a");
+      expect(listener).not.toHaveBeenCalled();
+      expect(get(searchQuery)).toBe("owner-a draft");
+      bindDiscoveryHistoryAccount("notification-owner-b");
+      expect(listener).toHaveBeenCalledTimes(1);
+      bindDiscoveryHistoryAccount("notification-owner-b");
+      expect(listener).toHaveBeenCalledTimes(1);
+    } finally {
+      unsubscribe();
+    }
+    bindDiscoveryHistoryAccount(null);
+    expect(listener).toHaveBeenCalledTimes(1);
   });
 
   it("does not carry a pending explicit handoff into a history navigation", () => {

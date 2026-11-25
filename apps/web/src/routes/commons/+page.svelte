@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy, tick } from "svelte";
+  import { onDestroy, onMount, tick } from "svelte";
   import { afterNavigate, beforeNavigate, replaceState } from "$app/navigation";
   import { page } from "$app/stores";
   import { searchNodes } from "$lib/api/search";
@@ -7,6 +7,7 @@
     stageDiscoverySearch,
     enterDiscoveryHistory,
     rememberDiscoveryHistory,
+    onDiscoveryAccountChange,
   } from "$lib/stores/searchStore";
   import type { Node } from "$lib/map/types";
 
@@ -108,6 +109,24 @@
     query = entry.query ?? "";
     void load();
   });
+  onMount(() =>
+    onDiscoveryAccountChange(() => {
+      // The old entry was invalidated. Reset the visible search and renew only
+      // the current entry, never a historical entry from the previous account.
+      query = "";
+      if ($page.route.id !== "/commons") return;
+      if (
+        discoveryHistoryId &&
+        $page.state.discoveryHistoryId === discoveryHistoryId
+      ) {
+        const entry = enterDiscoveryHistory("commons", undefined, "enter");
+        discoveryHistoryId = entry.id;
+        replaceState("", { ...$page.state, discoveryHistoryId: entry.id });
+      }
+      // load aborts the old owner search and immediately clears its results.
+      void load();
+    }),
+  );
   onDestroy(() => controller?.abort());
 </script>
 

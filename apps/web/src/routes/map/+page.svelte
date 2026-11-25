@@ -60,6 +60,7 @@
     closeSearch,
     enterDiscoveryHistory,
     rememberDiscoveryHistory,
+    onDiscoveryAccountChange,
   } from "$lib/stores/searchStore";
   import {
     openSearchExclusive,
@@ -647,6 +648,23 @@
       closeSearch();
     }
   });
+
+  onMount(() =>
+    onDiscoveryAccountChange(() => {
+      resetNodeSearch();
+      if ($page.route.id !== "/map") return;
+      if (
+        discoveryHistoryId &&
+        $page.state.discoveryHistoryId === discoveryHistoryId
+      ) {
+        const entry = enterDiscoveryHistory("map", undefined, "enter");
+        discoveryHistoryId = entry.id;
+        replaceState("", { ...$page.state, discoveryHistoryId: entry.id });
+      }
+      // Keep the active overlay, focus and filters; the global search draft
+      // has already been cleared by the authoritative account change.
+    }),
+  );
 
   function tryApplyFocusMapUrlAddressing(
     parsed: ParsedMapUrlState,

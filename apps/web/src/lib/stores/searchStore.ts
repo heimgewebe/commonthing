@@ -49,15 +49,28 @@ const MAX_DISCOVERY_HISTORY = 64;
 type DiscoveryEntry = { view: DiscoveryView; query: string | null };
 const discoveryHistory = new Map<string, DiscoveryEntry>();
 let historyAccount: string | null | undefined;
+const accountChangeListeners = new Set<() => void>();
+
+// Only mounted discovery views subscribe. Do not notify on initial binding or
+// non-authoritative auth checks.
+export function onDiscoveryAccountChange(listener: () => void) {
+  accountChangeListeners.add(listener);
+  return () => {
+    accountChangeListeners.delete(listener);
+  };
+}
 
 // Do not resurrect a prior account's searches, even after switching back.
 // A first authoritative observation binds the newly loaded runtime.
 export function bindDiscoveryHistoryAccount(account: string | null) {
-  if (historyAccount !== undefined && historyAccount !== account) {
+  const changed = historyAccount !== undefined && historyAccount !== account;
+  historyAccount = account;
+  if (changed) {
     discoveryHistory.clear();
     discoveryTransfer = undefined;
+    searchQuery.set("");
+    for (const listener of accountChangeListeners) listener();
   }
-  historyAccount = account;
 }
 if (browser) {
   authStore.subscribe((status) => {

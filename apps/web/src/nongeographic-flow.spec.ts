@@ -466,10 +466,38 @@ test("discovery history never restores a previous account's search", async ({
       json: { authenticated: true, account_id: accountId, role: "weber" },
     }),
   );
+  await page.route("**/api/public/nodes?**", (route) =>
+    route.fulfill({
+      json: {
+        items: [
+          {
+            id: "history-public",
+            title: "Öffentlicher Beispielknoten",
+            kind: "resource",
+            location: null,
+            search_visibility: "public",
+          },
+        ],
+        page: { next_cursor: null, has_more: false },
+      },
+    }),
+  );
   await page.route("**/api/search?**", (route) =>
     route.fulfill({
       json: {
-        items: [],
+        items:
+          accountId === "history-owner-b" &&
+          new URL(route.request().url()).searchParams.get("q") ===
+            "Neuer Katalogentwurf B"
+            ? [
+                {
+                  id: "history-private-b",
+                  title: "Privater Treffer B",
+                  kind: "resource",
+                  location: null,
+                },
+              ]
+            : [],
         mode: "lexical_fallback",
         generation_id: "test",
         offset: 0,
@@ -501,16 +529,50 @@ test("discovery history never restores a previous account's search", async ({
   await page.getByRole("link", { name: "Karte öffnen", exact: true }).click();
   await expect(mapSearch).toHaveValue("Suchentwurf nur für A");
 
+  // The map stays mounted during the authoritative account refresh.
   accountId = "history-owner-b";
   await recheckAuth();
-  await page.goBack();
-  await expect(page.getByLabel("Knoten suchen")).toHaveValue("");
-  await page.goBack();
   await expect(mapSearch).toHaveValue("");
+  await mapSearch.fill("Neuer Kartenentwurf B");
+  await page
+    .getByRole("link", { name: "Alle Einträge – auch ohne Kartenort" })
+    .click();
+  const catalogSearch = page.getByLabel("Knoten suchen");
+  await expect(catalogSearch).toHaveValue("Neuer Kartenentwurf B");
+  await catalogSearch.fill("Neuer Katalogentwurf B");
+  await page.goBack();
+  await expect(mapSearch).toHaveValue("Neuer Kartenentwurf B");
+  await page.goForward();
+  await expect(catalogSearch).toHaveValue("Neuer Katalogentwurf B");
+  const privateResult = page.getByRole("link", { name: "Privater Treffer B" });
+  await expect(privateResult).toBeVisible();
+
+  // Also switch accounts while the catalog remains mounted.
   accountId = "history-owner-a";
   await recheckAuth();
+  await expect(catalogSearch).toHaveValue("");
+  await expect(privateResult).toHaveCount(0);
+  await expect(
+    page.getByRole("heading", { name: "Öffentliche Einträge" }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("link", { name: "Öffentlicher Beispielknoten" }),
+  ).toBeVisible();
+  await catalogSearch.fill("Frischer Katalogentwurf A");
+  await page.getByRole("link", { name: "Karte öffnen", exact: true }).click();
+  await expect(mapSearch).toHaveValue("Frischer Katalogentwurf A");
+  await page.goBack();
+  await expect(catalogSearch).toHaveValue("Frischer Katalogentwurf A");
+  await page.goBack();
+  await expect(mapSearch).toHaveValue("");
+  await page.goBack();
+  await expect(catalogSearch).toHaveValue("");
+  await page.goBack();
+  await expect(mapSearch).toHaveValue("");
   await page.goForward();
-  await expect(page.getByLabel("Knoten suchen")).toHaveValue("");
+  await expect(catalogSearch).toHaveValue("");
   await page.goForward();
   await expect(mapSearch).toHaveValue("");
+  await page.goForward();
+  await expect(catalogSearch).toHaveValue("Frischer Katalogentwurf A");
 });
