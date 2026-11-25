@@ -483,3 +483,143 @@ test("ein verspätetes Öffnen überschreibt keinen neueren Sidebar-Zustand", as
   await expect(page.getByRole("heading", { name: "Alice" })).toBeVisible();
   await expect(page.getByRole("alert")).toHaveCount(0);
 });
+
+test("verspätetes Senden behält Bobs Verlauf und Entwurf und aktualisiert Alice", async ({
+  page,
+}) => {
+  await installStaticBuildFallback(page);
+  await mockApiResponses(page, {
+    auth: {
+      authenticated: true,
+      account_id: "current-account",
+      role: "weber",
+    },
+  });
+  const api = await installDirectMessagesApi(page);
+  let releaseSend!: () => void;
+  const sendReleased = new Promise<void>((resolve) => {
+    releaseSend = resolve;
+  });
+  await page.route("**/api/conversations/*/messages", async (route) => {
+    if (route.request().method() !== "POST") return route.fallback();
+    expect(new URL(route.request().url()).pathname).toBe(
+      `/api/conversations/${ALICE_CONVERSATION_ID}/messages`,
+    );
+    await sendReleased;
+    return route.fulfill({
+      status: 201,
+      json: {
+        ...message(
+          ALICE_CONVERSATION_ID,
+          "current-account",
+          "Ich",
+          "Nur an Alice",
+        ),
+        id: "aaaaaaaa-1111-4111-8111-111111111111",
+      },
+    });
+  });
+
+  await page.goto("/nachrichten");
+  api.releaseAliceResponse();
+  api.releaseAliceReadResponse();
+  const alice = page.getByRole("button", { name: /Alice/ });
+  const bob = page.getByRole("button", { name: /Bob/ });
+  const composer = page.getByRole("textbox", { name: "Nachricht" });
+  const history = page.locator(".conversation .message-list");
+  await alice.click();
+  await expect(history).toContainText("Verspätete Nachricht von Alice");
+  await composer.fill("Nur an Alice");
+  const sendStarted = page.waitForRequest(
+    (request) =>
+      request.method() === "POST" &&
+      new URL(request.url()).pathname ===
+        `/api/conversations/${ALICE_CONVERSATION_ID}/messages`,
+  );
+  await page.getByRole("button", { name: "Senden", exact: true }).click();
+  await sendStarted;
+  try {
+    await bob.click();
+    await expect(history).toContainText("Aktuelle Nachricht von Bob");
+    await expect(composer).toHaveValue("");
+    await composer.fill("Entwurf für Bob");
+    releaseSend();
+    await expect(alice).toContainText("Nur an Alice");
+    await expect(bob).not.toContainText("Nur an Alice");
+    await expect(history).not.toContainText("Nur an Alice");
+    await expect(composer).toHaveValue("Entwurf für Bob");
+    await alice.click();
+    await expect(composer).toHaveValue("");
+    await bob.click();
+    await expect(composer).toHaveValue("Entwurf für Bob");
+  } finally {
+    releaseSend();
+  }
+});
+
+test("verspätetes Blockieren ändert ausschließlich das ursprüngliche Gespräch", async ({
+  page,
+}) => {
+  await installStaticBuildFallback(page);
+  await mockApiResponses(page, {
+    auth: {
+      authenticated: true,
+      account_id: "current-account",
+      role: "weber",
+    },
+  });
+  const api = await installDirectMessagesApi(page);
+  let releaseBlock!: () => void;
+  const blockReleased = new Promise<void>((resolve) => {
+    releaseBlock = resolve;
+  });
+  await page.route("**/api/direct-conversations/*/block", async (route) => {
+    await blockReleased;
+    return route.fulfill({
+      status: 200,
+      json: { ...conversations[0], blocked_by_me: true, can_send: false },
+    });
+  });
+  await page.goto("/nachrichten");
+  api.releaseAliceResponse();
+  api.releaseAliceReadResponse();
+  const alice = page.getByRole("button", { name: /Alice/ });
+  const bob = page.getByRole("button", { name: /Bob/ });
+  await alice.click();
+  await expect(page.getByRole("heading", { name: "Alice" })).toBeVisible();
+  const blockStarted = page.waitForRequest(
+    (request) =>
+      request.method() === "PUT" &&
+      new URL(request.url()).pathname ===
+        `/api/direct-conversations/${ALICE_CONVERSATION_ID}/block`,
+  );
+  await page.getByRole("button", { name: "Blockieren", exact: true }).click();
+  await blockStarted;
+  try {
+    await bob.click();
+    await expect(page.locator(".conversation .message-list")).toContainText(
+      "Aktuelle Nachricht von Bob",
+    );
+    const blockFinished = page.waitForResponse(
+      (response) =>
+        response.request().method() === "PUT" &&
+        new URL(response.url()).pathname.endsWith("/block"),
+    );
+    releaseBlock();
+    await blockFinished;
+    await page.evaluate(
+      () =>
+        new Promise<void>((resolve) =>
+          requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+        ),
+    );
+    await expect(page.getByRole("heading", { name: "Bob" })).toBeVisible();
+    await expect(
+      page.getByRole("textbox", { name: "Nachricht" }),
+    ).toBeVisible();
+    await alice.click();
+    await expect(page.getByRole("button", { name: "Freigeben" })).toBeVisible();
+  } finally {
+    releaseBlock();
+  }
+});

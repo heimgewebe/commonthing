@@ -21,11 +21,18 @@
   let conversations: DirectConversation[] = $state([]);
   let selected: DirectConversation | null = $state(null);
   let messages: ConversationMessage[] = $state([]);
-  let draft = $state("");
+  let drafts = $state<Record<string, string>>({});
+  let draft = $derived.by(() => (selected ? (drafts[selected.id] ?? "") : ""));
   let loadingInbox = $state(true);
   let loadingConversation = $state(false);
-  let sending = $state(false);
-  let changingBlock = $state(false);
+  let sendingByConversation = $state<Record<string, boolean>>({});
+  let blockingByConversation = $state<Record<string, boolean>>({});
+  let sending = $derived.by(() =>
+    selected ? !!sendingByConversation[selected.id] : false,
+  );
+  let changingBlock = $derived.by(() =>
+    selected ? !!blockingByConversation[selected.id] : false,
+  );
   let error = $state("");
   let initialized = $state(false);
   let handledRecipient: string | null = $state(null);
@@ -67,7 +74,9 @@
   }
 
   function sortMessages(items: ConversationMessage[]): ConversationMessage[] {
-    return [...items].sort(
+    // A send acknowledgement and an overlapping history load may include
+    // the same message. Merge by canonical message ID.
+    return [...new Map(items.map((item) => [item.id, item])).values()].sort(
       (left, right) =>
         left.created_at.localeCompare(right.created_at) ||
         left.id.localeCompare(right.id),
@@ -118,7 +127,7 @@
     try {
       const response = await listDirectMessages(conversation.id);
       if (generation !== selectionGeneration) return;
-      messages = sortMessages(response.items);
+      messages = sortMessages([...response.items, ...messages]);
       const newestLoadedMessage = messages.at(-1);
       if (newestLoadedMessage) {
         await markDirectConversationRead(
@@ -130,7 +139,11 @@
         item.id === conversation.id ? { ...item, unread_count: 0 } : item,
       );
       if (generation !== selectionGeneration) return;
-      selected = { ...conversation, unread_count: 0 };
+      selected = {
+        ...(conversations.find((item) => item.id === conversation.id) ??
+          conversation),
+        unread_count: 0,
+      };
       await scrollToNewest(generation);
     } catch (cause) {
       if (generation === selectionGeneration) {
@@ -177,56 +190,89 @@
   }
 
   async function send(): Promise<void> {
-    const content = draft.trim();
+    const submittedDraft = draft;
+    const content = submittedDraft.trim();
     if (!selected || !content || sending || !selected.can_send) return;
-    sending = true;
+    const conversationId = selected.id;
+    sendingByConversation[conversationId] = true;
     error = "";
     try {
       const created = await sendDirectMessage(
-        selected.id,
+        conversationId,
         content,
         crypto.randomUUID(),
       );
-      messages = sortMessages([...messages, created]);
-      draft = "";
+      if (created.conversation_id !== conversationId) {
+        throw new Error("Message response belongs to a different conversation");
+      }
+      // Clear only the unchanged draft submitted to this conversation.
+      if (drafts[conversationId] === submittedDraft) {
+        delete drafts[conversationId];
+      }
       const preview = content.slice(0, 160);
       conversations = conversations
         .map((item) =>
-          item.id === selected?.id
+          item.id === conversationId &&
+          (!item.last_message_at || item.last_message_at <= created.created_at)
             ? {
                 ...item,
                 last_message_preview: preview,
                 last_message_at: created.created_at,
-                updated_at: created.created_at,
+                updated_at:
+                  item.updated_at > created.created_at
+                    ? item.updated_at
+                    : created.created_at,
               }
             : item,
         )
         .sort((left, right) => right.updated_at.localeCompare(left.updated_at));
-      await scrollToNewest();
+      if (selected?.id === conversationId) {
+        messages = sortMessages([...messages, created]);
+        await scrollToNewest(selectionGeneration);
+      }
     } catch (cause) {
-      error = describeError(cause);
+      if (selected?.id === conversationId) error = describeError(cause);
     } finally {
-      sending = false;
+      delete sendingByConversation[conversationId];
     }
   }
 
   async function toggleBlock(): Promise<void> {
     if (!selected || changingBlock) return;
-    changingBlock = true;
+    const conversationId = selected.id;
+    const blocked = !selected.blocked_by_me;
+    blockingByConversation[conversationId] = true;
     error = "";
     try {
       const updated = await setDirectConversationBlocked(
-        selected.id,
-        !selected.blocked_by_me,
+        conversationId,
+        blocked,
       );
-      selected = updated;
+      if (updated.id !== conversationId) {
+        throw new Error("Block response belongs to a different conversation");
+      }
+      // Only the block state belongs to this operation. A concurrent send can
+      // already have refreshed the sidebar preview and timestamps.
       conversations = conversations.map((item) =>
-        item.id === updated.id ? updated : item,
+        item.id === conversationId
+          ? {
+              ...item,
+              blocked_by_me: updated.blocked_by_me,
+              can_send: updated.can_send,
+            }
+          : item,
       );
+      if (selected?.id === conversationId) {
+        selected = {
+          ...selected,
+          blocked_by_me: updated.blocked_by_me,
+          can_send: updated.can_send,
+        };
+      }
     } catch (cause) {
-      error = describeError(cause);
+      if (selected?.id === conversationId) error = describeError(cause);
     } finally {
-      changingBlock = false;
+      delete blockingByConversation[conversationId];
     }
   }
 
@@ -444,7 +490,10 @@
               <label for="direct-message">Nachricht</label>
               <textarea
                 id="direct-message"
-                bind:value={draft}
+                value={draft}
+                oninput={(event) => {
+                  if (selected) drafts[selected.id] = event.currentTarget.value;
+                }}
                 maxlength="4000"
                 rows="4"
                 onkeydown={handleComposerKeydown}

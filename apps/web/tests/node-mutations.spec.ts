@@ -1,5 +1,6 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
-import { mockApiResponses } from "./fixtures/mockApi";
+import { mockApiResponses, mockListResponse } from "./fixtures/mockApi";
+import { demoNodes } from "../src/lib/demo/demoData";
 import { waitForNodeMarker } from "./fixtures/mapReady";
 
 async function openFirstNode(page: Page) {
@@ -640,4 +641,130 @@ test.describe("Knoten bearbeiten und löschen", () => {
       panel.getByRole("button", { name: "Änderungen speichern" }),
     ).toHaveCount(0);
   });
+});
+
+test("verspätetes Speichern überschreibt keinen inzwischen ausgewählten Knoten", async ({
+  page,
+}) => {
+  await mockApiResponses(page, {
+    auth: {
+      authenticated: true,
+      account_id: "e2e-weber",
+      role: "weber",
+    },
+  });
+  const secondNode = {
+    ...demoNodes[0],
+    id: "d1acebed-1111-4111-8111-111111111111",
+    title: "Zweiter Testknoten",
+    location: { lat: 53.561, lon: 10.058 },
+    address: "Teststraße 2",
+    tags: [],
+  };
+  // The shared demo intentionally has only one node. Add a second real
+  // addressable entity to exercise a selection switch in the same panel.
+  await page.route("**/api/nodes*", async (route) => {
+    if (
+      route.request().method() !== "GET" ||
+      new URL(route.request().url()).pathname !== "/api/nodes"
+    ) {
+      return route.fallback();
+    }
+    return route.fulfill({
+      status: 200,
+      json: mockListResponse(route.request().url(), [demoNodes[0], secondNode]),
+    });
+  });
+  await page.route(`**/api/nodes/${secondNode.id}`, async (route) => {
+    if (route.request().method() === "GET") {
+      return route.fulfill({ status: 200, json: secondNode });
+    }
+    if (route.request().method() === "PUT") {
+      return route.fulfill({
+        status: 200,
+        json: {
+          ...secondNode,
+          ...route.request().postDataJSON(),
+          id: secondNode.id,
+          updated_at: "2026-11-25T12:00:00Z",
+        },
+      });
+    }
+    return route.fallback();
+  });
+  let releaseSave!: () => void;
+  const saveReleased = new Promise<void>((resolve) => {
+    releaseSave = resolve;
+  });
+  let firstSave = true;
+  await page.route("**/api/nodes/*", async (route) => {
+    if (route.request().method() === "PUT" && firstSave) {
+      firstSave = false;
+      await saveReleased;
+    }
+    return route.fallback();
+  });
+  await page.goto("/map");
+  await waitForNodeMarker(page);
+  await page
+    .getByRole("button", { name: /fairschenkbox/ })
+    .evaluate((marker) => {
+      marker.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+  const panel = page.locator('[data-testid="context-panel"]');
+  await expect(panel.locator("h3")).toHaveText("fairschenkbox");
+  const originalTitle = "fairschenkbox";
+  await panel.getByRole("tab", { name: "Bearbeiten" }).click();
+  await panel.getByRole("button", { name: "Bearbeiten", exact: true }).click();
+  await panel.getByLabel("Titel").fill("Verspäteter Knoten A");
+  const putA = page.waitForRequest(
+    (request) =>
+      request.method() === "PUT" &&
+      /\/api\/nodes\/[^/]+$/.test(new URL(request.url()).pathname),
+  );
+  await panel.getByRole("button", { name: "Änderungen speichern" }).click();
+  const firstRequest = await putA;
+  try {
+    const secondMarker = page.getByRole("button", {
+      name: /Zweiter Testknoten/,
+    });
+    await expect(secondMarker).toBeVisible();
+    await secondMarker.evaluate((marker) =>
+      marker.dispatchEvent(new MouseEvent("click", { bubbles: true })),
+    );
+    await expect(panel.locator("h3")).not.toHaveText(originalTitle);
+    const secondTitle = await panel.locator("h3").innerText();
+    await panel.getByRole("tab", { name: "Bearbeiten" }).click();
+    await panel
+      .getByRole("button", { name: "Bearbeiten", exact: true })
+      .click();
+    await panel.getByLabel("Titel").fill("Unabhängiger Knoten B");
+    const saveFinished = page.waitForResponse(
+      (response) =>
+        response.request().method() === "PUT" &&
+        response.url() === firstRequest.url(),
+    );
+    releaseSave();
+    await saveFinished;
+    await page.evaluate(
+      () =>
+        new Promise<void>((resolve) =>
+          requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+        ),
+    );
+    await expect(panel.locator("h3")).toHaveText(secondTitle);
+    await expect(panel.getByLabel("Titel")).toHaveValue(
+      "Unabhängiger Knoten B",
+    );
+    const putB = page.waitForRequest(
+      (request) =>
+        request.method() === "PUT" &&
+        /\/api\/nodes\/[^/]+$/.test(new URL(request.url()).pathname),
+    );
+    await panel.getByRole("button", { name: "Änderungen speichern" }).click();
+    expect((await putB).url()).not.toBe(firstRequest.url());
+    await expect(panel.locator("h3")).toHaveText("Unabhängiger Knoten B");
+  } finally {
+    releaseSave();
+  }
 });
