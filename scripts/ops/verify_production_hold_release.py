@@ -403,8 +403,8 @@ def verify_routine_source(repository: Path, grant: dict[str, object], target: st
             raise HoldReleaseError("routine release changes a non-UI path; exact approval required")
 
 
-def select_main_ci_run(payload: object, commit: str) -> int:
-    """Use only the newest exact push run of the unchanged main CI workflow."""
+def select_latest_main_ci_run(payload: object, commit: str) -> dict:
+    """Return the newest exact push run of the unchanged main CI workflow."""
     if not isinstance(payload, dict) or not isinstance(payload.get("workflow_runs"), list):
         raise HoldReleaseError("main CI response invalid")
     runs = payload["workflow_runs"]
@@ -420,21 +420,29 @@ def select_main_ci_run(payload: object, commit: str) -> int:
     ]
     if not exact:
         raise HoldReleaseError("exact main CI run missing")
-    latest = max(exact, key=lambda run: (run["run_number"], run["run_attempt"]))
+    return max(exact, key=lambda run: (run["run_number"], run["run_attempt"]))
+
+
+def select_main_ci_run(payload: object, commit: str) -> int:
+    """Only a successful exact main CI run authorizes routine admission."""
+    latest = select_latest_main_ci_run(payload, commit)
     if (latest.get("status") != "completed" or latest.get("conclusion") != "success"
             or type(latest.get("id")) is not int or latest["id"] <= 0):
         raise HoldReleaseError("exact main CI has not succeeded")
     return latest["id"]
 
 
-def verify_main_ci(commit: str) -> int:
+def fetch_main_ci_runs(commit: str, *, token: str | None = None) -> object:
     if not SHA40.fullmatch(commit):
         raise HoldReleaseError("invalid main CI target")
     url = ("https://api.github.com/repos/heimgewebe/commonthing/actions/workflows/ci.yml/runs"
            f"?head_sha={commit}&branch=main&event=push&per_page=5")
-    request = urllib.request.Request(url, headers={
+    headers = {
         "Accept": "application/vnd.github+json", "User-Agent": "commonthing-production-reconciler",
-    })
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=12) as response:
             raw = response.read(1_048_577)
@@ -443,7 +451,11 @@ def verify_main_ci(commit: str) -> int:
         payload = json.loads(raw)
     except (OSError, ValueError, urllib.error.URLError) as exc:
         raise HoldReleaseError("main CI evidence unavailable") from exc
-    return select_main_ci_run(payload, commit)
+    return payload
+
+
+def verify_main_ci(commit: str) -> int:
+    return select_main_ci_run(fetch_main_ci_runs(commit), commit)
 
 
 def verify_local_recovery(backup_root: Path = Path("/var/backups/weltgewebe/postgres"),

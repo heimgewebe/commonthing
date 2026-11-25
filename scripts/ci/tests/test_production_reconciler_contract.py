@@ -1798,6 +1798,9 @@ prune_releases
         self.assertNotIn('payload.get("state") != "current"', workflow)
         self.assertIn("--schaubild-receipt schaubild-release-convergence.json", workflow[classify:])
         self.assertIn("--schaubild-pending-grace-seconds 21600", workflow[classify:])
+        self.assertIn("--main-ci-grace-seconds 3600", workflow[classify:])
+        self.assertIn("GITHUB_TOKEN: " + chr(36) + "{{ github.token }}", workflow[classify:])
+        self.assertIn("actions: read", workflow[workflow.index("  verify-live-commit:"):classify])
         convergence_slice = workflow[convergence:live_readback]
         self.assertIn("continue-on-error: true", convergence_slice)
         self.assertIn('"state": "invalid"', convergence_slice)
