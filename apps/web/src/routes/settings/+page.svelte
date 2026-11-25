@@ -89,6 +89,12 @@
               <strong>Meine Garnrolle</strong>
               <span>Profil, Kartenanker und Sichtbarkeit</span>
             </a>
+            {#if $authStore.authenticated}
+              <a href="#meine-gemeinschaften">
+                <strong>Meine Gemeinschaften</strong>
+                <span>Hausgemeinschaften und Einladungen</span>
+              </a>
+            {/if}
             <a href="#benachrichtigungen">
               <strong>Benachrichtigungen</strong>
               <span>Push-Hinweise und dieses Gerät</span>
@@ -134,24 +140,26 @@
             accounts={data.accounts}
             accountsLoadError={data.accountsLoadError}
           />
-          {#if AudienceCircleControls}
-            <AudienceCircleControls
-              selectedAccountId={$authStore.account_id ?? ""}
-            />
-          {:else if circleLoadFailed}
-            <p class="lazy-status" role="alert">
-              Hausgemeinschaften konnten nicht geladen werden.
-              <button
-                class="btn secondary touch-target"
-                type="button"
-                onclick={loadAudienceCircles}>Erneut versuchen</button
-              >
-            </p>
-          {:else}
-            <p class="lazy-status" role="status">
-              Hausgemeinschaften werden geladen …
-            </p>
-          {/if}
+          <div id="meine-gemeinschaften">
+            {#if AudienceCircleControls}
+              <AudienceCircleControls
+                selectedAccountId={$authStore.account_id ?? ""}
+              />
+            {:else if circleLoadFailed}
+              <p class="lazy-status" role="alert">
+                Hausgemeinschaften konnten nicht geladen werden.
+                <button
+                  class="btn secondary touch-target"
+                  type="button"
+                  onclick={loadAudienceCircles}>Erneut versuchen</button
+                >
+              </p>
+            {:else}
+              <p class="lazy-status" role="status">
+                Hausgemeinschaften werden geladen …
+              </p>
+            {/if}
+          </div>
         </section>
 
         <div class="panel notification-card">

@@ -4,6 +4,7 @@
     isSearchOpen,
     searchQuery,
     closeSearch,
+    stageDiscoverySearch,
   } from "$lib/stores/searchStore";
   import { contextPanelOpen } from "$lib/stores/uiView";
   import { activeFilterCount } from "$lib/stores/filterStore";
@@ -161,7 +162,17 @@
     aria-modal="false"
     aria-busy={searchStatus === "loading"}
   >
-    <a href="/commons">Alle Knoten – auch ohne Kartenort</a>
+    <a
+      href="/commons"
+      onclick={(event) => stageDiscoverySearch(event, "commons", $searchQuery)}
+      >Alle Einträge – auch ohne Kartenort</a
+    >
+    {#if hasQuery}
+      <p class="search-note">
+        Hier siehst du Treffer mit Kartenort. In der Liste bleibt dein
+        Suchbegriff erhalten, auch für Einträge ohne Kartenort.
+      </p>
+    {/if}
     <div class="search-box">
       <span class="search-icon" aria-hidden="true">⌕</span>
       <input
