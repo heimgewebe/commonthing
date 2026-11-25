@@ -1,9 +1,13 @@
 <script lang="ts">
-  import { onMount, tick } from "svelte";
+  import { onDestroy, onMount, tick } from "svelte";
+  import { afterNavigate, beforeNavigate, replaceState } from "$app/navigation";
+  import { page } from "$app/stores";
   import { searchNodes } from "$lib/api/search";
   import {
     stageDiscoverySearch,
-    takeDiscoverySearch,
+    enterDiscoveryHistory,
+    rememberDiscoveryHistory,
+    onDiscoveryAccountChange,
   } from "$lib/stores/searchStore";
   import type { Node } from "$lib/map/types";
 
@@ -88,11 +92,42 @@
     resultHeading?.focus();
   }
 
-  onMount(() => {
-    query = takeDiscoverySearch("commons") ?? "";
-    void load();
-    return () => controller?.abort();
+  let discoveryHistoryId: string | undefined;
+  beforeNavigate(() => {
+    rememberDiscoveryHistory(discoveryHistoryId, "commons", query.trim());
   });
+  afterNavigate(({ type }) => {
+    const entry = enterDiscoveryHistory(
+      "commons",
+      $page.state.discoveryHistoryId,
+      type,
+    );
+    discoveryHistoryId = entry.id;
+    if ($page.state.discoveryHistoryId !== entry.id) {
+      replaceState("", { ...$page.state, discoveryHistoryId: entry.id });
+    }
+    query = entry.query ?? "";
+    void load();
+  });
+  onMount(() =>
+    onDiscoveryAccountChange(() => {
+      // The old entry was invalidated. Reset the visible search and renew only
+      // the current entry, never a historical entry from the previous account.
+      query = "";
+      if ($page.route.id !== "/commons") return;
+      if (
+        discoveryHistoryId &&
+        $page.state.discoveryHistoryId === discoveryHistoryId
+      ) {
+        const entry = enterDiscoveryHistory("commons", undefined, "enter");
+        discoveryHistoryId = entry.id;
+        replaceState("", { ...$page.state, discoveryHistoryId: entry.id });
+      }
+      // load aborts the old owner search and immediately clears its results.
+      void load();
+    }),
+  );
+  onDestroy(() => controller?.abort());
 </script>
 
 <svelte:head><title>Knoten · commonThing</title></svelte:head>
