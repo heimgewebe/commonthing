@@ -103,8 +103,21 @@ test("commons uses dedicated public endpoint for every page; search retains owne
       },
     });
   });
-  await page.getByLabel("Knoten suchen").fill("");
-  await page.getByRole("button", { name: "Suchen", exact: true }).click();
+  // One explicit action resets the field, cancels owner-only results and
+  // returns to the independent public list without waiting for its response.
+  await expect(
+    page.getByRole("heading", { name: "Suchergebnisse für „private Commons“" }),
+  ).toBeVisible();
+  await page
+    .getByRole("button", { name: "Alle öffentlichen Einträge" })
+    .click();
+  await expect(page.getByLabel("Knoten suchen")).toHaveValue("");
+  await expect(
+    page.getByRole("heading", { name: "Öffentliche Einträge", exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "Öffentliche Einträge", exact: true }),
+  ).toBeFocused();
   await expect(page.getByRole("status")).toContainText("Knoten werden geladen");
   await expect(
     page.getByRole("link", { name: "Owner's private Commons", exact: true }),
@@ -113,6 +126,59 @@ test("commons uses dedicated public endpoint for every page; search retains owne
   await expect(
     page.getByRole("link", { name: "Public replacement", exact: true }),
   ).toBeVisible();
+
+  // Reset is available during an in-flight search as well.
+  let releaseSearch: () => void = () => {};
+  const heldSearch = new Promise<void>((resolve) => {
+    releaseSearch = resolve;
+  });
+  let searchFinished: () => void = () => {};
+  const finished = new Promise<void>((resolve) => {
+    searchFinished = resolve;
+  });
+  await page.route("**/api/search?**", async (route) => {
+    await heldSearch;
+    try {
+      await route.fulfill({
+        json: {
+          items: [
+            {
+              id: "late-owner",
+              title: "Late private result",
+              kind: "resource",
+            },
+          ],
+          mode: "lexical_fallback",
+          generation_id: "test",
+          offset: 0,
+        },
+      });
+    } catch {
+      // The reset aborts the old request; a cancelled route is expected.
+    } finally {
+      searchFinished();
+    }
+  });
+  await page.getByLabel("Knoten suchen").fill("slow private search");
+  const request = page.waitForRequest(
+    (r) => new URL(r.url()).pathname === "/api/search",
+  );
+  await page.getByRole("button", { name: "Suchen", exact: true }).click();
+  await request;
+  try {
+    await page
+      .getByRole("button", { name: "Alle öffentlichen Einträge" })
+      .click();
+    await expect(
+      page.getByRole("link", { name: "Public replacement", exact: true }),
+    ).toBeVisible();
+  } finally {
+    releaseSearch();
+  }
+  await finished;
+  await expect(
+    page.getByText("Late private result", { exact: true }),
+  ).toHaveCount(0);
 });
 
 test("commons rejects older APIs without the public-only endpoint (no legacy fallback)", async ({
@@ -298,4 +364,61 @@ test("create, search, link, open and edit Commons without a map location", async
   await expect(
     panel.getByText("Commons bearbeitet", { exact: true }).first(),
   ).toBeVisible();
+});
+
+test("explicit map/list switches preserve the search term without putting it into the URL", async ({
+  page,
+}) => {
+  await mockApiResponses(page);
+  const requests: string[] = [];
+  await page.route("**/api/search?**", (route) => {
+    const term = new URL(route.request().url()).searchParams.get("q") ?? "";
+    requests.push(term);
+    return route.fulfill({
+      json: {
+        items: [
+          {
+            id: "discovery-off-map",
+            title: "Digitales Wissen",
+            kind: "resource",
+            summary: "Nicht räumlich verortet",
+            location: null,
+            search_visibility: "public",
+          },
+        ],
+        mode: "lexical_fallback",
+        generation_id: "test",
+        offset: 0,
+      },
+    });
+  });
+
+  await page.goto("/map?lens=search");
+  const mapSearch = page.getByRole("combobox", { name: "Suchbegriff" });
+  await mapSearch.fill("Digitales Wissen");
+  await expect.poll(() => requests.length).toBeGreaterThan(0);
+  await page
+    .getByRole("link", { name: "Alle Einträge – auch ohne Kartenort" })
+    .click();
+  await expect(page).toHaveURL(/\/commons\/?$/);
+  await expect(page.getByLabel("Knoten suchen")).toHaveValue(
+    "Digitales Wissen",
+  );
+  await expect(
+    page.getByRole("link", { name: "Digitales Wissen", exact: true }),
+  ).toBeVisible();
+  await expect
+    .poll(() => requests.filter((q) => q === "Digitales Wissen").length)
+    .toBeGreaterThan(1);
+
+  await page.getByLabel("Knoten suchen").fill("Wissen teilen");
+  await page.getByRole("link", { name: "Karte öffnen", exact: true }).click();
+  await expect(page).toHaveURL(/\/map\?lens=search$/);
+  await expect(mapSearch).toHaveValue("Wissen teilen");
+  await expect.poll(() => requests.includes("Wissen teilen")).toBe(true);
+
+  // A normal menu visit opens the public catalog, not a stale private search.
+  await page.getByTestId("site-menu-trigger").click();
+  await page.getByRole("link", { name: "Alle Einträge", exact: true }).click();
+  await expect(page.getByLabel("Knoten suchen")).toHaveValue("");
 });
