@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import { searchNodes } from "$lib/api/search";
   import {
     stageDiscoverySearch,
@@ -12,8 +12,10 @@
   let cursor: string | null = $state(null);
   let loading = $state(true);
   let error = $state("");
-  let searching = $state(false);
+  let activeQuery = $state("");
+  let searching = $derived(Boolean(activeQuery));
   let controller: AbortController | undefined;
+  let resultHeading: HTMLHeadingElement | undefined = $state();
 
   async function load(more = false) {
     controller?.abort();
@@ -29,7 +31,7 @@
       cursor = null;
     }
     const term = query.trim();
-    searching = Boolean(term);
+    activeQuery = term;
     try {
       let items: Node[];
       let nextCursor: string | null = null;
@@ -79,6 +81,13 @@
     }
   }
 
+  async function resetPublicCatalog() {
+    query = "";
+    void load();
+    await tick();
+    resultHeading?.focus();
+  }
+
   onMount(() => {
     query = takeDiscoverySearch("commons") ?? "";
     void load();
@@ -112,7 +121,15 @@
       bind:value={query}
     />
     <button type="submit" disabled={loading}>Suchen</button>
+    {#if searching || query.trim()}
+      <button type="button" onclick={resetPublicCatalog}
+        >Alle öffentlichen Einträge</button
+      >
+    {/if}
   </form>
+  <h2 tabindex="-1" bind:this={resultHeading}>
+    {searching ? `Suchergebnisse für „${activeQuery}“` : "Öffentliche Einträge"}
+  </h2>
   {#if loading}<p role="status">Knoten werden geladen…</p>{/if}
   {#if error}
     <p role="alert">{error}</p>
