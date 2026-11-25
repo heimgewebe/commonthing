@@ -1674,6 +1674,7 @@ async fn insert_domain_node_in_transaction(
     node: &Node,
     operation: Option<&CreateOperationKey>,
     creator_node_limit: Option<usize>,
+    with_origin_faden: bool,
 ) -> Result<CreateWriteOutcome<Node>, NodeCreateError> {
     let payload = serialize_node_payload(node).map_err(NodeCreateError::Serialization)?;
 
@@ -1760,6 +1761,21 @@ async fn insert_domain_node_in_transaction(
         }
     }
 
+    // Compound node/Faden writes must acquire the existing edge-table lock
+    // before the node INSERT takes the projection singleton via its trigger.
+    // Keep the per-node lock first, matching the existing delete/replay order.
+    if with_origin_faden {
+        sqlx::query("SELECT pg_advisory_xact_lock($1::bigint)")
+            .bind(crate::advisory_lock::node_mutation_lock_key(&node.id))
+            .execute(&mut **tx)
+            .await
+            .map_err(NodeCreateError::Database)?;
+        sqlx::query("LOCK TABLE domain_edges IN EXCLUSIVE MODE")
+            .execute(&mut **tx)
+            .await
+            .map_err(NodeCreateError::Database)?;
+    }
+
     let result = sqlx::query(
         "INSERT INTO domain_nodes \
             (id, kind, title, lat, lon, created_at, updated_at, payload, \
@@ -1797,7 +1813,8 @@ pub async fn insert_domain_node_with_creator_limit(
 ) -> Result<CreateWriteOutcome<Node>, NodeCreateError> {
     let mut tx = pool.begin().await.map_err(NodeCreateError::Database)?;
     let outcome =
-        insert_domain_node_in_transaction(&mut tx, node, operation, creator_node_limit).await;
+        insert_domain_node_in_transaction(&mut tx, node, operation, creator_node_limit, false)
+            .await;
     match outcome {
         Ok(outcome) => {
             tx.commit().await.map_err(NodeCreateError::Database)?;
@@ -2661,6 +2678,7 @@ where
                 conversion.node,
                 Some(conversion.operation),
                 conversion.creator_node_limit,
+                true,
             )
             .await?
             {
@@ -2672,11 +2690,13 @@ where
         }
     };
 
-    sqlx::query("SELECT pg_advisory_xact_lock($1::bigint)")
-        .bind(crate::advisory_lock::node_mutation_lock_key(&node.id))
-        .execute(&mut **tx)
-        .await
-        .map_err(E::Database)?;
+    if !created {
+        sqlx::query("SELECT pg_advisory_xact_lock($1::bigint)")
+            .bind(crate::advisory_lock::node_mutation_lock_key(&node.id))
+            .execute(&mut **tx)
+            .await
+            .map_err(E::Database)?;
+    }
     let expected_edge = edge_for_node(&node.id);
     let edge_operation = edge_operation_for_node(&node.id);
     let edge =
@@ -3256,9 +3276,14 @@ where
                 .map_err(NodeCreateError::Database)?;
         }
 
-        let node_outcome =
-            insert_domain_node_in_transaction(&mut tx, node, Some(operation), creator_node_limit)
-                .await?;
+        let node_outcome = insert_domain_node_in_transaction(
+            &mut tx,
+            node,
+            Some(operation),
+            creator_node_limit,
+            true,
+        )
+        .await?;
         let (actual_node, created) = match node_outcome {
             CreateWriteOutcome::Created => (node.clone(), true),
             CreateWriteOutcome::Existing(existing) => {
@@ -3269,14 +3294,14 @@ where
             }
         };
 
-        sqlx::query("SELECT pg_advisory_xact_lock($1::bigint)")
-            .bind(crate::advisory_lock::node_mutation_lock_key(
-                &actual_node.id,
-            ))
-            .execute(&mut *tx)
-            .await
-            .map_err(NodeCreateError::Database)?;
         if !created {
+            sqlx::query("SELECT pg_advisory_xact_lock($1::bigint)")
+                .bind(crate::advisory_lock::node_mutation_lock_key(
+                    &actual_node.id,
+                ))
+                .execute(&mut *tx)
+                .await
+                .map_err(NodeCreateError::Database)?;
             let node_still_exists: bool =
                 sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM domain_nodes WHERE id = $1)")
                     .bind(&actual_node.id)
