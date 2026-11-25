@@ -1827,7 +1827,6 @@ async fn search_backfill_binary_projects_with_live_local_provider_without_activa
     migrate(&pool).await;
     reset_search_state(&pool).await;
     let node = "t005-backfill-e2e-node";
-    let generation = "t005-backfill-e2e-generation";
     sqlx::query("INSERT INTO domain_nodes (id,kind,title,payload) VALUES ($1,'place','Backfill E2E',$2::jsonb)")
         .bind(node)
         .bind(r#"{"summary":"lokaler Providerpfad"}"#)
@@ -1842,6 +1841,17 @@ async fn search_backfill_binary_projects_with_live_local_provider_without_activa
     let runtime_identity =
         std::env::var("T005_LIVE_OLLAMA_RUNTIME_IDENTITY").expect("runtime identity");
     let dimension = std::env::var("T005_LIVE_OLLAMA_DIMENSION").expect("dimension");
+    let expected_dimension: i32 = dimension.parse().expect("valid dimension");
+    let generation_id = GenerationSpec {
+        generation_id: "derived-below",
+        provider: "local:ollama",
+        model_id: &model_id,
+        model_revision: &model_revision,
+        runtime_identity: &runtime_identity,
+        dimension: expected_dimension,
+    }
+    .derived_id();
+    let generation = generation_id.as_str();
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_search-backfill"))
         .env("DATABASE_URL", &database_url)
@@ -1865,8 +1875,8 @@ async fn search_backfill_binary_projects_with_live_local_provider_without_activa
     assert!(!stdout.contains("Backfill E2E"));
     assert!(!stdout.contains("lokaler Providerpfad"));
 
-    let projection: (i64, String, String) = sqlx::query_as(
-        "SELECT source_version,semantic_state,status FROM search_node_projections WHERE generation_id=$1 AND node_id=$2",
+    let projection: (i64, String, String, Option<i32>) = sqlx::query_as(
+        "SELECT source_version,semantic_state,status,cardinality(embedding) FROM search_node_projections WHERE generation_id=$1 AND node_id=$2",
     )
     .bind(generation)
     .bind(node)
@@ -1876,6 +1886,7 @@ async fn search_backfill_binary_projects_with_live_local_provider_without_activa
     assert_eq!(projection.0, 1);
     assert_eq!(projection.1, "ready");
     assert_eq!(projection.2, "active");
+    assert_eq!(projection.3, Some(expected_dimension));
     let generation_state: String =
         sqlx::query_scalar("SELECT state FROM search_index_generations WHERE generation_id=$1")
             .bind(generation)
