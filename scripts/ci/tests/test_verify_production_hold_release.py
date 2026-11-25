@@ -425,6 +425,78 @@ class HoldReleaseVerificationTests(unittest.TestCase):
         with self.assertRaises(verifier.HoldReleaseError):
             verifier.verify_local_recovery(backup, expected_uid=self.uid, now=now)
 
+
+    def test_recovery_selection_uses_publication_order_and_restore_time(self) -> None:
+        backup = self.root / "backups"
+        backup.mkdir()
+        proofs = backup / "proofs"
+        proofs.mkdir()
+        now = datetime(2026, 11, 25, 4, 0, tzinfo=timezone.utc)
+
+        def publish(label: str, hours: int, sequence: int | None) -> None:
+            stem = "weltgewebe-postgres-" + label
+            data = backup / (stem + ".sql.gz")
+            data.write_bytes(label.encode())
+            record = (
+                "contract=weltgewebe-postgres-backup-v1\n"
+                f"created_at={(now-timedelta(hours=hours)).isoformat()}\n"
+                f"file={data.name}\nsha256={hashlib.sha256(data.read_bytes()).hexdigest()}\n"
+                f"bytes={data.stat().st_size}\n"
+            )
+            if sequence is not None:
+                record += f"publication_sequence={sequence}\n"
+            (backup / (stem + ".sha256.manifest")).write_text(record)
+
+        def restored(label: str, hours: int) -> None:
+            stem = "weltgewebe-postgres-" + label
+            (proofs / (stem + ".restore-proof")).write_text(
+                "contract=weltgewebe-postgres-restore-proof-v1\n"
+                f"created_at={(now-timedelta(hours=hours)).isoformat()}\n"
+                f"backup_file={stem}.sql.gz\nbackup_sha256={'1'*64}\nresult=ok\n"
+            )
+
+        # The previous implementation ignored manual backups and selected proofs
+        # by filename; the older z-label must not strand the current deployment.
+        publish("20261124T000000Z", 28, 1)
+        publish("a-manual", 2, 2)
+        publish("z-legacy", 1, None)
+        restored("z-manual", 240)
+        restored("a-manual", 1)
+        verifier.verify_local_recovery(backup, expected_uid=self.uid, now=now)
+
+        # Publication sequence, not apparent freshness, identifies the latest
+        # completed dump, even when a clock correction has moved time backwards.
+        publish("older-clock", 27, 3)
+        with self.assertRaises(verifier.HoldReleaseError):
+            verifier.verify_local_recovery(backup, expected_uid=self.uid, now=now)
+        publish("older-clock", 1, 3)
+        verifier.verify_local_recovery(backup, expected_uid=self.uid, now=now)
+        publish("duplicate-sequence", 1, 3)
+        with self.assertRaises(verifier.HoldReleaseError):
+            verifier.verify_local_recovery(backup, expected_uid=self.uid, now=now)
+
+    def test_recovery_selection_legacy_manifests_use_recorded_time(self) -> None:
+        backup = self.root / "backups"
+        backup.mkdir()
+        proofs = backup / "proofs"
+        proofs.mkdir()
+        now = datetime(2026, 11, 25, 4, 0, tzinfo=timezone.utc)
+        for label, hours in (("z-old", 40), ("a-current", 1)):
+            stem = "weltgewebe-postgres-" + label
+            data = backup / (stem + ".sql.gz")
+            data.write_bytes(b"backup")
+            stamp = (now-timedelta(hours=hours)).isoformat()
+            sha = hashlib.sha256(data.read_bytes()).hexdigest()
+            (backup / (stem + ".sha256.manifest")).write_text(
+                "contract=weltgewebe-postgres-backup-v1\n"
+                f"created_at={stamp}\nfile={data.name}\nsha256={sha}\nbytes=6\n"
+            )
+            (proofs / (stem + ".restore-proof")).write_text(
+                "contract=weltgewebe-postgres-restore-proof-v1\n"
+                f"created_at={stamp}\nbackup_file={data.name}\nbackup_sha256={sha}\nresult=ok\n"
+            )
+        verifier.verify_local_recovery(backup, expected_uid=self.uid, now=now)
+
     def test_concurrent_operator_revocation_during_admission_leaves_no_effective_grant(self) -> None:
         repo, _ = self.fixture_repo()
         target = self.change(repo, "apps/web/src/new.ts")

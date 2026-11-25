@@ -468,28 +468,63 @@ def verify_local_recovery(backup_root: Path = Path("/var/backups/weltgewebe/post
             raise HoldReleaseError("invalid recovery record")
         return dict(pairs)
 
-    def recent(record: dict[str, str], hours: int) -> bool:
+    def recorded_at(record: dict[str, str]) -> datetime:
         parsed = datetime.fromisoformat(record["created_at"].replace("Z", "+00:00"))
-        return 0 <= (now - parsed).total_seconds() <= hours * 3600
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise HoldReleaseError("recovery record timestamp lacks timezone")
+        return parsed
+
+    def recent(record: dict[str, str], hours: int) -> bool:
+        return 0 <= (now - recorded_at(record)).total_seconds() <= hours * 3600
+
+    def read_named_record(path: Path, suffix: str, file_field: str) -> dict[str, str]:
+        stem = path.name.removesuffix(suffix)
+        if (not re.fullmatch(r"weltgewebe-postgres-[A-Za-z0-9._-]+", stem)
+                or len(stem) > 200 or ".." in stem):
+            raise HoldReleaseError("invalid recovery record name")
+        record = read_record(path)
+        if record.get(file_field) != stem + ".sql.gz":
+            raise HoldReleaseError("recovery record file identity mismatch")
+        return record
 
     try:
-        backups = sorted((path for path in backup_root.glob("weltgewebe-postgres-*.sha256.manifest")
-                          if re.fullmatch(r"weltgewebe-postgres-\d{8}T\d{6}Z\.sha256\.manifest", path.name)),
-                         reverse=True)
-        proofs = sorted((backup_root / "proofs").glob("weltgewebe-postgres-*.restore-proof"), reverse=True)
+        # Match postgres-restore-latest-proof.sh: manual labels are valid,
+        # encrypted siblings are not local completion manifests, and sequence
+        # order wins over wall-clock order whenever a sequence is available.
+        backups = []
+        seen_sequences: set[int] = set()
+        for path in backup_root.glob("weltgewebe-postgres-*.sha256.manifest"):
+            if path.name.endswith(".age.sha256.manifest"):
+                continue
+            record = read_named_record(path, ".sha256.manifest", "file")
+            stamp = recorded_at(record)
+            sequence = record.get("publication_sequence")
+            if sequence is None:
+                order = 0
+            else:
+                if not re.fullmatch(r"[1-9][0-9]{0,17}", sequence):
+                    raise HoldReleaseError("invalid backup publication sequence")
+                order = int(sequence)
+                if order in seen_sequences:
+                    raise HoldReleaseError("duplicate backup publication sequence")
+                seen_sequences.add(order)
+            backups.append((order, stamp, path.name, record))
+        proofs = []
+        for path in (backup_root / "proofs").glob("weltgewebe-postgres-*.restore-proof"):
+            record = read_named_record(path, ".restore-proof", "backup_file")
+            proofs.append((recorded_at(record), path.name, record))
         if not backups or not proofs:
             raise HoldReleaseError("backup or restore evidence absent")
-        backup, proof = read_record(backups[0]), read_record(proofs[0])
-        expected_backup = backups[0].name.replace(".sha256.manifest", ".sql.gz")
-        expected_restored = proofs[0].name.replace(".restore-proof", ".sql.gz")
+        backup = max(backups, key=lambda item: item[:3])[3]
+        # A restore can be run on an older or manually named dump. Its own
+        # recorded observation time, not the dump label, orders restore proof.
+        proof = max(proofs, key=lambda item: item[:2])[2]
         if (backup.get("contract") != "weltgewebe-postgres-backup-v1"
                 or proof.get("contract") != "weltgewebe-postgres-restore-proof-v1"
                 or proof.get("result") != "ok"
                 or not recent(backup, 26) or not recent(proof, 192)
                 or not SHA256.fullmatch(backup.get("sha256", ""))
-                or not SHA256.fullmatch(proof.get("backup_sha256", ""))
-                or backup.get("file") != expected_backup
-                or proof.get("backup_file") != expected_restored):
+                or not SHA256.fullmatch(proof.get("backup_sha256", ""))):
             raise HoldReleaseError("backup or restore evidence is stale or invalid")
         backup_path = backup_root / backup["file"]
         data = backup_path.lstat()
