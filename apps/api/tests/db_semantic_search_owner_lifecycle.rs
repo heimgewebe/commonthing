@@ -69,6 +69,10 @@ struct ForbiddenProvider;
 
 #[async_trait]
 impl EmbeddingProvider for ForbiddenProvider {
+    fn accepts_projection_generation(&self, _generation_id: &str, _dimension: i32) -> bool {
+        true // This test fails if an actual embedding is ever requested.
+    }
+
     async fn embed(
         &self,
         _document: &str,
@@ -209,10 +213,10 @@ async fn candidate_count_as(pool: &PgPool, account: Option<&str>) -> usize {
         .len()
 }
 
-async fn process_one(projection_worker: &ProjectionWorker) {
+async fn process_one(projection_worker: &ProjectionWorker, generation: &str) {
     assert_eq!(
         projection_worker
-            .claim_and_process_one()
+            .claim_and_process_one(generation)
             .await
             .expect("process owner-lifecycle job"),
         ProcessOutcome::Processed
@@ -247,7 +251,7 @@ async fn private_owner_lifecycle_is_account_bound_redacted_and_recoverable() {
         .start_generation(generation_spec)
         .await
         .expect("start owner-lifecycle generation");
-    process_one(&projection_worker).await;
+    process_one(&projection_worker, &generation).await;
 
     let missing_owner = projection(&pool, &generation).await;
     assert_eq!(missing_owner.source_version, 1);
@@ -272,7 +276,7 @@ async fn private_owner_lifecycle_is_account_bound_redacted_and_recoverable() {
         .await
         .expect("create active owner account");
     assert_eq!(owner_candidate_count(&pool).await, 0);
-    process_one(&projection_worker).await;
+    process_one(&projection_worker, &generation).await;
     let active_owner = projection(&pool, &generation).await;
     assert_eq!(active_owner.source_version, 2);
     assert_private(&active_owner);
@@ -477,7 +481,7 @@ async fn private_owner_lifecycle_is_account_bound_redacted_and_recoverable() {
     .expect("attempt direct plaintext restoration");
     assert_redacted(&projection(&pool, &generation).await);
 
-    process_one(&projection_worker).await;
+    process_one(&projection_worker, &generation).await;
     let disabled_owner = projection(&pool, &generation).await;
     assert_eq!(disabled_owner.source_version, 3);
     assert_redacted(&disabled_owner);
@@ -488,7 +492,7 @@ async fn private_owner_lifecycle_is_account_bound_redacted_and_recoverable() {
         .await
         .expect("reactivate owner account");
     assert_eq!(owner_candidate_count(&pool).await, 0);
-    process_one(&projection_worker).await;
+    process_one(&projection_worker, &generation).await;
     let reactivated_owner = projection(&pool, &generation).await;
     assert_eq!(reactivated_owner.source_version, 4);
     assert_private(&reactivated_owner);
@@ -502,7 +506,7 @@ async fn private_owner_lifecycle_is_account_bound_redacted_and_recoverable() {
     let synchronously_deleted = projection(&pool, &generation).await;
     assert_redacted(&synchronously_deleted);
     assert_eq!(owner_candidate_count(&pool).await, 0);
-    process_one(&projection_worker).await;
+    process_one(&projection_worker, &generation).await;
     let deleted_owner = projection(&pool, &generation).await;
     assert_eq!(deleted_owner.source_version, 5);
     assert_redacted(&deleted_owner);
@@ -557,7 +561,12 @@ async fn private_worker_locks_owner_before_projection_state() {
         .await
         .expect("lock node version before worker");
 
-    let worker_task = tokio::spawn(async move { projection_worker.claim_and_process_one().await });
+    let worker_generation = generation.clone();
+    let worker_task = tokio::spawn(async move {
+        projection_worker
+            .claim_and_process_one(&worker_generation)
+            .await
+    });
 
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
