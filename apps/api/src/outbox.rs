@@ -14,6 +14,7 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::PgPool;
+use uuid::Uuid;
 
 use crate::{
     config::{
@@ -42,6 +43,14 @@ pub struct OutboxEvent {
     pub payload: Value,
     pub created_at: DateTime<Utc>,
     pub attempt_count: i32,
+    pub claim_token: Uuid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureDisposition {
+    RetryScheduled,
+    Quarantined,
+    ClaimLost,
 }
 
 #[derive(Debug, Clone, Copy, sqlx::FromRow)]
@@ -400,71 +409,90 @@ pub async fn claim_pending(pool: &PgPool, limit: i64) -> anyhow::Result<Vec<Outb
          ) \
          UPDATE domain_outbox AS event \
             SET attempt_count = event.attempt_count + 1, \
-                available_at = NOW() + make_interval(secs => $2) \
+                available_at = NOW() + make_interval(secs => $2), \
+                claim_token = $3 \
            FROM picked \
           WHERE event.id = picked.id \
          RETURNING event.id, event.aggregate_type, event.aggregate_id, \
-                   event.event_type, event.payload, event.created_at, event.attempt_count",
+                   event.event_type, event.payload, event.created_at, event.attempt_count, event.claim_token",
     )
     .bind(limit)
     .bind(CLAIM_LEASE_SECONDS)
+    .bind(Uuid::new_v4())
     .fetch_all(pool)
     .await
     .context("failed to claim domain outbox events")
 }
 
-pub async fn mark_published(pool: &PgPool, event_id: i64) -> anyhow::Result<()> {
-    sqlx::query(
+/// Complete only the reservation that actually sent the event.
+/// A newer claim can supersede an expired reservation even if its publisher
+/// is still running. A zero-row update is a lost claim, not a database error.
+pub async fn mark_published(pool: &PgPool, event: &OutboxEvent) -> anyhow::Result<bool> {
+    let result = sqlx::query(
         "UPDATE domain_outbox \
-            SET published_at = NOW(), last_error = NULL \
-          WHERE id = $1 AND published_at IS NULL AND quarantined_at IS NULL",
+            SET published_at = NOW(), last_error = NULL, claim_token = NULL \
+          WHERE id = $1 AND published_at IS NULL AND quarantined_at IS NULL \
+            AND claim_token = $2",
     )
-    .bind(event_id)
+    .bind(event.id)
+    .bind(event.claim_token)
     .execute(pool)
     .await
     .context("failed to mark domain outbox event published")?;
-    Ok(())
+    Ok(result.rows_affected() == 1)
 }
 
 pub async fn mark_failed(
     pool: &PgPool,
-    event_id: i64,
-    attempt_count: i32,
+    event: &OutboxEvent,
     error: &str,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<FailureDisposition> {
     let error: String = error.chars().take(2_000).collect();
-    if attempt_count >= MAX_ATTEMPTS {
-        sqlx::query(
+    if event.attempt_count >= MAX_ATTEMPTS {
+        let result = sqlx::query(
             "UPDATE domain_outbox \
-                SET quarantined_at = NOW(), last_error = $2 \
-              WHERE id = $1 AND published_at IS NULL",
+                SET quarantined_at = NOW(), last_error = $3, claim_token = NULL \
+              WHERE id = $1 AND published_at IS NULL AND quarantined_at IS NULL \
+                AND claim_token = $2",
         )
-        .bind(event_id)
+        .bind(event.id)
+        .bind(event.claim_token)
         .bind(&error)
         .execute(pool)
         .await
         .context("failed to quarantine domain outbox event")?;
-        return Ok(true);
+        return Ok(if result.rows_affected() == 1 {
+            FailureDisposition::Quarantined
+        } else {
+            FailureDisposition::ClaimLost
+        });
     }
 
-    let exponent = u32::try_from(attempt_count.clamp(1, 8)).unwrap_or(8);
+    let exponent = u32::try_from(event.attempt_count.clamp(1, 8)).unwrap_or(8);
     let base_delay_seconds = (2_i32.pow(exponent) * 2).min(300);
     // Deterministic per-event jitter prevents many failed events from becoming
     // eligible in the same second while keeping retry timing testable.
-    let jitter_seconds = i32::try_from(event_id.rem_euclid(11)).unwrap_or(0);
+    let jitter_seconds = i32::try_from(event.id.rem_euclid(11)).unwrap_or(0);
     let delay_seconds = (base_delay_seconds + jitter_seconds).min(300);
-    sqlx::query(
+    let result = sqlx::query(
         "UPDATE domain_outbox \
-            SET available_at = NOW() + make_interval(secs => $2), last_error = $3 \
-          WHERE id = $1 AND published_at IS NULL AND quarantined_at IS NULL",
+            SET available_at = NOW() + make_interval(secs => $3), last_error = $4, \
+                claim_token = NULL \
+          WHERE id = $1 AND published_at IS NULL AND quarantined_at IS NULL \
+            AND claim_token = $2",
     )
-    .bind(event_id)
+    .bind(event.id)
+    .bind(event.claim_token)
     .bind(delay_seconds)
     .bind(&error)
     .execute(pool)
     .await
     .context("failed to reschedule domain outbox event")?;
-    Ok(false)
+    Ok(if result.rows_affected() == 1 {
+        FailureDisposition::RetryScheduled
+    } else {
+        FailureDisposition::ClaimLost
+    })
 }
 
 /// Requeue one explicitly quarantined event for a controlled operator retry.
@@ -472,7 +500,7 @@ pub async fn mark_failed(
 pub async fn requeue_quarantined(pool: &PgPool, event_id: i64) -> anyhow::Result<bool> {
     let result = sqlx::query(
         "UPDATE domain_outbox \
-            SET quarantined_at = NULL, attempt_count = 0, available_at = NOW(), last_error = NULL \
+            SET quarantined_at = NULL, attempt_count = 0, available_at = NOW(), last_error = NULL, claim_token = NULL \
           WHERE id = $1 AND published_at IS NULL AND quarantined_at IS NOT NULL",
     )
     .bind(event_id)
@@ -530,44 +558,42 @@ async fn relay_loop(pool: PgPool, context: jetstream::Context) {
             Ok(events) => {
                 for event in events {
                     match publish_event(&context, &event).await {
-                        Ok(()) => {
-                            if let Err(error) = mark_published(&pool, event.id).await {
-                                tracing::error!(
-                                    event_id = event.id,
-                                    error = %error,
-                                    "Published domain event could not be marked complete"
-                                );
-                            }
-                        }
-                        Err(error) => {
-                            match mark_failed(
-                                &pool,
-                                event.id,
-                                event.attempt_count,
-                                &error.to_string(),
-                            )
-                            .await
-                            {
-                                Ok(true) => tracing::error!(
-                                    event_id = event.id,
-                                    attempts = event.attempt_count,
-                                    error = %error,
-                                    "Domain outbox event quarantined"
-                                ),
-                                Ok(false) => tracing::warn!(
-                                    event_id = event.id,
-                                    attempts = event.attempt_count,
-                                    error = %error,
-                                    "Domain outbox publish failed; retry scheduled"
-                                ),
-                                Err(mark_error) => tracing::error!(
-                                    event_id = event.id,
-                                    error = %error,
-                                    mark_error = %mark_error,
-                                    "Domain outbox publish and failure recording both failed"
-                                ),
-                            }
-                        }
+                        Ok(()) => match mark_published(&pool, &event).await {
+                            Ok(true) => {}
+                            Ok(false) => tracing::debug!(
+                                event_id = event.id,
+                                "Published domain event claim was superseded"
+                            ),
+                            Err(error) => tracing::error!(
+                                event_id = event.id,
+                                error = %error,
+                                "Published domain event could not be marked complete"
+                            ),
+                        },
+                        Err(error) => match mark_failed(&pool, &event, &error.to_string()).await {
+                            Ok(FailureDisposition::Quarantined) => tracing::error!(
+                                event_id = event.id,
+                                attempts = event.attempt_count,
+                                error = %error,
+                                "Domain outbox event quarantined"
+                            ),
+                            Ok(FailureDisposition::RetryScheduled) => tracing::warn!(
+                                event_id = event.id,
+                                attempts = event.attempt_count,
+                                error = %error,
+                                "Domain outbox publish failed; retry scheduled"
+                            ),
+                            Ok(FailureDisposition::ClaimLost) => tracing::debug!(
+                                event_id = event.id,
+                                "Ignoring failure from superseded domain event claim"
+                            ),
+                            Err(mark_error) => tracing::error!(
+                                event_id = event.id,
+                                error = %error,
+                                mark_error = %mark_error,
+                                "Domain outbox publish and failure recording both failed"
+                            ),
+                        },
                     }
                 }
             }
