@@ -3674,7 +3674,8 @@ class BackupObservationTests(unittest.TestCase):
     def test_healthy_fresh_proofs_even_after_user_manager_restart(self):
         result = self.observe(self.sources())
         self.assertEqual(result["status"], "HEALTHY")
-        self.assertEqual(set(result["backup_success"]), set(watch.BACKUP_UNITS))
+        self.assertEqual(set(result["backup_success"]),
+                         set(watch.BACKUP_UNITS) | {watch.BACKUP_OFFHOST_PULLED_AT})
 
     def test_all_three_failed_runs_are_actionable_even_with_recent_receipt(self):
         result = self.observe(self.sources(
@@ -3712,7 +3713,9 @@ class BackupObservationTests(unittest.TestCase):
             "backup_daily_unverified", "backup_offhost_unverified",
         })
         self.assertIn("backup_restore_unverified", self.codes(overdue, "P2"))
-        self.assertEqual(overdue["backup_success"], baseline["backup_success"])
+        self.assertEqual(overdue["backup_success"], {
+            name: baseline["backup_success"][name] for name in watch.BACKUP_UNITS
+        })
 
     def test_new_failure_journal_deduplicates_and_no_false_recovery_on_timeout(self):
         import json
@@ -3738,6 +3741,84 @@ class BackupObservationTests(unittest.TestCase):
             recovered = self.observe(self.sources(), previous=prior)
             self.assertEqual(watch.record(recovered, directory), "RECOVERY")
             self.assertEqual(transitions(), ["ALARM", "RECOVERY"])
+
+    def test_manager_restart_cannot_clear_failure_with_same_old_receipt(self):
+        import json
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            baseline = self.observe(self.sources())
+            watch.record(baseline, directory)
+            def prior():
+                return json.loads((directory / "state.json").read_text())["backup_success"]
+            failed = self.observe(self.sources(offhost_result="exit-code"), previous=prior())
+            self.assertEqual(watch.record(failed, directory), "ALARM")
+            original = prior()["backup_offhost"]
+            failure_at = prior()[watch.BACKUP_OFFHOST_FAILURE_AT]
+            self.assertEqual(failure_at, int(NOW.timestamp()))
+
+            later = NOW + timedelta(hours=1)
+            # Empty user-manager exit timestamp and same receipt as before failure.
+            restarted = self.observe(self.sources(), now=later, previous=prior())
+            self.assertIn("backup_offhost_failed", self.codes(restarted))
+            self.assertIsNone(watch.record(restarted, directory))
+            self.assertEqual(prior()[watch.BACKUP_OFFHOST_FAILURE_AT], failure_at)
+            self.assertEqual(prior()["backup_offhost"], original)
+
+            # A successful new transfer of the SAME still fresh dump is sufficient.
+            fresh = self.observe(self.sources(now=later, offhost_age=4, pulled_age=0.5),
+                                 now=later, previous=prior())
+            self.assertEqual(fresh["status"], "HEALTHY")
+            self.assertEqual(watch.record(fresh, directory), "RECOVERY")
+            self.assertNotIn(watch.BACKUP_OFFHOST_FAILURE_AT, prior())
+            self.assertEqual(prior()["backup_offhost"], original)
+            self.assertGreater(prior()[watch.BACKUP_OFFHOST_PULLED_AT], failure_at)
+            events = [json.loads(line)["event"] for line in
+                      (directory / "events.jsonl").read_text().splitlines()]
+            self.assertEqual(events, ["ALARM", "RECOVERY"])
+
+    def test_failure_watermark_survives_lost_evaluation_and_old_state(self):
+        import json
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            baseline = self.observe(self.sources())
+            watch.record(baseline, directory)
+            failed = self.observe(self.sources(offhost_result="exit-code"),
+                                  previous=baseline["backup_success"])
+            # Model the global deadline or persistence fallback after observing failure.
+            del failed["backup_success"]
+            self.assertEqual(watch.record(failed, directory), "ALARM")
+            path = directory / "state.json"
+            state = json.loads(path.read_text())
+            self.assertEqual(state["backup_success"][watch.BACKUP_OFFHOST_FAILURE_AT],
+                             int(NOW.timestamp()))
+
+            # Older/fallback snapshot omitted the marker but retained the incident.
+            del state["backup_success"][watch.BACKUP_OFFHOST_FAILURE_AT]
+            watch.write_json(path, state)
+            later = NOW + timedelta(minutes=10)
+            observed = self.observe(self.sources(), now=later, previous=state["backup_success"])
+            self.assertEqual(observed["status"], "HEALTHY")  # pure observation alone
+            watch.record(observed, directory)
+            self.assertEqual(observed["status"], "ALARM")
+            persisted = json.loads(path.read_text())
+            self.assertIn("backup_offhost_failed", {x[0] for x in persisted["severe"]})
+            self.assertIn(watch.BACKUP_OFFHOST_FAILURE_AT, persisted["backup_success"])
+            events = [json.loads(line)["event"] for line in
+                      (directory / "events.jsonl").read_text().splitlines()]
+            self.assertNotIn("RECOVERY", events)
+
+    def test_new_transfer_of_overdue_dump_does_not_clear_freshness_alarm(self):
+        baseline = self.observe(self.sources(offhost_age=31))
+        failed = self.observe(self.sources(offhost_result="exit-code"),
+                              previous=baseline["backup_success"])
+        later = NOW + timedelta(hours=1)
+        fresh_pull_old_dump = self.observe(
+            self.sources(now=later, offhost_age=32, pulled_age=0.5),
+            now=later, previous=failed["backup_success"],
+        )
+        self.assertIn("backup_offhost_stale", self.codes(fresh_pull_old_dump))
+        self.assertNotIn("backup_offhost_failed", self.codes(fresh_pull_old_dump))
+        self.assertEqual(fresh_pull_old_dump["status"], "ALARM")
 
     def test_backup_observation_never_suppresses_product_alarm(self):
         result = self.observe(self.sources(), product=WatchTests().fixtures(

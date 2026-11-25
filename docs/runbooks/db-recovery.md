@@ -822,6 +822,10 @@ Beim Off-Host-Pull müssen sowohl Dumpdatum als auch Pull-Zeit frisch sein;
 ein frisch geschriebener Receipt für einen alten Dump genügt nicht.
 Ein leerer Exit-Zeitstempel nach Neustart eines Systemd-Managers ist kein
 Erfolgsbeleg. Beim Off-Host-Pull bleibt der dauerhafte Receipt nutzbar.
+Nach einem bestätigten Transferfehler genügt jedoch kein älterer Receipt:
+Der Pull-Zeitpunkt muss nach dem gespeicherten Fehlerzeitpunkt liegen.
+Ein erneuter erfolgreicher Pull derselben noch frischen Sicherungsdatei
+kann die Transferstörung beenden, macht die Sicherungsdatei aber nicht jünger.
 
 Bei kurzzeitig nicht erreichbarem Heim-PC wird der letzte belegte
 Sicherungszeitpunkt nicht durch eine Beobachtungszeit ersetzt. Solange

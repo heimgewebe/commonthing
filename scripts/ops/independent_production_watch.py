@@ -102,6 +102,8 @@ BACKUP_UNITS = {
 }
 BACKUP_PROPERTIES = ("Id", "LoadState", "Result", "ExecMainStatus",
                      "ExecMainExitTimestamp")
+BACKUP_OFFHOST_FAILURE_AT = "backup_offhost_failure_at"
+BACKUP_OFFHOST_PULLED_AT = "backup_offhost_pulled_at"
 for _component in BACKUP_UNITS:
     for _fault in ("failed", "stale", "unverified"):
         P1_UNVERIFIABLE_ON[f"{_component}_{_fault}"] = {f"{_component}_unverified"}
@@ -192,21 +194,25 @@ def _offhost_receipt(raw, now):
     stamps = (int(created.timestamp()), int(pulled.timestamp()))
     if any(_backup_epoch(value, now) is None for value in stamps) or stamps[0] > stamps[1]:
         raise ValueError("invalid off-host receipt chronology")
-    # A freshly rewritten pull receipt cannot make an old dump fresh.
-    return min(stamps)
+    # Dump freshness and transfer completion time are different facts.
+    return stamps
 
 
 def check_backup_health(now, reader, previous, issues):
     """Classify confirmed failures, overdue proofs and unavailable observations.
 
-    Keep only last confirmed completion timestamps in the existing state
-    snapshot. A temporarily unreachable Heim-PC is not a failed backup.
+    Keep last confirmed completion timestamps and the off-host failure
+    watermark in the existing state snapshot. A temporarily unreachable
+    Heim-PC is not a failed backup.
     After the normal interval plus grace, missing proof is itself actionable.
     """
     epoch = int(now.timestamp())
     previous = previous if isinstance(previous, dict) else {}
     success = {name: previous[name] for name in BACKUP_UNITS
                if _backup_epoch(previous.get(name), epoch) is not None}
+    failure_at = _backup_epoch(previous.get(BACKUP_OFFHOST_FAILURE_AT), epoch)
+    if failure_at is not None:
+        success[BACKUP_OFFHOST_FAILURE_AT] = failure_at
 
     def report(name, fault, actual, severity="P1"):
         issues.append({
@@ -252,13 +258,88 @@ def check_backup_health(now, reader, previous, issues):
     try:
         ok, _stamp = _backup_exit(_backup_fields(reader("offhost_unit")), unit)
         if not ok:
+            success[BACKUP_OFFHOST_FAILURE_AT] = max(epoch, failure_at or 0)
             report(name, "failed", "systemd reports a failed transfer")
         else:
-            # A durable pull receipt remains useful across a user-manager restart.
-            confirm(name, _offhost_receipt(reader("offhost_receipt"), epoch))
+            created, pulled = _offhost_receipt(reader("offhost_receipt"), epoch)
+            # A manager restart can reset Result to success without a new run.
+            # The same old receipt cannot clear a confirmed transfer failure.
+            if failure_at is not None and pulled <= failure_at:
+                report(name, "failed", "previous transfer failure has no later successful receipt")
+            else:
+                success.pop(BACKUP_OFFHOST_FAILURE_AT, None)
+                success[BACKUP_OFFHOST_PULLED_AT] = pulled
+                # Re-pulling the same fresh dump can prove transfer recovery,
+                # but must not make the dump itself younger.
+                confirm(name, min(created, pulled))
     except (OSError, ValueError, subprocess.TimeoutExpired):
         unknown(name)
     return success
+
+
+def _preserve_offhost_failure(result, previous, previous_heartbeat, old_severe):
+    """Fail closed if a previously confirmed transfer failure lacks newer proof.
+
+    The ordinary evaluation carries a typed failure watermark. Preserve it
+    also when a later observation or persistence step loses that evaluation
+    result, and when recovering an older incident snapshot without the field.
+    """
+    checked = timestamp(result.get("checked_at_utc"))
+    if checked is None:
+        return
+    epoch = int(checked.timestamp())
+    observed_failure = any(
+        item.get("code") == "backup_offhost_failed" and item.get("severity") == "P1"
+        for item in result.get("issues", []) if isinstance(item, dict)
+    )
+    prior_failure = any(item[0] == "backup_offhost_failed" for item in old_severe)
+    if not observed_failure and not prior_failure:
+        return
+
+    observed = result.get("backup_success")
+    observed = observed if isinstance(observed, dict) else {}
+    old = previous.get("backup_success")
+    old = old if isinstance(old, dict) else {}
+    heartbeat = previous_heartbeat if isinstance(previous_heartbeat, dict) else {}
+    heartbeat_backup = heartbeat.get("backup_success")
+    heartbeat_backup = heartbeat_backup if isinstance(heartbeat_backup, dict) else {}
+    marks = [_backup_epoch(value, epoch) for value in (
+        observed.get(BACKUP_OFFHOST_FAILURE_AT),
+        old.get(BACKUP_OFFHOST_FAILURE_AT) if prior_failure else None,
+        heartbeat_backup.get(BACKUP_OFFHOST_FAILURE_AT) if prior_failure else None,
+    )]
+    marks = [value for value in marks if value is not None]
+    if observed_failure and BACKUP_OFFHOST_FAILURE_AT not in observed:
+        # E.g. the global poll deadline fired after collecting the failure.
+        marks.append(epoch)
+    if prior_failure and not marks:
+        anchor = timestamp(previous.get("checked_at_utc")) or timestamp(
+            heartbeat.get("checked_at_utc")
+        )
+        marks.append(int(anchor.timestamp()) if anchor and anchor <= checked else epoch)
+    failure_at = max(marks, default=epoch)
+    pulled = _backup_epoch(observed.get(BACKUP_OFFHOST_PULLED_AT), epoch)
+    uncertain = {"backup_offhost_unverified", "watcher_execution_failed", "unverifiable_state"}
+    observed_codes = {
+        item.get("code") for item in result.get("issues", []) if isinstance(item, dict)
+    }
+    if (not observed_failure and pulled is not None and pulled > failure_at
+            and not uncertain.intersection(observed_codes)):
+        return
+
+    carried = dict(observed if observed else old)
+    carried[BACKUP_OFFHOST_FAILURE_AT] = failure_at
+    carried.pop(BACKUP_OFFHOST_PULLED_AT, None)
+    result["backup_success"] = carried
+    if prior_failure and not observed_failure and not uncertain.intersection(observed_codes):
+        result["issues"].append({
+            "code": "backup_offhost_unverified",
+            "component": BACKUP_UNITS["backup_offhost"],
+            "actual": "no successful pull receipt after confirmed transfer failure",
+            "expected": "newer successful pull receipt",
+            "source": "heim-pc off-host receipt and systemd",
+            "severity": "P2",
+        })
 
 
 def timestamp(value):
@@ -1535,6 +1616,7 @@ def record(result, directory, *, serialized_poll=False, suppress_transition_even
                         old_severe.append([code, str(issue.get("actual", ""))[:160]])
                         known_codes.add(code)
             old_severe.sort()
+        _preserve_offhost_failure(result, previous, previous_heartbeat, old_severe)
         old_uncertain = previous.get("uncertain")
         old_uncertain = old_uncertain if isinstance(old_uncertain, list) else []
         severe = sorted([x["code"], str(x["actual"])[:160]]
@@ -1973,6 +2055,9 @@ def _persist_cycle(result, directory, *, suppress_transition_event=False):
         completed_main = result.get("main_observation")
         if isinstance(completed_main, dict):
             failure["main_observation"] = completed_main
+        completed_backup = result.get("backup_success")
+        if isinstance(completed_backup, dict):
+            failure["backup_success"] = completed_backup
         # A failed state replace must not turn a confirmed NEW product P1
         # into generic P2 uncertainty. Preserve the observation from this
         # poll even when no prior state.json contains the incident yet.
