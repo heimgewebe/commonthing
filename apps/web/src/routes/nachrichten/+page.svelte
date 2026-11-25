@@ -1,10 +1,13 @@
 <script lang="ts">
-  import { onMount, tick } from "svelte";
+  import { onDestroy, onMount, tick } from "svelte";
   import { goto } from "$app/navigation";
   import { page } from "$app/stores";
   import { authStore } from "$lib/auth/store";
   import type { ConversationMessage } from "$lib/api/nodeConversation";
-  import { NodeConversationApiError } from "$lib/api/nodeConversation";
+  import {
+    compareApiTimestamps,
+    NodeConversationApiError,
+  } from "$lib/api/nodeConversation";
   import {
     DirectMessagesApiError,
     listDirectConversations,
@@ -25,6 +28,9 @@
   let draft = $derived.by(() => (selected ? (drafts[selected.id] ?? "") : ""));
   let loadingInbox = $state(true);
   let loadingConversation = $state(false);
+  let olderCursor: string | null = $state(null);
+  let loadingOlder = $state(false);
+  let olderRequest: AbortController | null = null;
   let sendingByConversation = $state<Record<string, boolean>>({});
   let blockingByConversation = $state<Record<string, boolean>>({});
   let sending = $derived.by(() =>
@@ -78,7 +84,7 @@
     // the same message. Merge by canonical message ID.
     return [...new Map(items.map((item) => [item.id, item])).values()].sort(
       (left, right) =>
-        left.created_at.localeCompare(right.created_at) ||
+        compareApiTimestamps(left.created_at, right.created_at) ||
         left.id.localeCompare(right.id),
     );
   }
@@ -120,6 +126,10 @@
     generation = ++selectionGeneration,
   ): Promise<void> {
     if (generation !== selectionGeneration) return;
+    olderRequest?.abort();
+    olderRequest = null;
+    olderCursor = null;
+    loadingOlder = false;
     selected = conversation;
     messages = [];
     loadingConversation = true;
@@ -128,6 +138,7 @@
       const response = await listDirectMessages(conversation.id);
       if (generation !== selectionGeneration) return;
       messages = sortMessages([...response.items, ...messages]);
+      olderCursor = response.page.has_more ? response.page.next_cursor : null;
       const newestLoadedMessage = messages.at(-1);
       if (newestLoadedMessage) {
         await markDirectConversationRead(
@@ -144,6 +155,7 @@
           conversation),
         unread_count: 0,
       };
+      loadingConversation = false;
       await scrollToNewest(generation);
     } catch (cause) {
       if (generation === selectionGeneration) {
@@ -155,6 +167,71 @@
       }
     }
   }
+
+  async function loadOlder(): Promise<void> {
+    if (!selected || !olderCursor || loadingOlder || loadingConversation)
+      return;
+
+    const conversationId = selected.id;
+    const cursor = olderCursor;
+    const generation = selectionGeneration;
+    const controller = new AbortController();
+    olderRequest = controller;
+    loadingOlder = true;
+    error = "";
+
+    const isCurrent = () =>
+      olderRequest === controller &&
+      generation === selectionGeneration &&
+      selected?.id === conversationId &&
+      !controller.signal.aborted;
+
+    try {
+      const response = await listDirectMessages(
+        conversationId,
+        cursor,
+        controller.signal,
+      );
+      if (!isCurrent()) return;
+
+      const nextCursor = response.page.has_more
+        ? response.page.next_cursor
+        : null;
+      if (response.page.has_more && (!nextCursor || nextCursor === cursor)) {
+        throw new Error("Invalid continuation cursor");
+      }
+
+      // Retain the position of existing content, even when the load button
+      // disappears or an overlapping page contains an already loaded message.
+      const list = messageList;
+      const anchor = list?.querySelector<HTMLElement>("article.message");
+      const previousTop = anchor?.getBoundingClientRect().top;
+      messages = sortMessages([...response.items, ...messages]);
+      olderCursor = nextCursor;
+      await tick();
+      if (
+        isCurrent() &&
+        list &&
+        messageList === list &&
+        anchor?.isConnected &&
+        previousTop !== undefined
+      ) {
+        list.scrollTop += anchor.getBoundingClientRect().top - previousTop;
+      }
+    } catch (cause) {
+      if (isCurrent()) error = describeError(cause);
+    } finally {
+      if (olderRequest === controller) {
+        olderRequest = null;
+        loadingOlder = false;
+      }
+    }
+  }
+
+  onDestroy(() => {
+    olderRequest?.abort();
+    olderRequest = null;
+  });
 
   async function startConversation(accountId: string): Promise<void> {
     if (!$authStore.authenticated || accountId === $authStore.account_id)
@@ -442,7 +519,19 @@
             {:else if messages.length === 0}
               <p class="muted">Noch keine Nachricht.</p>
             {:else}
-              {#each messages as message}
+              {#if olderCursor}
+                <button
+                  type="button"
+                  class="quiet load-older"
+                  onclick={loadOlder}
+                  disabled={loadingOlder}
+                >
+                  {loadingOlder
+                    ? "Lade ältere Nachrichten…"
+                    : "Ältere Nachrichten laden"}
+                </button>
+              {/if}
+              {#each messages as message (message.id)}
                 <article
                   class="message"
                   class:own={message.author_account_id ===
@@ -720,6 +809,7 @@
   }
 
   .message-list {
+    max-height: min(58vh, 42rem);
     overflow-y: auto;
     display: flex;
     flex-direction: column;
@@ -727,7 +817,13 @@
     padding: 0.25rem;
   }
 
+  .load-older {
+    align-self: center;
+    flex-shrink: 0;
+  }
+
   .message {
+    flex-shrink: 0;
     max-width: min(78%, 38rem);
     align-self: flex-start;
     padding: 0.7rem 0.8rem;
