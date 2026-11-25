@@ -321,6 +321,8 @@ class HoldReleaseVerificationTests(unittest.TestCase):
         for path in ("apps/api/src/main.rs", ".github/workflows/ci.yml",
                      "apps/web/package.json", "scripts/ops/anything.sh",
                      "apps/web/src/lib/auth/store.ts", "apps/web/src/hooks.client.ts",
+                     "apps/web/src/lib/components/topBarAuthState.ts",
+                     "apps/web/src/lib/components/TopBar.svelte",
                      "infra/schauwerk-editor/release-lock.json"):
             with self.subTest(path=path):
                 subprocess.run(["git", "-C", str(repo), "reset", "--hard", base],

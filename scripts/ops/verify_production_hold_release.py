@@ -394,7 +394,9 @@ def verify_routine_source(repository: Path, grant: dict[str, object], target: st
         if (path.startswith((b"apps/web/src/lib/auth/", b"apps/web/src/routes/auth/",
                              b"apps/web/src/routes/login/", b"apps/web/src/routes/_dev/auth/"))
                 or path in (b"apps/web/src/hooks.client.ts", b"apps/web/src/service-worker.ts",
-                            b"apps/web/src/lib/components/TopBarAuth.svelte")):
+                            b"apps/web/src/lib/components/TopBarAuth.svelte",
+                            b"apps/web/src/lib/components/topBarAuthState.ts",
+                            b"apps/web/src/lib/components/TopBar.svelte")):
             raise HoldReleaseError("routine release changes authentication-sensitive code")
         if not (path.startswith((b"apps/web/src/", b"apps/web/tests/"))
                 or path == b"policies/performance.v1.json"):
