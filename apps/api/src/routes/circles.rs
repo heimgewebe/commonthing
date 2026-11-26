@@ -15,6 +15,7 @@ use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::{
+    auth::rate_limit::RateLimitError,
     config::{DomainAccountWriteSource, DomainReadSource},
     middleware::auth::AuthContext,
     state::ApiState,
@@ -134,6 +135,42 @@ fn require_pool(state: &ApiState) -> Result<&PgPool, ApiError> {
         StatusCode::SERVICE_UNAVAILABLE,
         "audience circles require PostgreSQL".to_owned(),
     ))
+}
+
+/// Spends one invitation from the inviter's account and pair budgets. Checked
+/// before the invitee lookup, so probing for account ids costs budget as well.
+async fn spend_invitation_budget(
+    state: &ApiState,
+    inviter: &str,
+    invitee: &str,
+) -> Result<(), Response> {
+    match state
+        .rate_limiter
+        .check_circle_invitation(inviter, invitee)
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(RateLimitError::CircleInvitationLimited { retry_after }) => Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            [
+                (
+                    header::RETRY_AFTER,
+                    retry_after.as_secs().max(1).to_string(),
+                ),
+                (header::CACHE_CONTROL, "private, no-store".to_owned()),
+            ],
+            "circle invitation rate limit exceeded",
+        )
+            .into_response()),
+        Err(error) => {
+            tracing::error!(%error, "circle invitation rate-limit backend unavailable");
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "circle invitation rate limit unavailable",
+            )
+                .into_response())
+        }
+    }
 }
 
 fn no_store<T: Serialize>(body: T) -> Response {
@@ -289,6 +326,9 @@ pub async fn create_circle(
     let actor = require_actor(&auth)?;
     let (kind, name, invited) = input.validate(actor)?;
     let pool = require_pool(&state)?;
+    if let Err(limited) = spend_invitation_budget(&state, actor, invited).await {
+        return Ok(limited);
+    }
     if !account_exists(pool, invited).await? {
         return Err((
             StatusCode::NOT_FOUND,
@@ -452,6 +492,9 @@ pub async fn invite_account(
         return Err(bad_request("invitee must be a different account"));
     }
     let pool = require_pool(&state)?;
+    if let Err(limited) = spend_invitation_budget(&state, actor, invited).await {
+        return Ok(limited);
+    }
     if !account_exists(pool, invited).await? {
         return Err((
             StatusCode::NOT_FOUND,
