@@ -362,6 +362,98 @@ test.describe("Map URL addressing", () => {
     ).toHaveCount(0);
   });
 
+  test("refreshes the same bbox after route data changes during initial loading", async ({
+    page,
+  }) => {
+    const bboxes: string[] = [];
+    let resolveFirstSeen!: () => void;
+    let releaseFirst!: () => void;
+    const firstSeen = new Promise<void>((resolve) => {
+      resolveFirstSeen = resolve;
+    });
+    const firstRelease = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+
+    await page.route("**/api/nodes*", async (route) => {
+      const request = route.request();
+      const url = new URL(request.url());
+      const bbox = url.searchParams.get("bbox");
+      if (
+        request.method() !== "GET" ||
+        url.pathname !== "/api/nodes" ||
+        !bbox
+      ) {
+        await route.fallback();
+        return;
+      }
+      bboxes.push(bbox);
+      const isInitial = bboxes.length === 1;
+      if (isInitial) {
+        resolveFirstSeen();
+        await firstRelease;
+      }
+      const node = {
+        id: isInitial ? "stale-same-bbox-node" : "fresh-same-bbox-node",
+        title: isInitial ? "Old viewport data" : "New viewport data",
+        kind: "Event",
+        location: { lat: 51.1657, lon: 10.4515 },
+        summary: "Same camera, different data revision.",
+        tags: [],
+        modules: [],
+        created_at: "2025-01-01T12:00:00Z",
+        updated_at: "2025-01-01T12:00:00Z",
+      };
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(mockListResponse(request.url(), [node])),
+      });
+    });
+
+    try {
+      await page.goto("/map", { waitUntil: "domcontentloaded" });
+      await firstSeen;
+      await page.waitForFunction(() => Boolean((window as any).__TEST_MAP__));
+      // Use the real SvelteKit link navigation on the mounted page. A changed
+      // route-resource snapshot must invalidate the data, even at the same
+      // camera position. No production test-only invalidation hook is needed.
+      await page.evaluate(() => {
+        (window as any).__TEST_INITIAL_MAP__ = (window as any).__TEST_MAP__;
+        const link = document.createElement("a");
+        link.href = "/map?lens=filter";
+        document.body.append(link);
+        link.click();
+        link.remove();
+      });
+      await expect(page).toHaveURL(/\/map\?lens=filter$/);
+      await expect(page.getByTestId("filter-overlay")).toBeVisible();
+      await settleViewportUpdates(page);
+      expect(
+        await page.evaluate(
+          () =>
+            (window as any).__TEST_MAP__ ===
+            (window as any).__TEST_INITIAL_MAP__,
+        ),
+      ).toBe(true);
+      expect(bboxes).toHaveLength(1);
+    } finally {
+      releaseFirst();
+    }
+
+    await expect
+      .poll(() => bboxes.length, { timeout: 10_000 })
+      .toBeGreaterThanOrEqual(2);
+    expect(bboxes[1]).toBe(bboxes[0]);
+    await waitForMapReady(page);
+    await expect(
+      page.locator('.map-marker[data-id="fresh-same-bbox-node"]'),
+    ).toHaveCount(1);
+    await expect(
+      page.locator('.map-marker[data-id="stale-same-bbox-node"]'),
+    ).toHaveCount(0);
+  });
+
   test("aborts an older active viewport request and ignores its late response", async ({
     page,
   }) => {
