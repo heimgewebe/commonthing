@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy, onMount, tick } from "svelte";
+  import { onDestroy, onMount, tick, untrack } from "svelte";
   import { goto } from "$app/navigation";
   import { page } from "$app/stores";
   import { authStore } from "$lib/auth/store";
@@ -44,6 +44,18 @@
   let handledRecipient: string | null = $state(null);
   let messageList: HTMLElement | null = $state(null);
   let selectionGeneration = 0;
+  let accountGeneration = 0;
+  let boundAccount: string | null | undefined;
+  let authChecked = $state(false);
+
+  function accountIsCurrent(generation: number): boolean {
+    return (
+      generation === accountGeneration &&
+      $authStore.authenticated &&
+      !!boundAccount &&
+      $authStore.account_id === boundAccount
+    );
+  }
 
   function describeError(cause: unknown): string {
     if (
@@ -100,18 +112,22 @@
   }
 
   async function refreshInbox(): Promise<void> {
+    const account = accountGeneration;
+    if (!accountIsCurrent(account)) return;
     loadingInbox = true;
     error = "";
     try {
-      conversations = await listDirectConversations();
+      const items = await listDirectConversations();
+      if (!accountIsCurrent(account)) return;
+      conversations = items;
       if (selected) {
         selected =
           conversations.find((item) => item.id === selected?.id) ?? selected;
       }
     } catch (cause) {
-      error = describeError(cause);
+      if (accountIsCurrent(account)) error = describeError(cause);
     } finally {
-      loadingInbox = false;
+      if (accountIsCurrent(account)) loadingInbox = false;
     }
   }
 
@@ -125,7 +141,9 @@
     conversation: DirectConversation,
     generation = ++selectionGeneration,
   ): Promise<void> {
-    if (generation !== selectionGeneration) return;
+    const account = accountGeneration;
+    if (!accountIsCurrent(account) || generation !== selectionGeneration)
+      return;
     olderRequest?.abort();
     olderRequest = null;
     olderCursor = null;
@@ -136,7 +154,8 @@
     error = "";
     try {
       const response = await listDirectMessages(conversation.id);
-      if (generation !== selectionGeneration) return;
+      if (!accountIsCurrent(account) || generation !== selectionGeneration)
+        return;
       messages = sortMessages([...response.items, ...messages]);
       olderCursor = response.page.has_more ? response.page.next_cursor : null;
       const newestLoadedMessage = messages.at(-1);
@@ -146,6 +165,7 @@
           newestLoadedMessage.id,
         );
       }
+      if (!accountIsCurrent(account)) return;
       conversations = conversations.map((item) =>
         item.id === conversation.id ? { ...item, unread_count: 0 } : item,
       );
@@ -158,11 +178,11 @@
       loadingConversation = false;
       await scrollToNewest(generation);
     } catch (cause) {
-      if (generation === selectionGeneration) {
+      if (accountIsCurrent(account) && generation === selectionGeneration) {
         error = describeError(cause);
       }
     } finally {
-      if (generation === selectionGeneration) {
+      if (accountIsCurrent(account) && generation === selectionGeneration) {
         loadingConversation = false;
       }
     }
@@ -175,6 +195,8 @@
     const conversationId = selected.id;
     const cursor = olderCursor;
     const generation = selectionGeneration;
+    const account = accountGeneration;
+    if (!accountIsCurrent(account)) return;
     const controller = new AbortController();
     olderRequest = controller;
     loadingOlder = true;
@@ -182,6 +204,7 @@
 
     const isCurrent = () =>
       olderRequest === controller &&
+      accountIsCurrent(account) &&
       generation === selectionGeneration &&
       selected?.id === conversationId &&
       !controller.signal.aborted;
@@ -229,17 +252,21 @@
   }
 
   onDestroy(() => {
+    accountGeneration += 1;
+    selectionGeneration += 1;
     olderRequest?.abort();
     olderRequest = null;
   });
 
   async function startConversation(accountId: string): Promise<void> {
-    if (!$authStore.authenticated || accountId === $authStore.account_id)
+    const account = accountGeneration;
+    if (!accountIsCurrent(account) || accountId === $authStore.account_id)
       return;
     const generation = ++selectionGeneration;
     error = "";
     try {
       const conversation = await openDirectConversation(accountId);
+      if (!accountIsCurrent(account)) return;
       const existingIndex = conversations.findIndex(
         (item) => item.id === conversation.id,
       );
@@ -253,23 +280,32 @@
       }
       if (!isCurrentSelection) return;
       await selectConversation(conversation, generation);
-      if (generation !== selectionGeneration) return;
+      if (!accountIsCurrent(account) || generation !== selectionGeneration)
+        return;
       await goto(`/nachrichten?id=${encodeURIComponent(conversation.id)}`, {
         replaceState: true,
         keepFocus: true,
         noScroll: true,
       });
     } catch (cause) {
-      if (generation === selectionGeneration) {
+      if (accountIsCurrent(account) && generation === selectionGeneration) {
         error = describeError(cause);
       }
     }
   }
 
   async function send(): Promise<void> {
+    const account = accountGeneration;
     const submittedDraft = draft;
     const content = submittedDraft.trim();
-    if (!selected || !content || sending || !selected.can_send) return;
+    if (
+      !accountIsCurrent(account) ||
+      !selected ||
+      !content ||
+      sending ||
+      !selected.can_send
+    )
+      return;
     const conversationId = selected.id;
     sendingByConversation[conversationId] = true;
     error = "";
@@ -279,6 +315,7 @@
         content,
         crypto.randomUUID(),
       );
+      if (!accountIsCurrent(account)) return;
       if (created.conversation_id !== conversationId) {
         throw new Error("Message response belongs to a different conversation");
       }
@@ -290,32 +327,38 @@
       conversations = conversations
         .map((item) =>
           item.id === conversationId &&
-          (!item.last_message_at || item.last_message_at <= created.created_at)
+          (!item.last_message_at ||
+            compareApiTimestamps(item.last_message_at, created.created_at) <= 0)
             ? {
                 ...item,
                 last_message_preview: preview,
                 last_message_at: created.created_at,
                 updated_at:
-                  item.updated_at > created.created_at
+                  compareApiTimestamps(item.updated_at, created.created_at) > 0
                     ? item.updated_at
                     : created.created_at,
               }
             : item,
         )
-        .sort((left, right) => right.updated_at.localeCompare(left.updated_at));
+        .sort((left, right) =>
+          compareApiTimestamps(right.updated_at, left.updated_at),
+        );
       if (selected?.id === conversationId) {
         messages = sortMessages([...messages, created]);
         await scrollToNewest(selectionGeneration);
       }
     } catch (cause) {
-      if (selected?.id === conversationId) error = describeError(cause);
+      if (accountIsCurrent(account) && selected?.id === conversationId)
+        error = describeError(cause);
     } finally {
-      delete sendingByConversation[conversationId];
+      if (accountIsCurrent(account))
+        delete sendingByConversation[conversationId];
     }
   }
 
   async function toggleBlock(): Promise<void> {
-    if (!selected || changingBlock) return;
+    const account = accountGeneration;
+    if (!accountIsCurrent(account) || !selected || changingBlock) return;
     const conversationId = selected.id;
     const blocked = !selected.blocked_by_me;
     blockingByConversation[conversationId] = true;
@@ -325,6 +368,7 @@
         conversationId,
         blocked,
       );
+      if (!accountIsCurrent(account)) return;
       if (updated.id !== conversationId) {
         throw new Error("Block response belongs to a different conversation");
       }
@@ -347,9 +391,11 @@
         };
       }
     } catch (cause) {
-      if (selected?.id === conversationId) error = describeError(cause);
+      if (accountIsCurrent(account) && selected?.id === conversationId)
+        error = describeError(cause);
     } finally {
-      delete blockingByConversation[conversationId];
+      if (accountIsCurrent(account))
+        delete blockingByConversation[conversationId];
     }
   }
 
@@ -367,8 +413,39 @@
     }
 
     await authStore.checkAuth();
-    if ($authStore.authenticated) {
+    authChecked = true;
+  });
+
+  // The mounted inbox can survive a server-authorized account switch.
+  // Clear account-private state synchronously before fetching another inbox.
+  function bindAccount(owner: string | null): void {
+    const switching = boundAccount !== undefined;
+    boundAccount = owner;
+    const account = ++accountGeneration;
+    selectionGeneration += 1;
+    olderRequest?.abort();
+    olderRequest = null;
+    conversations = [];
+    selected = null;
+    messages = [];
+    drafts = {};
+    sendingByConversation = {};
+    blockingByConversation = {};
+    olderCursor = null;
+    loadingOlder = false;
+    loadingConversation = false;
+    error = "";
+    initialized = false;
+    // A recipient URL left over from another account is not a new intent.
+    if (switching) handledRecipient = $page.url.searchParams.get("mit");
+    if (!owner) {
+      loadingInbox = false;
+      initialized = true;
+      return;
+    }
+    void (async () => {
       await refreshInbox();
+      if (!accountIsCurrent(account)) return;
       const requestedId = $page.url.searchParams.get("id");
       if (requestedId) {
         const conversation = conversations.find(
@@ -376,10 +453,16 @@
         );
         if (conversation) await selectConversation(conversation);
       }
-    } else {
-      loadingInbox = false;
-    }
-    initialized = true;
+      if (accountIsCurrent(account)) initialized = true;
+    })();
+  }
+
+  $effect.pre(() => {
+    const owner = $authStore.authenticated
+      ? ($authStore.account_id ?? null)
+      : null;
+    if (!authChecked || boundAccount === owner) return;
+    untrack(() => bindAccount(owner));
   });
   let requestedRecipient = $derived($page.url.searchParams.get("mit"));
   $effect.pre(() => {
