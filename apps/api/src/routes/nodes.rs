@@ -1631,7 +1631,7 @@ pub async fn create_node(
 
             edges.remove(&outcome.edge.id);
             if let Some(edge) = canonical_edge.as_ref() {
-                edges.insert(edge.id.clone(), edge.clone());
+                super::edges::publish_edge_to_cache(&mut edges, edge.clone(), chrono::Utc::now());
             }
             nodes.remove(&outcome.node.id);
             if let Some(node) = canonical_node.as_ref() {

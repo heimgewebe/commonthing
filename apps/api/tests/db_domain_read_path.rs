@@ -2210,3 +2210,34 @@ async fn public_proposal_http_read_fences_target_visibility_through_response() {
         .expect("clean proposal fixture before deleting target");
     clean(&pool).await;
 }
+
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn expired_history_is_not_streamed_but_future_and_undated_faden_are_retained() {
+    let pool = prepare_pool().await;
+    let _limit = EnvGuard::set("MAX_EDGES_CACHE", "2");
+    sqlx::query(
+        "INSERT INTO domain_edges (id,source_id,target_id,edge_kind,created_at,payload)
+         VALUES
+           ('rp-edge-a','rp-node-a','rp-node-b','relates',TIMESTAMPTZ '2020-01-01T00:00:00Z','{}'),
+           ('rp-edge-b','rp-node-a','rp-node-b','relates',TIMESTAMPTZ '2020-01-01T00:00:00Z','{\"expires_at\":\"2020-01-08T00:00:00Z\"}'),
+           ('rp-edge-c','rp-node-a','rp-node-b','relates',NOW()+INTERVAL '1 day','{}'),
+           ('rp-edge-d','rp-node-a','rp-node-b','relates',NULL,'{}')",
+    ).execute(&pool).await.expect("seed mixed lifecycle rows");
+    let (cache, received) = load_edges_from_postgres_counted(&pool)
+        .await
+        .expect("load eligible projections");
+    assert_eq!(
+        cache_ids(&cache),
+        vec!["rp-edge-c".to_string(), "rp-edge-d".to_string()]
+    );
+    assert_eq!(received, 2, "expired history should not stream payloads");
+    let durable: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM domain_edges WHERE id LIKE 'rp-edge-%'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(durable, 4);
+    clean(&pool).await;
+}

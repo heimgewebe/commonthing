@@ -1859,3 +1859,69 @@ async fn postgres_edges_reject_node_references_missing_from_cache() -> Result<()
     );
     Ok(())
 }
+
+#[tokio::test]
+#[serial]
+async fn expired_faden_history_frees_capacity_without_reusing_identity_jsonl() -> Result<()> {
+    const OPERATION_ID: &str = "20000000-0000-0000-0000-000000000011";
+    let tmp = make_tmp_dir();
+    let in_dir = tmp.path().join("in");
+    fs::create_dir_all(&in_dir)?;
+    let edges_path = in_dir.join("demo.edges.jsonl");
+    let _env = set_gewebe_in_dir(&in_dir);
+    let _limit = EnvGuard::set("MAX_EDGES_CACHE", "1");
+    let (app, cookie, _) = app_with_session(Role::Weber, DomainReadSource::Jsonl).await?;
+    let request_body = format!(
+        r#"{{"source_id":"{CREATE_SOURCE_ID}","source_type":"node","target_id":"{CREATE_TARGET_ID}","target_type":"node","edge_kind":"reference","operation_id":"{OPERATION_ID}"}}"#
+    );
+    let first = app
+        .oneshot(post_edges(Some(&cookie), &request_body))
+        .await?;
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let first = read_json_body(first).await?;
+    let id = first["id"].as_str().context("original edge id")?;
+    let mut history = jsonl_lines(&edges_path).remove(0);
+    history["created_at"] = serde_json::json!("2020-01-01T00:00:00Z");
+    history["expires_at"] = serde_json::json!("2020-01-08T00:00:00Z");
+    let historical_line = serde_json::to_string(&history)?;
+    write_lines(&edges_path, &[historical_line.as_str()]);
+
+    let (app, cookie, state) = app_with_session(Role::Weber, DomainReadSource::Jsonl).await?;
+    assert_eq!(
+        state.edges.read().await.len(),
+        0,
+        "expired history must not occupy the only slot"
+    );
+    let created = app
+        .clone()
+        .oneshot(post_edges(Some(&cookie), &valid_create_body()))
+        .await?;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let active = read_json_body(created).await?;
+    let replay = app
+        .clone()
+        .oneshot(post_edges(Some(&cookie), &request_body))
+        .await?;
+    assert_eq!(replay.status(), StatusCode::OK);
+    assert_eq!(read_json_body(replay).await?["id"], id);
+    let duplicate = format!(
+        r#"{{"id":"{id}","source_id":"{CREATE_SOURCE_ID}","source_type":"node","target_id":"{CREATE_TARGET_ID}","target_type":"node","edge_kind":"reference"}}"#
+    );
+    assert_eq!(
+        app.oneshot(post_edges(Some(&cookie), &duplicate))
+            .await?
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let records = jsonl_lines(&edges_path);
+    assert_eq!(records.len(), 2);
+    assert_eq!(
+        records[0], history,
+        "historical record must remain untouched"
+    );
+    let cache = state.edges.read().await;
+    assert_eq!(cache.len(), 1);
+    assert!(cache.get(id).is_none());
+    assert!(cache.get(active["id"].as_str().unwrap()).is_some());
+    Ok(())
+}

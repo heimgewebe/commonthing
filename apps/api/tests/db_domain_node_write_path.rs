@@ -6577,3 +6577,52 @@ async fn domain_edge_lock_order_guest_exit() -> Result<()> {
     clean_all_nodes(&pool).await;
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
+#[serial]
+async fn expired_origin_faden_replay_preserves_node_and_does_not_reoccupy_capacity() -> Result<()> {
+    const ACTOR_ID: &str = "20000000-0000-4000-8000-000000000097";
+    let pool = connect_pool().await;
+    run_migrations(&pool).await;
+    clean_all_nodes(&pool).await;
+    let _limit = EnvVarGuard::set("MAX_EDGES_CACHE", "1");
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+    let first_body = r#"{"title":"Historischer Knoten","kind":"place","operation_id":"30000000-0000-4000-8000-000000000097"}"#;
+    let (app, cookie, _) = postgres_write_app(pool.clone(), ACTOR_ID).await?;
+    let response = app.oneshot(post_node_req(&cookie, first_body)).await?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let node: serde_json::Value =
+        serde_json::from_slice(&body::to_bytes(response.into_body(), usize::MAX).await?)?;
+    let id = node["id"].as_str().context("first node id")?;
+    let old_edge_id: String = sqlx::query_scalar(
+        "UPDATE domain_edges SET created_at=TIMESTAMPTZ '2020-01-01T00:00:00Z', payload=payload-'expires_at' WHERE target_id=$1 RETURNING id"
+    ).bind(id).fetch_one(&pool).await?;
+    let (app, cookie, state) = postgres_write_app(pool.clone(), ACTOR_ID).await?;
+    assert!(state.edges.read().await.is_empty());
+    let next_body = r#"{"title":"Neuer Knoten","kind":"place","operation_id":"30000000-0000-4000-8000-000000000098"}"#;
+    let response = app
+        .clone()
+        .oneshot(post_node_req(&cookie, next_body))
+        .await?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let replay = app.oneshot(post_node_req(&cookie, first_body)).await?;
+    assert_eq!(replay.status(), StatusCode::OK);
+    let node: serde_json::Value =
+        serde_json::from_slice(&body::to_bytes(replay.into_body(), usize::MAX).await?)?;
+    assert_eq!(node["id"], id);
+    let cache = state.edges.read().await;
+    assert_eq!(cache.len(), 1);
+    assert!(cache.get(&old_edge_id).is_none());
+    drop(cache);
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM domain_edges WHERE source_id=$1")
+        .bind(ACTOR_ID)
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(count, 2, "both durable Faden identities must survive");
+    clean_all_nodes(&pool).await;
+    Ok(())
+}

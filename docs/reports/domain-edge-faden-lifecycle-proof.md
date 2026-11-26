@@ -266,3 +266,34 @@ bestanden), `cargo clippy --all-targets -- -D warnings` und
   darstellt.
 - Remote-CI- und Live-Evidence werden nach PR und Merge ergänzt; dieser Bericht
   behauptet bis dahin ausschließlich den lokal reproduzierten Stand.
+
+## Revalidierung 2026-11-26: aktive Kapazität statt historischer Zeilenzahl
+
+Die frühere Entscheidung gegen das Ausschließen abgelaufener Zeilen aus dem
+Cache (Revalidierung 2026-07-30) ist durch den nun vollständigen persistenten
+Duplicate-ID-/Operationsscan und die PostgreSQL-Identitätsprüfung überholt.
+Historische Zeilen bleiben unverändert gespeichert und für Replays verfügbar;
+sie belegen nach Ablauf keinen aktiven Cache-Slot mehr. Zukünftige und
+vollständig undatierte, gültige Projektionen behalten ihren Slot.
+
+- Ein gemeinsames Zulassungsprädikat begrenzt JSONL-Laden, PostgreSQL-Laden
+  und Cache-Publikation. PostgreSQL filtert abgelaufene Zeilen vor dem
+  Payload-Streaming über den typisierten Zeitstempel und die kanonische
+  168-Stunden-Frist. Die bestehende konservative Zählung nicht sicher
+  interpretierbarer Payload-Zeitstrings bleibt erhalten.
+- Neuaufnahme und Reaktivierung prüfen dieselbe persistente Kapazität unter
+  derselben Schreibserialisierung; eine bereits zugelassene Identität kann
+  ihren eigenen Platz wiederverwenden. Replays abgelaufener Ergebnisse
+  verdrängen keine neueren aktiven Projektionen. Keine Datenlöschung,
+  Schemamigration oder Änderung des Lebenszyklusvertrags.
+- Die drei Ausgangsregressionen (JSONL-Kapazität, PostgreSQL-Kapazität,
+  Reaktivierung am Limit) wurden vor der Reparatur reproduziert und sind
+  anschließend grün. Der frühere statisch datierte Test für einen aktiven
+  Nicht-Objekt-Payload verwendet nun einen aktuellen Erstellungszeitpunkt;
+  die Kapazitätsassertion bleibt unverändert.
+- Lokaler Prüfbeleg `5b6cc531cc2c46c0a00500d7`: 20 Lifecycle-Unit-, 38 API-Edge-,
+  15 PostgreSQL-Edge-Write- und 26 PostgreSQL-Read-Tests bestanden, einschließlich
+  Ablaufgrenze, Zukunft/Legacy, Pruning, Replay und konkurrierender Zulassung.
+  Zusätzlich 58 PostgreSQL-Node-Write- und 9 Account-Write-Tests bestanden.
+  Insgesamt 166 Tests, ohne Fehler; Remote-CI separat.
+  Dieser Nachweis ist kein Produktionsrollout.

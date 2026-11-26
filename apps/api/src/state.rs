@@ -91,6 +91,12 @@ impl<T> OrderedCache<T> {
         Some(removed)
     }
 
+    /// Remove a group of cache entries without repeated linear order scans.
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(&T) -> bool) {
+        self.items.retain(|_, item| keep(item));
+        self.order.retain(|id| self.items.contains_key(id));
+    }
+
     pub fn len(&self) -> usize {
         self.items.len()
     }
