@@ -3807,6 +3807,62 @@ class BackupObservationTests(unittest.TestCase):
                       (directory / "events.jsonl").read_text().splitlines()]
             self.assertNotIn("RECOVERY", events)
 
+    def test_backward_clock_step_cannot_lower_transfer_failure_watermark(self):
+        import json
+        for legacy_snapshot in (False, True):
+            with self.subTest(legacy_snapshot=legacy_snapshot), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+
+                def state():
+                    return json.loads((directory / "state.json").read_text())
+
+                watch.record(self.observe(self.sources()), directory, serialized_poll=True)
+                old_pull = state()["backup_success"][watch.BACKUP_OFFHOST_PULLED_AT]
+                failed = self.observe(
+                    self.sources(offhost_result="exit-code"),
+                    previous=state()["backup_success"],
+                )
+                self.assertEqual(watch.record(failed, directory, serialized_poll=True), "ALARM")
+                failure_at = state()["backup_success"][watch.BACKUP_OFFHOST_FAILURE_AT]
+
+                if legacy_snapshot:
+                    # Exercise the fallback with neither persisted typed anchor.
+                    for name in ("state.json", "heartbeat.json"):
+                        path = directory / name
+                        snapshot = json.loads(path.read_text())
+                        snapshot["backup_success"].pop(watch.BACKUP_OFFHOST_FAILURE_AT, None)
+                        watch.write_json(path, snapshot)
+
+                # Same old receipt, now 120s in the future after an NTP step,
+                # within the tolerated skew for observed success timestamps.
+                earlier = NOW - timedelta(hours=1, minutes=2)
+                self.assertEqual(old_pull - int(earlier.timestamp()), 120)
+                observed = self.observe(
+                    self.sources(), now=earlier, previous=state()["backup_success"],
+                )
+                watch.record(observed, directory, serialized_poll=True)
+                self.assertEqual(observed["status"], "ALARM")
+                self.assertEqual(
+                    state()["backup_success"][watch.BACKUP_OFFHOST_FAILURE_AT],
+                    failure_at,
+                )
+                self.assertIn("backup_offhost_failed", {x[0] for x in state()["severe"]})
+
+                # A genuinely later pull of the still fresh dump can recover.
+                later = NOW + timedelta(hours=1)
+                fresh = self.observe(
+                    self.sources(now=later, offhost_age=4, pulled_age=0.5),
+                    now=later, previous=state()["backup_success"],
+                )
+                self.assertEqual(watch.record(fresh, directory, serialized_poll=True), "RECOVERY")
+                self.assertNotIn(watch.BACKUP_OFFHOST_FAILURE_AT, state()["backup_success"])
+                transitions = [
+                    json.loads(line)["event"]
+                    for line in (directory / "events.jsonl").read_text().splitlines()
+                    if json.loads(line)["event"] in {"ALARM", "RECOVERY"}
+                ]
+                self.assertEqual(transitions, ["ALARM", "RECOVERY"])
+
     def test_new_transfer_of_overdue_dump_does_not_clear_freshness_alarm(self):
         baseline = self.observe(self.sources(offhost_age=31))
         failed = self.observe(self.sources(offhost_result="exit-code"),

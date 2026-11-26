@@ -163,6 +163,12 @@ def _backup_epoch(value, now):
     return value if type(value) is int and 0 < value <= now + 300 else None
 
 
+def _backup_failure_epoch(value):
+    # A failure watermark is historical evidence, not a claim of a fresh
+    # success. A backward observer-clock step must never invalidate it.
+    return value if type(value) is int and value > 0 else None
+
+
 def _backup_exit(fields, unit):
     if fields.get("Id") != unit or fields.get("LoadState") != "loaded":
         raise ValueError("backup service not loaded")
@@ -210,7 +216,7 @@ def check_backup_health(now, reader, previous, issues):
     previous = previous if isinstance(previous, dict) else {}
     success = {name: previous[name] for name in BACKUP_UNITS
                if _backup_epoch(previous.get(name), epoch) is not None}
-    failure_at = _backup_epoch(previous.get(BACKUP_OFFHOST_FAILURE_AT), epoch)
+    failure_at = _backup_failure_epoch(previous.get(BACKUP_OFFHOST_FAILURE_AT))
     if failure_at is not None:
         success[BACKUP_OFFHOST_FAILURE_AT] = failure_at
 
@@ -303,7 +309,7 @@ def _preserve_offhost_failure(result, previous, previous_heartbeat, old_severe):
     heartbeat = previous_heartbeat if isinstance(previous_heartbeat, dict) else {}
     heartbeat_backup = heartbeat.get("backup_success")
     heartbeat_backup = heartbeat_backup if isinstance(heartbeat_backup, dict) else {}
-    marks = [_backup_epoch(value, epoch) for value in (
+    marks = [_backup_failure_epoch(value) for value in (
         observed.get(BACKUP_OFFHOST_FAILURE_AT),
         old.get(BACKUP_OFFHOST_FAILURE_AT) if prior_failure else None,
         heartbeat_backup.get(BACKUP_OFFHOST_FAILURE_AT) if prior_failure else None,
@@ -313,10 +319,17 @@ def _preserve_offhost_failure(result, previous, previous_heartbeat, old_severe):
         # E.g. the global poll deadline fired after collecting the failure.
         marks.append(epoch)
     if prior_failure and not marks:
-        anchor = timestamp(previous.get("checked_at_utc")) or timestamp(
-            heartbeat.get("checked_at_utc")
-        )
-        marks.append(int(anchor.timestamp()) if anchor and anchor <= checked else epoch)
+        # Older incident snapshots may lack the typed watermark. Their
+        # persisted observation times are historical anchors even if the
+        # current clock has stepped backwards.
+        for snapshot in (previous, heartbeat):
+            anchor = timestamp(snapshot.get("checked_at_utc"))
+            if anchor is not None:
+                mark = _backup_failure_epoch(int(anchor.timestamp()))
+                if mark is not None:
+                    marks.append(mark)
+        if not marks:
+            marks.append(epoch)
     failure_at = max(marks, default=epoch)
     pulled = _backup_epoch(observed.get(BACKUP_OFFHOST_PULLED_AT), epoch)
     uncertain = {"backup_offhost_unverified", "watcher_execution_failed", "unverifiable_state"}

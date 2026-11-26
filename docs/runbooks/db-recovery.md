@@ -824,6 +824,8 @@ Ein leerer Exit-Zeitstempel nach Neustart eines Systemd-Managers ist kein
 Erfolgsbeleg. Beim Off-Host-Pull bleibt der dauerhafte Receipt nutzbar.
 Nach einem bestätigten Transferfehler genügt jedoch kein älterer Receipt:
 Der Pull-Zeitpunkt muss nach dem gespeicherten Fehlerzeitpunkt liegen.
+Ein Rücksprung der Beobachteruhr darf diesen historischen Fehlerzeitpunkt
+nicht absenken; im Zweifel bleibt der Alarm bis zu einem neueren Beleg aktiv.
 Ein erneuter erfolgreicher Pull derselben noch frischen Sicherungsdatei
 kann die Transferstörung beenden, macht die Sicherungsdatei aber nicht jünger.
 
