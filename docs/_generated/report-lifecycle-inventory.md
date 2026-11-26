@@ -888,12 +888,12 @@ Schema: `contracts/audit-report-truth.schema.json`
   "does_not_establish": [
     "The correctness of claims inside individual reports, runtime use of declared consumers, or deployment truth."
   ],
-  "generated_at": "2026-10-14T05:45:01+02:00",
+  "generated_at": "2026-11-26T06:18:27+01:00",
   "limitations": [
     "The inventory evaluates repository metadata, exact path references and declared control contracts, not runtime behaviour."
   ],
   "schema_version": 1,
-  "source_revision": "2318db8d0e9dbbdd713ffd70cdde79e1ffa12bfb",
+  "source_revision": "e6d7e84d3ef8bdd616c2b9e64b186f0a312ba1dc",
   "sources": [
     {
       "path": ".wgx/generated-artifacts.yml",
@@ -1005,7 +1005,7 @@ Schema: `contracts/audit-report-truth.schema.json`
     },
     {
       "path": "docs/reports/domain-edge-faden-lifecycle-proof.md",
-      "sha256": "a2ae3a25b53c85d74caed62843651c59e856c80cd2eaf429c3ef35750fcee39a"
+      "sha256": "c92ec0c4ae9ea116781af500cbc7dec9517d94d298c2bd1fe852d28c0888257f"
     },
     {
       "path": "docs/reports/domain-edge-reference-audit.md",
