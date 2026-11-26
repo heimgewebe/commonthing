@@ -85,6 +85,8 @@ name: Basemap Runtime Proof
       - "apps/web/vite.config.ts"
       - "apps/web/svelte.config.*"
       - "map-style/**"
+      # setup-node reads this file in every proof job.
+      - ".node-version"
       - ".github/workflows/basemap-runtime-proof.yml"
   workflow_dispatch: {}
 
