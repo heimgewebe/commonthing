@@ -221,6 +221,156 @@ async fn wait_for_event_receipt(pool: &PgPool, event_id: i64) -> Result<()> {
     anyhow::bail!("outbox event was not published and consumed in time")
 }
 
+async fn seed_outbox_event(pool: &PgPool, attempts: i32) -> Result<i64> {
+    Ok(sqlx::query_scalar(
+        "INSERT INTO domain_outbox \
+         (aggregate_type, aggregate_id, event_type, payload, attempt_count) \
+         VALUES ('node', 'claim-fencing', 'domain.node.updated', '{}'::jsonb, $1) \
+         RETURNING id",
+    )
+    .bind(attempts)
+    .fetch_one(pool)
+    .await?)
+}
+
+async fn expire_outbox_claim(pool: &PgPool, id: i64) -> Result<()> {
+    sqlx::query(
+        "UPDATE domain_outbox SET available_at = NOW() - INTERVAL '1 second' WHERE id = $1",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+#[serial]
+async fn stale_outbox_completions_cannot_override_reclaims_or_requeue() -> Result<()> {
+    use outbox::FailureDisposition::{ClaimLost, Quarantined, RetryScheduled};
+
+    let pool = PgPool::connect(&database_url()).await?;
+    migrate(&pool).await;
+    reset(&pool).await;
+
+    // Claim A has reached the quarantine threshold. A later worker reclaims
+    // the same event after the lease expires, before A reports failure.
+    let id = seed_outbox_event(&pool, 9).await?;
+    let old = outbox::claim_pending(&pool, 1)
+        .await?
+        .pop()
+        .expect("first claim");
+    assert_eq!((old.id, old.attempt_count), (id, 10));
+    expire_outbox_claim(&pool, id).await?;
+    let current = outbox::claim_pending(&pool, 1)
+        .await?
+        .pop()
+        .expect("new claim");
+    assert_eq!((current.id, current.attempt_count), (id, 11));
+    assert_ne!(old.claim_token, current.claim_token);
+    assert_eq!(
+        outbox::mark_failed(&pool, &old, "late failure").await?,
+        ClaimLost
+    );
+    assert!(!outbox::mark_published(&pool, &old).await?);
+    let untouched: (Option<String>, bool, Uuid) = sqlx::query_as(
+        "SELECT last_error, quarantined_at IS NULL, claim_token FROM domain_outbox WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(untouched, (None, true, current.claim_token));
+    assert!(outbox::mark_published(&pool, &current).await?);
+    assert!(!outbox::mark_published(&pool, &current).await?);
+    assert_eq!(
+        outbox::mark_failed(&pool, &current, "duplicate failure").await?,
+        ClaimLost
+    );
+    let published: (bool, bool, bool) = sqlx::query_as(
+        "SELECT published_at IS NOT NULL, quarantined_at IS NULL, claim_token IS NULL \
+         FROM domain_outbox WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(published, (true, true, true));
+
+    // A legitimate terminal failure still quarantines. Manual requeue resets
+    // the retry budget without ever reviving an old claim identity.
+    let id = seed_outbox_event(&pool, 9).await?;
+    let poison = outbox::claim_pending(&pool, 1)
+        .await?
+        .pop()
+        .expect("poison claim");
+    assert_eq!(poison.id, id);
+    assert_eq!(
+        outbox::mark_failed(&pool, &poison, "terminal").await?,
+        Quarantined
+    );
+    let quarantined: (bool, Option<String>, bool) = sqlx::query_as(
+        "SELECT quarantined_at IS NOT NULL, last_error, claim_token IS NULL FROM domain_outbox WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(quarantined, (true, Some("terminal".into()), true));
+    assert!(
+        outbox::load_event_chain_db_snapshot(&pool, 1, 600)
+            .await?
+            .quarantine_present
+    );
+    assert!(outbox::requeue_quarantined(&pool, id).await?);
+    let requeued: (bool, i32, bool, bool, bool) = sqlx::query_as(
+        "SELECT quarantined_at IS NULL, attempt_count, available_at <= NOW(), \
+                last_error IS NULL, claim_token IS NULL FROM domain_outbox WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(requeued, (true, 0, true, true, true));
+    assert!(!outbox::requeue_quarantined(&pool, id).await?);
+
+    let retry = outbox::claim_pending(&pool, 1)
+        .await?
+        .pop()
+        .expect("requeued claim");
+    assert_eq!((retry.id, retry.attempt_count), (id, 1));
+    assert_ne!(poison.claim_token, retry.claim_token);
+    assert_eq!(
+        outbox::mark_failed(&pool, &poison, "old poison").await?,
+        ClaimLost
+    );
+    assert!(!outbox::mark_published(&pool, &poison).await?);
+    assert_eq!(
+        outbox::mark_failed(&pool, &retry, "temporary").await?,
+        RetryScheduled
+    );
+    let delayed: (bool, Option<String>, i32, bool) = sqlx::query_as(
+        "SELECT available_at > NOW(), last_error, attempt_count, claim_token IS NULL \
+         FROM domain_outbox WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(delayed, (true, Some("temporary".into()), 1, true));
+    assert!(!outbox::mark_published(&pool, &retry).await?);
+
+    expire_outbox_claim(&pool, id).await?;
+    let last = outbox::claim_pending(&pool, 1)
+        .await?
+        .pop()
+        .expect("retry claim");
+    assert_eq!((last.id, last.attempt_count), (id, 2));
+    assert_ne!(retry.claim_token, last.claim_token);
+    assert_eq!(
+        outbox::mark_failed(&pool, &retry, "late retry").await?,
+        ClaimLost
+    );
+    assert!(outbox::mark_published(&pool, &last).await?);
+    assert!(!outbox::requeue_quarantined(&pool, id).await?);
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL and JetStream"]
 #[serial]
@@ -519,50 +669,6 @@ async fn two_instances_and_restart_share_truth_and_event_receipts() -> Result<()
     // Idempotency ledger accepts the first consumer effect and rejects replay.
     assert!(outbox::record_consumed_once(&pool, "test-consumer", 9_000_001).await?);
     assert!(!outbox::record_consumed_once(&pool, "test-consumer", 9_000_001).await?);
-
-    // Failed relay attempts are delayed and ultimately quarantined. Keep the
-    // synthetic event outside the live relays' claim window so this assertion
-    // tests failure handling rather than racing the two workers started above.
-    let failed_id: i64 = sqlx::query_scalar(
-        "INSERT INTO domain_outbox \
-         (aggregate_type, aggregate_id, event_type, payload, attempt_count, available_at) \
-         VALUES ('node', 'multi-instance-failed', 'domain.node.updated', '{}'::jsonb, 1, \
-                 NOW() + INTERVAL '1 hour') \
-         RETURNING id",
-    )
-    .fetch_one(&pool)
-    .await?;
-    assert!(!outbox::mark_failed(&pool, failed_id, 1, "temporary").await?);
-    let delayed: (bool, Option<String>, i32) = sqlx::query_as(
-        "SELECT available_at > NOW(), last_error, attempt_count \
-         FROM domain_outbox WHERE id = $1",
-    )
-    .bind(failed_id)
-    .fetch_one(&pool)
-    .await?;
-    assert_eq!(delayed, (true, Some("temporary".to_string()), 1));
-    assert!(outbox::mark_failed(&pool, failed_id, 10, "terminal").await?);
-    let quarantined: (bool, Option<String>) = sqlx::query_as(
-        "SELECT quarantined_at IS NOT NULL, last_error \
-         FROM domain_outbox WHERE id = $1",
-    )
-    .bind(failed_id)
-    .fetch_one(&pool)
-    .await?;
-    assert_eq!(quarantined, (true, Some("terminal".to_string())));
-    let quarantined_chain = outbox::load_event_chain_db_snapshot(&pool, 1, 600).await?;
-    assert!(quarantined_chain.quarantine_present);
-    assert!(outbox::requeue_quarantined(&pool, failed_id).await?);
-    let requeued: (bool, i32, bool, bool) = sqlx::query_as(
-        "SELECT quarantined_at IS NULL, attempt_count, available_at <= NOW(), \
-                last_error IS NULL \
-         FROM domain_outbox WHERE id = $1",
-    )
-    .bind(failed_id)
-    .fetch_one(&pool)
-    .await?;
-    assert_eq!(requeued, (true, 0, true, true));
-    assert!(!outbox::requeue_quarantined(&pool, failed_id).await?);
 
     // Readiness is current-health, not an all-history integrity scan. A retry
     // scheduled into the future is not actionable yet; an old missing receipt

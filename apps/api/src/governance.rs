@@ -1175,6 +1175,12 @@ pub async fn delete_guest_account(pool: &PgPool, account_id: &str) -> Result<(),
         .await?;
     }
 
+    // Match compound node/Faden writes and node deletion: acquire the edge
+    // table before any node update can lock the projection singleton.
+    sqlx::query("LOCK TABLE domain_edges IN EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await?;
+
     sqlx::query(
         "UPDATE domain_nodes \
          SET payload = payload - 'created_by_account_id', updated_at = NOW() \
