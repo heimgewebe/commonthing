@@ -1,9 +1,13 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onDestroy, onMount, tick } from "svelte";
+  import { afterNavigate, beforeNavigate, replaceState } from "$app/navigation";
+  import { page } from "$app/stores";
   import { searchNodes } from "$lib/api/search";
   import {
     stageDiscoverySearch,
-    takeDiscoverySearch,
+    enterDiscoveryHistory,
+    rememberDiscoveryHistory,
+    onDiscoveryAccountChange,
   } from "$lib/stores/searchStore";
   import type { Node } from "$lib/map/types";
 
@@ -12,8 +16,10 @@
   let cursor: string | null = $state(null);
   let loading = $state(true);
   let error = $state("");
-  let searching = $state(false);
+  let activeQuery = $state("");
+  let searching = $derived(Boolean(activeQuery));
   let controller: AbortController | undefined;
+  let resultHeading: HTMLHeadingElement | undefined = $state();
 
   async function load(more = false) {
     controller?.abort();
@@ -29,7 +35,7 @@
       cursor = null;
     }
     const term = query.trim();
-    searching = Boolean(term);
+    activeQuery = term;
     try {
       let items: Node[];
       let nextCursor: string | null = null;
@@ -79,11 +85,49 @@
     }
   }
 
-  onMount(() => {
-    query = takeDiscoverySearch("commons") ?? "";
+  async function resetPublicCatalog() {
+    query = "";
     void load();
-    return () => controller?.abort();
+    await tick();
+    resultHeading?.focus();
+  }
+
+  let discoveryHistoryId: string | undefined;
+  beforeNavigate(() => {
+    rememberDiscoveryHistory(discoveryHistoryId, "commons", query.trim());
   });
+  afterNavigate(({ type }) => {
+    const entry = enterDiscoveryHistory(
+      "commons",
+      $page.state.discoveryHistoryId,
+      type,
+    );
+    discoveryHistoryId = entry.id;
+    if ($page.state.discoveryHistoryId !== entry.id) {
+      replaceState("", { ...$page.state, discoveryHistoryId: entry.id });
+    }
+    query = entry.query ?? "";
+    void load();
+  });
+  onMount(() =>
+    onDiscoveryAccountChange(() => {
+      // The old entry was invalidated. Reset the visible search and renew only
+      // the current entry, never a historical entry from the previous account.
+      query = "";
+      if ($page.route.id !== "/commons") return;
+      if (
+        discoveryHistoryId &&
+        $page.state.discoveryHistoryId === discoveryHistoryId
+      ) {
+        const entry = enterDiscoveryHistory("commons", undefined, "enter");
+        discoveryHistoryId = entry.id;
+        replaceState("", { ...$page.state, discoveryHistoryId: entry.id });
+      }
+      // load aborts the old owner search and immediately clears its results.
+      void load();
+    }),
+  );
+  onDestroy(() => controller?.abort());
 </script>
 
 <svelte:head><title>Knoten · commonThing</title></svelte:head>
@@ -112,7 +156,15 @@
       bind:value={query}
     />
     <button type="submit" disabled={loading}>Suchen</button>
+    {#if searching || query.trim()}
+      <button type="button" onclick={resetPublicCatalog}
+        >Alle öffentlichen Einträge</button
+      >
+    {/if}
   </form>
+  <h2 tabindex="-1" bind:this={resultHeading}>
+    {searching ? `Suchergebnisse für „${activeQuery}“` : "Öffentliche Einträge"}
+  </h2>
   {#if loading}<p role="status">Knoten werden geladen…</p>{/if}
   {#if error}
     <p role="alert">{error}</p>

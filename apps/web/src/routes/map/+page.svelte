@@ -31,7 +31,12 @@
   } from "$lib/map/searchNavigation";
 
   import { page } from "$app/stores";
-  import { invalidate } from "$app/navigation";
+  import {
+    afterNavigate,
+    beforeNavigate,
+    invalidate,
+    replaceState,
+  } from "$app/navigation";
 
   import {
     view,
@@ -53,7 +58,9 @@
     isSearchOpen,
     searchQuery,
     closeSearch,
-    takeDiscoverySearch,
+    enterDiscoveryHistory,
+    rememberDiscoveryHistory,
+    onDiscoveryAccountChange,
   } from "$lib/stores/searchStore";
   import {
     openSearchExclusive,
@@ -241,7 +248,7 @@
   let viewportNodeAbortController: AbortController | null = null;
   let viewportNodeSequence = 0;
   let requestNodeViewportRefresh: (() => void) | null = null;
-  let pendingViewportRefresh = false;
+  let pendingViewportRefresh: "movement" | "data" | null = null;
   let viewportRouteStatusInitialized = false;
   let lastViewportRouteStatus: PageData["resourceStatus"] | null = null;
   let lastViewportBootstrapKey: string | null = null;
@@ -605,14 +612,59 @@
       return;
     }
     if (parsed.lens === "search") {
-      const transferredQuery = takeDiscoverySearch("map");
-      if (transferredQuery !== null) searchQuery.set(transferredQuery);
+      searchQuery.set("");
       openSearchExclusive();
       return;
     }
     closeSearch();
     closeFilter();
   }
+
+  let discoveryHistoryId: string | undefined;
+  beforeNavigate(() => {
+    rememberDiscoveryHistory(
+      discoveryHistoryId,
+      "map",
+      $isSearchOpen ? $searchQuery.trim() : null,
+    );
+  });
+  afterNavigate(({ type }) => {
+    const entry = enterDiscoveryHistory(
+      "map",
+      $page.state.discoveryHistoryId,
+      type,
+    );
+    discoveryHistoryId = entry.id;
+    if ($page.state.discoveryHistoryId !== entry.id) {
+      replaceState("", { ...$page.state, discoveryHistoryId: entry.id });
+    }
+    // Explicit focus, composition and filter URLs still win over a search.
+    const parsed = parseMapUrlState($page.url.searchParams);
+    if (parsed.compose || parsed.focus || parsed.lens === "filter") return;
+    if (entry.query !== null || parsed.lens === "search") {
+      searchQuery.set(entry.query ?? "");
+      openSearchExclusive();
+    } else {
+      closeSearch();
+    }
+  });
+
+  onMount(() =>
+    onDiscoveryAccountChange(() => {
+      resetNodeSearch();
+      if ($page.route.id !== "/map") return;
+      if (
+        discoveryHistoryId &&
+        $page.state.discoveryHistoryId === discoveryHistoryId
+      ) {
+        const entry = enterDiscoveryHistory("map", undefined, "enter");
+        discoveryHistoryId = entry.id;
+        replaceState("", { ...$page.state, discoveryHistoryId: entry.id });
+      }
+      // Keep the active overlay, focus and filters; the global search draft
+      // has already been cleared by the authoritative account change.
+    }),
+  );
 
   function tryApplyFocusMapUrlAddressing(
     parsed: ParsedMapUrlState,
@@ -838,7 +890,9 @@
     const handleNodeViewportMoveEnd = () => {
       mapViewportRevision += 1;
       if (!mapHasLoaded) {
-        pendingViewportRefresh = true;
+        // A camera move may reuse complete coverage, but it must not
+        // downgrade an already pending data invalidation.
+        pendingViewportRefresh ??= "movement";
         return;
       }
       void refreshNodeViewport();
@@ -891,9 +945,12 @@
         return;
       }
       if (pendingViewportRefresh) {
-        pendingViewportRefresh = false;
+        const force = pendingViewportRefresh === "data";
+        pendingViewportRefresh = null;
         lastViewportRouteStatus = data.resourceStatus ?? null;
-        void refreshNodeViewport().then(() => finishInitialLoading(generation));
+        void refreshNodeViewport(force).then(() =>
+          finishInitialLoading(generation),
+        );
         return;
       }
       mapHasLoaded = true;
@@ -1231,11 +1288,12 @@
     if (currentRouteStatus === lastViewportRouteStatus) return;
     if (data.nodeLoadMode !== "viewport") {
       lastViewportRouteStatus = currentRouteStatus;
-      pendingViewportRefresh = false;
+      pendingViewportRefresh = null;
       return;
     }
     if (!mapHasLoaded) {
-      pendingViewportRefresh = true;
+      // Route data changed. Even a complete, identical BBOX can now be stale.
+      pendingViewportRefresh = "data";
       return;
     }
     lastViewportRouteStatus = currentRouteStatus;

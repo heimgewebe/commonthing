@@ -27,9 +27,9 @@ use weltgewebe_api::{
     middleware::auth::AuthContext,
     search::{
         execute_search, fetch_postgres_candidates, fetch_postgres_candidates_for_generation,
-        EmbeddingProvider, EmbeddingProviderError, GenerationSpec, ProcessOutcome,
-        ProjectionWorker, SearchError, SearchFilters, SearchMode, SearchQueryParams,
-        SearchRepositoryError, DOCUMENT_REVISION, MAX_AUTHORIZED_CANDIDATES,
+        EmbeddingProvider, EmbeddingProviderError, GenerationSpec, OllamaEmbeddingProvider,
+        ProcessOutcome, ProjectionWorker, SearchError, SearchFilters, SearchMode,
+        SearchQueryParams, SearchRepositoryError, DOCUMENT_REVISION, MAX_AUTHORIZED_CANDIDATES,
         NORMALIZATION_REVISION, RANKING_REVISION,
     },
     state::ApiState,
@@ -117,6 +117,11 @@ struct FakeProvider {
 
 #[async_trait]
 impl EmbeddingProvider for FakeProvider {
+    fn accepts_projection_generation(&self, _generation_id: &str, _dimension: i32) -> bool {
+        // Synthetic test vectors have no real model identity.
+        true
+    }
+
     async fn embed(
         &self,
         _document: &str,
@@ -137,6 +142,11 @@ struct BlockingProvider {
 
 #[async_trait]
 impl EmbeddingProvider for BlockingProvider {
+    fn accepts_projection_generation(&self, _generation_id: &str, _dimension: i32) -> bool {
+        // Synthetic test vectors have no real model identity.
+        true
+    }
+
     async fn embed(
         &self,
         _document: &str,
@@ -154,6 +164,11 @@ struct BarrierProvider {
 
 #[async_trait]
 impl EmbeddingProvider for BarrierProvider {
+    fn accepts_projection_generation(&self, _generation_id: &str, _dimension: i32) -> bool {
+        // Synthetic test vectors have no real model identity.
+        true
+    }
+
     async fn embed(
         &self,
         _document: &str,
@@ -168,6 +183,11 @@ struct PermanentFailureProvider;
 
 #[async_trait]
 impl EmbeddingProvider for PermanentFailureProvider {
+    fn accepts_projection_generation(&self, _generation_id: &str, _dimension: i32) -> bool {
+        // Synthetic test vectors have no real model identity.
+        true
+    }
+
     async fn embed(
         &self,
         _document: &str,
@@ -208,6 +228,145 @@ fn exact_generation_spec<'a>(
     }
 }
 
+struct GenerationBoundProvider {
+    generation: String,
+    dimension: i32,
+    value: f64,
+}
+
+#[async_trait]
+impl EmbeddingProvider for GenerationBoundProvider {
+    fn accepts_projection_generation(&self, generation_id: &str, dimension: i32) -> bool {
+        self.generation == generation_id && self.dimension == dimension
+    }
+
+    async fn embed(
+        &self,
+        _document: &str,
+        dimension: usize,
+    ) -> Result<Vec<f64>, EmbeddingProviderError> {
+        Ok(vec![self.value; dimension])
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires T005_DATABASE_URL pointing to direct disposable PostgreSQL"]
+async fn same_dimension_generations_do_not_share_claims_or_vectors() {
+    let pool = pool().await;
+    migrate(&pool).await;
+    reset_search_state(&pool).await;
+    let node = "t005-generation-scope";
+    sqlx::query("INSERT INTO domain_nodes (id,kind,title,payload) VALUES ($1,'place','Scope test','{}'::jsonb)")
+        .bind(node).execute(&pool).await.expect("insert node");
+    let runtime = "ollama:test@http://127.0.0.1:11434";
+    let a = exact_generation_spec("model-a", "revision-a", runtime, 3);
+    let b = exact_generation_spec("model-b", "revision-b", runtime, 3);
+    let a_id = a.generation_id;
+    let b_id = b.generation_id;
+    assert_ne!(a_id, b_id);
+
+    // Exercise the real provider's exact identity check without calling Ollama.
+    let real_a = OllamaEmbeddingProvider::new(
+        "http://127.0.0.1:11434/",
+        a.model_id.to_owned(),
+        a.model_revision.to_owned(),
+        a.runtime_identity.to_owned(),
+    )
+    .expect("provider identity");
+    assert!(real_a.accepts_projection_generation(a_id, 3));
+    assert!(!real_a.accepts_projection_generation(b_id, 3));
+    assert!(!real_a.accepts_projection_generation(a_id, 4));
+    let worker_a = ProjectionWorker::new_with_provider(
+        pool.clone(),
+        "scope-a".into(),
+        Metrics::try_new(BuildInfo::collect()).expect("metrics"),
+        Arc::new(GenerationBoundProvider {
+            generation: a_id.into(),
+            dimension: 3,
+            value: 0.25,
+        }),
+    )
+    .expect("worker A");
+    let worker_b = ProjectionWorker::new_with_provider(
+        pool.clone(),
+        "scope-b".into(),
+        Metrics::try_new(BuildInfo::collect()).expect("metrics"),
+        Arc::new(GenerationBoundProvider {
+            generation: b_id.into(),
+            dimension: 3,
+            value: 0.75,
+        }),
+    )
+    .expect("worker B");
+    worker_a.start_generation(a).await.expect("start A");
+    worker_b.start_generation(b).await.expect("start B");
+    sqlx::query("UPDATE search_projection_jobs SET available_at=TIMESTAMPTZ '1970-01-01' WHERE generation_id=$1")
+        .bind(a_id).execute(&pool).await.expect("make A oldest");
+    // Reject incorrect caller/provider binding before touching attempt counters.
+    assert!(worker_b.claim_and_process_one(a_id).await.is_err());
+    let untouched: (String, i32) = sqlx::query_as(
+        "SELECT state,attempt_count FROM search_projection_jobs WHERE generation_id=$1",
+    )
+    .bind(a_id)
+    .fetch_one(&pool)
+    .await
+    .expect("A remains pending");
+    assert_eq!(untouched, ("pending".into(), 0));
+    // B must skip the older A job rather than put a B vector in A's index.
+    assert_eq!(
+        worker_b
+            .claim_and_process_one(b_id)
+            .await
+            .expect("process B"),
+        ProcessOutcome::Processed
+    );
+    assert_eq!(
+        worker_b
+            .claim_and_process_one(b_id)
+            .await
+            .expect("B drained"),
+        ProcessOutcome::Empty
+    );
+    let a_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM search_node_projections WHERE generation_id=$1")
+            .bind(a_id)
+            .fetch_one(&pool)
+            .await
+            .expect("no foreign vector");
+    assert_eq!(a_count, 0);
+    let untouched: (String, i32) = sqlx::query_as(
+        "SELECT state,attempt_count FROM search_projection_jobs WHERE generation_id=$1",
+    )
+    .bind(a_id)
+    .fetch_one(&pool)
+    .await
+    .expect("A still untouched");
+    assert_eq!(untouched, ("pending".into(), 0));
+    assert_eq!(
+        worker_a
+            .claim_and_process_one(a_id)
+            .await
+            .expect("process A"),
+        ProcessOutcome::Processed
+    );
+    let vectors: Vec<(String, Vec<f64>)> = sqlx::query_as(
+        "SELECT generation_id,embedding FROM search_node_projections WHERE node_id=$1",
+    )
+    .bind(node)
+    .fetch_all(&pool)
+    .await
+    .expect("two independently projected vectors");
+    assert_eq!(vectors.len(), 2);
+    assert_eq!(
+        vectors.iter().find(|(id, _)| id == a_id).unwrap().1,
+        vec![0.25; 3]
+    );
+    assert_eq!(
+        vectors.iter().find(|(id, _)| id == b_id).unwrap().1,
+        vec![0.75; 3]
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires T005_DATABASE_URL pointing to direct disposable PostgreSQL"]
 async fn worker_is_revision_bound_leased_resumable_and_deletion_propagates() {
@@ -231,7 +390,10 @@ async fn worker_is_revision_bound_leased_resumable_and_deletion_propagates() {
         .await
         .expect("start");
     assert_eq!(
-        first.claim_and_process_one().await.expect("process"),
+        first
+            .claim_and_process_one(generation)
+            .await
+            .expect("process"),
         ProcessOutcome::Processed
     );
     let projection: (i64, String, String, String) = sqlx::query_as("SELECT source_version,status,semantic_state,searchable_text FROM search_node_projections WHERE generation_id=$2 AND node_id=$1")
@@ -250,7 +412,7 @@ async fn worker_is_revision_bound_leased_resumable_and_deletion_propagates() {
     let second = worker(pool.clone(), "t005-b", provider);
     assert_eq!(
         second
-            .claim_and_process_one()
+            .claim_and_process_one(generation)
             .await
             .expect("process current"),
         ProcessOutcome::Processed
@@ -268,7 +430,10 @@ async fn worker_is_revision_bound_leased_resumable_and_deletion_propagates() {
         .bind(generation)
         .bind(node).execute(&pool).await.expect("stale job");
     assert_eq!(
-        second.claim_and_process_one().await.expect("process stale"),
+        second
+            .claim_and_process_one(generation)
+            .await
+            .expect("process stale"),
         ProcessOutcome::Stale
     );
 
@@ -279,7 +444,7 @@ async fn worker_is_revision_bound_leased_resumable_and_deletion_propagates() {
         .expect("delete node");
     assert_eq!(
         first
-            .claim_and_process_one()
+            .claim_and_process_one(generation)
             .await
             .expect("process deletion"),
         ProcessOutcome::Deleted
@@ -327,7 +492,7 @@ async fn private_nodes_stay_lexical_without_calling_the_provider_and_can_activat
 
     assert_eq!(
         projection_worker
-            .claim_and_process_one()
+            .claim_and_process_one(generation)
             .await
             .expect("project private node lexically"),
         ProcessOutcome::Processed
@@ -415,7 +580,7 @@ async fn status_snapshot_separates_unique_nodes_job_history_and_activation_readi
 
     assert_eq!(
         projection_worker
-            .claim_and_process_one()
+            .claim_and_process_one(generation)
             .await
             .expect("project first revision"),
         ProcessOutcome::Processed
@@ -473,7 +638,7 @@ async fn status_snapshot_separates_unique_nodes_job_history_and_activation_readi
 
     assert_eq!(
         projection_worker
-            .claim_and_process_one()
+            .claim_and_process_one(generation)
             .await
             .expect("project second revision"),
         ProcessOutcome::Processed
@@ -544,7 +709,7 @@ async fn status_snapshot_separates_unique_nodes_job_history_and_activation_readi
     );
     assert_eq!(
         projection_worker
-            .claim_and_process_one()
+            .claim_and_process_one(generation_two)
             .await
             .expect("project second generation"),
         ProcessOutcome::Processed
@@ -576,10 +741,10 @@ async fn status_snapshot_separates_unique_nodes_job_history_and_activation_readi
         .expect("deletion pending status");
     assert_eq!(deletion_pending.current_nodes, 0);
     assert_eq!(deletion_pending.rebuild_activation_ready, Some(false));
-    for _ in 0..2 {
+    for generation_id in [generation, generation_two] {
         assert_eq!(
             projection_worker
-                .claim_and_process_one()
+                .claim_and_process_one(generation_id)
                 .await
                 .expect("process retained-generation deletion"),
             ProcessOutcome::Deleted
@@ -622,7 +787,7 @@ async fn worker_hardening_proves_races_trigger_identity_outage_and_activation() 
     a.start_generation(generation_spec).await.expect("start");
     // A provider outage leaves a leased item retryable; it does not alter the canonical node.
     assert_eq!(
-        a.claim_and_process_one().await.expect("outage"),
+        a.claim_and_process_one(generation).await.expect("outage"),
         ProcessOutcome::PendingProvider
     );
     let state: String =
@@ -717,7 +882,7 @@ async fn worker_hardening_proves_races_trigger_identity_outage_and_activation() 
     provider.unavailable.store(false, Ordering::SeqCst);
     sqlx::query("UPDATE search_projection_jobs SET available_at=NOW() WHERE generation_id=$1 AND state='retry'").bind(generation).execute(&pool).await.expect("release retry");
     assert_eq!(
-        b.claim_and_process_one().await.expect("recovery"),
+        b.claim_and_process_one(generation).await.expect("recovery"),
         ProcessOutcome::Processed
     );
     // Two independent instances race for one new job; SKIP LOCKED gives it to
@@ -727,7 +892,10 @@ async fn worker_hardening_proves_races_trigger_identity_outage_and_activation() 
         .execute(&pool)
         .await
         .expect("create one claimable job");
-    let (a_claim, b_claim) = tokio::join!(a.claim_and_process_one(), b.claim_and_process_one());
+    let (a_claim, b_claim) = tokio::join!(
+        a.claim_and_process_one(generation),
+        b.claim_and_process_one(generation)
+    );
     let a_claim = a_claim.expect("first claimant");
     let b_claim = b_claim.expect("second claimant");
     assert!(
@@ -745,7 +913,7 @@ async fn worker_hardening_proves_races_trigger_identity_outage_and_activation() 
     sqlx::query("UPDATE search_projection_jobs SET state='pending', claimed_by=NULL, claim_until=NULL, available_at=TIMESTAMPTZ '1970-01-01' WHERE generation_id=$1 AND node_id=$2 AND source_version=$3 AND operation='upsert'")
         .bind(generation).bind(node).bind(before).execute(&pool).await.expect("requeue stale upsert");
     assert_eq!(
-        a.claim_and_process_one()
+        a.claim_and_process_one(generation)
             .await
             .expect("stale upsert outcome"),
         ProcessOutcome::Stale
@@ -755,7 +923,7 @@ async fn worker_hardening_proves_races_trigger_identity_outage_and_activation() 
     sqlx::query("UPDATE search_projection_jobs SET state='stale', completed_at=NOW() WHERE generation_id=$1 AND node_id=$2 AND source_version=$3 AND operation='upsert'")
         .bind(generation).bind(node).bind(before + 2).execute(&pool).await.expect("keep newer job out of this race proof");
     assert_eq!(
-        b.claim_and_process_one()
+        b.claim_and_process_one(generation)
             .await
             .expect("stale delete outcome"),
         ProcessOutcome::Stale
@@ -800,7 +968,7 @@ async fn provider_failures_are_bounded_fail_closed_and_explicitly_recoverable() 
 
     for attempt in 1..=8 {
         let outcome = retrying
-            .claim_and_process_one()
+            .claim_and_process_one(generation)
             .await
             .expect("provider outage attempt");
         if attempt < 8 {
@@ -840,7 +1008,7 @@ async fn provider_failures_are_bounded_fail_closed_and_explicitly_recoverable() 
         .expect("explicit catch-up rearm");
     assert_eq!(
         retrying
-            .claim_and_process_one()
+            .claim_and_process_one(generation)
             .await
             .expect("catch-up projection"),
         ProcessOutcome::Processed
@@ -877,7 +1045,7 @@ async fn provider_failures_are_bounded_fail_closed_and_explicitly_recoverable() 
     assert_eq!(identity_rearmed, ("pending".to_owned(), 0, None));
     assert_eq!(
         retrying
-            .claim_and_process_one()
+            .claim_and_process_one(identity_generation)
             .await
             .expect("identity catch-up projection"),
         ProcessOutcome::Processed
@@ -899,7 +1067,7 @@ async fn provider_failures_are_bounded_fail_closed_and_explicitly_recoverable() 
         .expect("start permanent failure generation");
     assert_eq!(
         permanent
-            .claim_and_process_one()
+            .claim_and_process_one(permanent_generation)
             .await
             .expect("permanent provider failure"),
         ProcessOutcome::Failed
@@ -961,7 +1129,10 @@ async fn rollback_candidate_stays_current_and_retired_generation_cannot_reactiva
 
     worker.start_generation(spec_a).await.expect("gen A");
     assert_eq!(
-        worker.claim_and_process_one().await.expect("A project"),
+        worker
+            .claim_and_process_one(&generation_a)
+            .await
+            .expect("A project"),
         ProcessOutcome::Processed
     );
     sqlx::query("SELECT weltgewebe_activate_search_generation($1)")
@@ -972,7 +1143,10 @@ async fn rollback_candidate_stays_current_and_retired_generation_cannot_reactiva
 
     worker.start_generation(spec_b).await.expect("gen B");
     assert_eq!(
-        worker.claim_and_process_one().await.expect("B project"),
+        worker
+            .claim_and_process_one(&generation_b)
+            .await
+            .expect("B project"),
         ProcessOutcome::Processed
     );
     sqlx::query("SELECT weltgewebe_activate_search_generation($1)")
@@ -1001,9 +1175,12 @@ async fn rollback_candidate_stays_current_and_retired_generation_cannot_reactiva
         .execute(&pool)
         .await
         .expect("mutate canonical node");
-    for label in ["first catch-up", "second catch-up"] {
+    for (label, generation) in [
+        ("first catch-up", generation_a.as_str()),
+        ("second catch-up", generation_b.as_str()),
+    ] {
         assert_eq!(
-            worker.claim_and_process_one().await.expect(label),
+            worker.claim_and_process_one(generation).await.expect(label),
             ProcessOutcome::Processed
         );
     }
@@ -1023,9 +1200,12 @@ async fn rollback_candidate_stays_current_and_retired_generation_cannot_reactiva
         .execute(&pool)
         .await
         .expect("withdraw visibility");
-    for label in ["first visibility catch-up", "second visibility catch-up"] {
+    for (label, generation) in [
+        ("first visibility catch-up", generation_a.as_str()),
+        ("second visibility catch-up", generation_b.as_str()),
+    ] {
         assert_eq!(
-            worker.claim_and_process_one().await.expect(label),
+            worker.claim_and_process_one(generation).await.expect(label),
             ProcessOutcome::Processed
         );
     }
@@ -1075,7 +1255,10 @@ async fn rollback_candidate_stays_current_and_retired_generation_cannot_reactiva
     let generation_c = spec_c.generation_id.to_owned();
     worker.start_generation(spec_c).await.expect("gen C");
     assert_eq!(
-        worker.claim_and_process_one().await.expect("C project"),
+        worker
+            .claim_and_process_one(&generation_c)
+            .await
+            .expect("C project"),
         ProcessOutcome::Processed
     );
     sqlx::query("SELECT weltgewebe_activate_search_generation($1)")
@@ -1136,11 +1319,17 @@ async fn rollback_candidate_stays_current_and_retired_generation_cannot_reactiva
         "ready rollback target must not activate while delete jobs are pending"
     );
     assert_eq!(
-        worker.claim_and_process_one().await.expect("delete active"),
+        worker
+            .claim_and_process_one(&generation_c)
+            .await
+            .expect("delete active"),
         ProcessOutcome::Deleted
     );
     assert_eq!(
-        worker.claim_and_process_one().await.expect("delete ready"),
+        worker
+            .claim_and_process_one(&generation_a)
+            .await
+            .expect("delete ready"),
         ProcessOutcome::Deleted
     );
     let live_rollback_projections: i64 = sqlx::query_scalar(
@@ -1185,7 +1374,7 @@ async fn restarting_the_same_identity_preserves_the_logical_integrity_digest() {
         .expect("start digest generation");
     assert_eq!(
         worker
-            .claim_and_process_one()
+            .claim_and_process_one(generation)
             .await
             .expect("digest projection"),
         ProcessOutcome::Processed
@@ -1268,7 +1457,7 @@ async fn generation_start_and_activation_serialize_with_domain_mutations() {
     assert_eq!(seeded_version, 2);
     assert_eq!(
         worker
-            .claim_and_process_one()
+            .claim_and_process_one(generation)
             .await
             .expect("project seeded revision"),
         ProcessOutcome::Processed
@@ -1305,7 +1494,7 @@ async fn generation_start_and_activation_serialize_with_domain_mutations() {
     );
     assert_eq!(
         worker
-            .claim_and_process_one()
+            .claim_and_process_one(generation)
             .await
             .expect("project activation revision"),
         ProcessOutcome::Processed
@@ -1406,8 +1595,8 @@ async fn concurrent_generation_finishes_serialize_ready_transition_and_keep_coun
     let first_worker = worker_a.clone();
     let second_worker = worker_b.clone();
     let (first, second) = tokio::join!(
-        async move { first_worker.claim_and_process_one().await },
-        async move { second_worker.claim_and_process_one().await }
+        first_worker.claim_and_process_one(&generation_a_id),
+        second_worker.claim_and_process_one(&generation_b_id)
     );
     assert_eq!(
         first.expect("first concurrent finish"),
@@ -1487,7 +1676,7 @@ async fn reclaimed_lease_fences_the_old_worker_before_projection_mutation() {
         .await
         .expect("start lease generation");
 
-    let slow_task = tokio::spawn(async move { slow.claim_and_process_one().await });
+    let slow_task = tokio::spawn(async move { slow.claim_and_process_one(generation).await });
     entered.notified().await;
     sqlx::query("UPDATE search_projection_jobs SET claim_until=NOW()-INTERVAL '1 second' WHERE generation_id=$1 AND state='claimed'")
         .bind(generation)
@@ -1503,7 +1692,9 @@ async fn reclaimed_lease_fences_the_old_worker_before_projection_mutation() {
         }),
     );
     assert_eq!(
-        fast.claim_and_process_one().await.expect("reclaimed job"),
+        fast.claim_and_process_one(generation)
+            .await
+            .expect("reclaimed job"),
         ProcessOutcome::Processed
     );
     release.notify_one();
@@ -1601,7 +1792,7 @@ async fn invalid_projection_document_fails_terminally_without_lease_cycle() {
         .expect("start invalid document generation");
     assert_eq!(
         worker
-            .claim_and_process_one()
+            .claim_and_process_one(generation)
             .await
             .expect("process invalid document"),
         ProcessOutcome::Failed
@@ -1619,7 +1810,7 @@ async fn invalid_projection_document_fails_terminally_without_lease_cycle() {
     assert_eq!(failed.2.as_deref(), Some("document_invalid"));
     assert_eq!(
         worker
-            .claim_and_process_one()
+            .claim_and_process_one(generation)
             .await
             .expect("no invalid document reclaim"),
         ProcessOutcome::Empty
@@ -1636,7 +1827,6 @@ async fn search_backfill_binary_projects_with_live_local_provider_without_activa
     migrate(&pool).await;
     reset_search_state(&pool).await;
     let node = "t005-backfill-e2e-node";
-    let generation = "t005-backfill-e2e-generation";
     sqlx::query("INSERT INTO domain_nodes (id,kind,title,payload) VALUES ($1,'place','Backfill E2E',$2::jsonb)")
         .bind(node)
         .bind(r#"{"summary":"lokaler Providerpfad"}"#)
@@ -1651,6 +1841,17 @@ async fn search_backfill_binary_projects_with_live_local_provider_without_activa
     let runtime_identity =
         std::env::var("T005_LIVE_OLLAMA_RUNTIME_IDENTITY").expect("runtime identity");
     let dimension = std::env::var("T005_LIVE_OLLAMA_DIMENSION").expect("dimension");
+    let expected_dimension: i32 = dimension.parse().expect("valid dimension");
+    let generation_id = GenerationSpec {
+        generation_id: "derived-below",
+        provider: "local:ollama",
+        model_id: &model_id,
+        model_revision: &model_revision,
+        runtime_identity: &runtime_identity,
+        dimension: expected_dimension,
+    }
+    .derived_id();
+    let generation = generation_id.as_str();
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_search-backfill"))
         .env("DATABASE_URL", &database_url)
@@ -1674,8 +1875,8 @@ async fn search_backfill_binary_projects_with_live_local_provider_without_activa
     assert!(!stdout.contains("Backfill E2E"));
     assert!(!stdout.contains("lokaler Providerpfad"));
 
-    let projection: (i64, String, String) = sqlx::query_as(
-        "SELECT source_version,semantic_state,status FROM search_node_projections WHERE generation_id=$1 AND node_id=$2",
+    let projection: (i64, String, String, Option<i32>) = sqlx::query_as(
+        "SELECT source_version,semantic_state,status,cardinality(embedding) FROM search_node_projections WHERE generation_id=$1 AND node_id=$2",
     )
     .bind(generation)
     .bind(node)
@@ -1685,6 +1886,7 @@ async fn search_backfill_binary_projects_with_live_local_provider_without_activa
     assert_eq!(projection.0, 1);
     assert_eq!(projection.1, "ready");
     assert_eq!(projection.2, "active");
+    assert_eq!(projection.3, Some(expected_dimension));
     let generation_state: String =
         sqlx::query_scalar("SELECT state FROM search_index_generations WHERE generation_id=$1")
             .bind(generation)
@@ -2964,7 +3166,7 @@ async fn nongeographic_commons_is_projected_and_searchable() {
         .await
         .expect("start generation");
     while projection_worker
-        .claim_and_process_one()
+        .claim_and_process_one(&generation)
         .await
         .expect("process projection")
         == ProcessOutcome::Processed
