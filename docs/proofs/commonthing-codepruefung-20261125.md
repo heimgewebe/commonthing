@@ -38,3 +38,55 @@ Die Priorität folgt der Auswirkung auf Nutzerdaten und Betrieb. Die Vorschläge
 Die isolierten UI-Prüfungen verwendeten die Originalfunktionen mit verzögerten Testantworten. Die Datenbankprüfungen verwendeten Originalabfragen und synthetische Daten in PostgreSQL 16.
 Die Befunde betreffen diese Codepfade. Für die Folge-PRs bleiben Browser-End-to-End-Tests und ein PostgreSQL-Test mit zwei konkurrierenden Transaktionen die nächsten Nachweise.
 [CI des geprüften Standes](https://github.com/heimgewebe/commonthing/actions/runs/45461374630).
+
+## Folgearbeit: belegter Zwischenstand 26. November 2026
+
+Die ursprünglichen Befunde und ihre revisionsgebundenen Fundstellen bleiben
+unverändert. Alle acht Reparaturen liegen inzwischen in konkreten PRs; die
+Integration und vollständige produktive Abnahme sind noch nicht abgeschlossen.
+
+| Befund | Reparatur | Belegter Stand |
+| --- | --- | --- |
+| Verspätete Knotenmutation | [#2237](https://github.com/heimgewebe/commonthing/pull/2237), ersetzt den geschlossenen #2230 | Ziel-ID und Auswahlgeneration gebunden; verzögerter DELETE und 412-Konflikte nach A→B bzw. A→B→A im Browser geprüft. Noch nicht gemergt. |
+| Vermischte Direktnachrichten | [#2237](https://github.com/heimgewebe/commonthing/pull/2237) | Dialog- und Accountzustand getrennt; zusätzlich reproduzierte private Altansicht nach Kontowechsel und fehlerhafter Zeitstempelvergleich behoben. Noch nicht gemergt. |
+| Veralteter Outbox-Abschluss | [#2231](https://github.com/heimgewebe/commonthing/pull/2231) | Merge c02342b, Migration 20261125000001, produktive Relay-/DB-/Bereitschaftsprüfung bestanden. |
+| Vermischte Suchgenerationen | [#2233](https://github.com/heimgewebe/commonthing/pull/2233) | Claims nach Generation und Provideridentität getrennt; gleichdimensionierter Modellgegenfall und 19 PostgreSQL-Tests bestanden, echter Ollama-Warmstart in isolierter DB geprüft. Noch nicht gemergt. |
+| Sperrinversion | [#2234](https://github.com/heimgewebe/commonthing/pull/2234) | Merge f47f6d1; zwei konkurrierende PostgreSQL-Regressionen und betroffene Schreibpfade geprüft, anschließend produktiv ausgeliefert. |
+| Verlorene Karteninvalidierung | [#2238](https://github.com/heimgewebe/commonthing/pull/2238) | Merge fa6c15c4; echte verzögerte Ausschnittsabfrage, gleichbleibende BBOX und Markerwechsel geprüft. CI 35 bestanden, zwei übersprungen; Lasttest bis 100.000 Knoten auf unveränderten Grenzwerten bestanden. Auslieferung noch offen. |
+| Fehlende ältere Direktnachrichten | [#2237](https://github.com/heimgewebe/commonthing/pull/2237) | Vorhandener Cursor, Deduplikation, Leseposition und Gesprächswechsel geprüft. Noch nicht gemergt. |
+| Abgelaufene Fäden belegen Kapazität | [#2244](https://github.com/heimgewebe/commonthing/pull/2244) | JSONL und PostgreSQL: abgelaufene Historie verbraucht keine aktive Kapazität, Reaktivierung und Neuanlage serialisiert. Historische Identitäten bleiben erhalten. 166 lokale Tests bestanden. Noch nicht gemergt. |
+
+### Konkrete Folgeprüfungen
+
+- Nachrichten: Task `8c50e84d86cd493589f0ae21`, 37/37 Browserprüfungen,
+  Typprüfung und ESLint erfolgreich. Die fünf geänderten Datei-Blobs sind
+  auf dem konvergierten Head `aa6f52f7` identisch zum geprüften Stand.
+- Suche: Tasks `90c13a8db8d847ec8ed8b68d` und `584ac93369d94dc39baf31d2`.
+  Der Warmstart-Test speichert einen echten 1024-dimensionalen Vektor;
+  keine Aktivierung oder produktive Datenänderung. Der erste kalte Lauf
+  lieferte keine Projektion; die Ursache bleibt nicht abschließend belegt.
+  Die vier geänderten Datei-Blobs auf `3143ba1b` sind unverändert.
+- Karte: [Lasttest 45756205899](https://github.com/heimgewebe/commonthing/actions/runs/45756205899).
+  Gemessene p95-Bildzeit je 50 ms bei 1k, 10k und 100k Knoten.
+  Frühere Messabweichungen bleiben ungeklärt; Grenzwerte wurden nicht gelockert.
+- Fäden: Red/Green-Tasks `520c4f2a45404b1d8ac40b00`,
+  `795a4383af2f4043a0105ace`, `5b6cc531cc2c46c0a00500d7`.
+  166 Tests aus sechs Testreihen. Die erneuerten Lifecycle-Indizes wurden
+  strikt ohne Findings validiert (`3474493c69854cc3ab5500f1`) und bytegenau
+  publiziert. Alle zwölf geänderten Datei-Blobs auf `61dc2d1b` entsprechen
+  den geprüften Ständen. Keine Schemamigration oder Datenlöschung.
+
+### Produktiver Nachweis und offene Grenzen
+
+Zum Zeitpunkt dieses Zwischenstands melden öffentliches Frontend und API
+`382db2a6`; Datenbank, Ereigniskette, NATS und Policy sind bereit. Main
+`fa6c15c4` enthält die Kartenreparatur, ist aber noch nicht live bestätigt.
+Die offenen PRs #2233, #2237 und #2244 sind auf diesen Main konvergiert;
+ihre neue CI und Integration sind gesondert abzuschließen.
+
+Eine produktive authentifizierte Mehrkontenaktion, ein echter
+iPad-Safari-Test sowie eine neue Modellgenerations-/Rollback-Abnahme sind
+noch nicht nachgewiesen. Ältere Vektoren wurden nicht pauschal gelöscht
+oder als korrekt deklariert. Der bestehende Bureau-Auftrag
+`WELTGEWEBE-AUDIT-20261125-FOLLOWUP` bleibt offen. Der Merge dieses
+Dokumentations-PRs allein würde keine produktive Abnahme belegen.
