@@ -1528,3 +1528,147 @@ async fn household_create_invite_and_full_member_list_regression() {
     .unwrap();
     assert_eq!(members_json.as_array().unwrap().len(), 102);
 }
+
+/// M2 (audit 2026-11-22): every invitation and every decline bumps the global
+/// privacy generation and forces a full projection reload in every API
+/// process. The PostgreSQL-shared pair budget must stop an endless
+/// propose/decline loop across replicas, while declining always stays free.
+#[tokio::test]
+#[serial]
+#[ignore = "requires DATABASE_URL for a disposable direct PostgreSQL database"]
+async fn shared_invitation_budget_stops_decline_reinvite_loops_across_replicas() {
+    use weltgewebe_api::auth::rate_limit::CIRCLE_INVITATION_PAIR_LIMIT;
+    use weltgewebe_api::routes::circles::create_circle;
+
+    let url = support::postgres_proof::validated_direct_disposable_url(
+        std::env::var("DATABASE_URL").expect("disposable PostgreSQL URL"),
+    );
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&url)
+        .await
+        .expect("connect PostgreSQL");
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+    let token = Uuid::new_v4();
+    let inviter = format!("m2-inviter-{token}");
+    let invitee = format!("m2-invitee-{token}");
+    for id in [&inviter, &invitee] {
+        sqlx::query(
+            "INSERT INTO domain_accounts(id,title,kind,location_lat,location_lon)
+             VALUES ($1,$1,'garnrolle',53.55,10.05)",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    // Two API processes with their own limiter instances share only PostgreSQL.
+    let replica = || {
+        let mut state = app_state(pool.clone());
+        state.rate_limiter = Arc::new(AuthRateLimiter::new_postgres(&state.config, pool.clone()));
+        state
+    };
+    let (first, second) = (replica(), replica());
+    let propose = |state: ApiState| {
+        let (inviter, invitee) = (inviter.clone(), invitee.clone());
+        async move {
+            create_circle(
+                State(state),
+                Extension(actor(&inviter)),
+                axum::Json(
+                    serde_json::from_value(json!({
+                        "kind": "household", "invitee_account_id": invitee
+                    }))
+                    .unwrap(),
+                ),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let decline = |state: ApiState, circle: Uuid| {
+        let invitee = invitee.clone();
+        async move {
+            let query: LeaveCircleQuery =
+                serde_json::from_value(json!({"expected_status":"invited"})).unwrap();
+            leave_circle(
+                State(state),
+                Extension(actor(&invitee)),
+                Path(circle),
+                Query(query),
+            )
+            .await
+            .unwrap()
+            .status()
+        }
+    };
+
+    let mut circles = Vec::new();
+    for round in 0..CIRCLE_INVITATION_PAIR_LIMIT.2 {
+        let state = if round % 2 == 0 { &first } else { &second };
+        let created = propose(state.clone()).await;
+        assert_eq!(created.status(), StatusCode::CREATED, "round {round}");
+        let view: Value = serde_json::from_slice(
+            &body::to_bytes(created.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let circle = Uuid::parse_str(view["id"].as_str().unwrap()).unwrap();
+        // The decline runs on the other replica and is never rate limited.
+        let other = if round % 2 == 0 { &second } else { &first };
+        assert_eq!(decline(other.clone(), circle).await, StatusCode::NO_CONTENT);
+        circles.push(circle);
+    }
+
+    let generation = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT version FROM domain_projection_state WHERE singleton = TRUE",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    let before = generation().await;
+    let limited = propose(second.clone()).await;
+    assert_eq!(
+        generation().await,
+        before,
+        "a refused proposal must not force a projection reload"
+    );
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry_after: u64 = limited.headers()[header::RETRY_AFTER]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((1..=86_400).contains(&retry_after), "{retry_after}");
+    assert_eq!(
+        limited.headers()[header::CACHE_CONTROL],
+        "private, no-store",
+        "a refusal must not be cached either"
+    );
+
+    let open_or_new: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_audience_circles WHERE created_by_account_id=$1",
+    )
+    .bind(&inviter)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        open_or_new,
+        i64::try_from(circles.len()).unwrap(),
+        "the refused proposal wrote no circle"
+    );
+    assert_eq!(
+        kinds(&pool, &invitee)
+            .await
+            .iter()
+            .filter(|kind| kind.as_str() == "circle_invited")
+            .count(),
+        circles.len(),
+        "the refused proposal delivered no personal event"
+    );
+}
