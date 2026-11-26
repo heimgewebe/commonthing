@@ -192,9 +192,10 @@ describe("map route viewport architecture guards", () => {
   it("keeps pagination lazy and retains explicit latest-request guards", () => {
     expect(pageSource).not.toContain('from "$lib/map/cursorPagination"');
     expect(pageSource).toContain("await refreshNodeViewport();");
-    expect(pageSource).toContain("pendingViewportRefresh = true;");
-    expect(pageSource).toContain(
-      "void refreshNodeViewport().then(() => finishInitialLoading(generation))",
+    expect(pageSource).toContain('pendingViewportRefresh ??= "movement"');
+    expect(pageSource).toContain('pendingViewportRefresh = "data"');
+    expect(pageSource).toMatch(
+      /const force = pendingViewportRefresh === "data";[\s\S]*pendingViewportRefresh = null;[\s\S]*refreshNodeViewport\(force\)\.then\(\(\) =>[\s\S]*finishInitialLoading\(generation\)/,
     );
     expect(pageSource).toContain(
       'map.on("moveend", handleNodeViewportMoveEnd)',
