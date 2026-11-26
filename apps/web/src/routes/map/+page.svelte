@@ -248,7 +248,7 @@
   let viewportNodeAbortController: AbortController | null = null;
   let viewportNodeSequence = 0;
   let requestNodeViewportRefresh: (() => void) | null = null;
-  let pendingViewportRefresh = false;
+  let pendingViewportRefresh: "movement" | "data" | null = null;
   let viewportRouteStatusInitialized = false;
   let lastViewportRouteStatus: PageData["resourceStatus"] | null = null;
   let lastViewportBootstrapKey: string | null = null;
@@ -890,7 +890,9 @@
     const handleNodeViewportMoveEnd = () => {
       mapViewportRevision += 1;
       if (!mapHasLoaded) {
-        pendingViewportRefresh = true;
+        // A camera move may reuse complete coverage, but it must not
+        // downgrade an already pending data invalidation.
+        pendingViewportRefresh ??= "movement";
         return;
       }
       void refreshNodeViewport();
@@ -943,9 +945,12 @@
         return;
       }
       if (pendingViewportRefresh) {
-        pendingViewportRefresh = false;
+        const force = pendingViewportRefresh === "data";
+        pendingViewportRefresh = null;
         lastViewportRouteStatus = data.resourceStatus ?? null;
-        void refreshNodeViewport().then(() => finishInitialLoading(generation));
+        void refreshNodeViewport(force).then(() =>
+          finishInitialLoading(generation),
+        );
         return;
       }
       mapHasLoaded = true;
@@ -1283,11 +1288,12 @@
     if (currentRouteStatus === lastViewportRouteStatus) return;
     if (data.nodeLoadMode !== "viewport") {
       lastViewportRouteStatus = currentRouteStatus;
-      pendingViewportRefresh = false;
+      pendingViewportRefresh = null;
       return;
     }
     if (!mapHasLoaded) {
-      pendingViewportRefresh = true;
+      // Route data changed. Even a complete, identical BBOX can now be stale.
+      pendingViewportRefresh = "data";
       return;
     }
     lastViewportRouteStatus = currentRouteStatus;
