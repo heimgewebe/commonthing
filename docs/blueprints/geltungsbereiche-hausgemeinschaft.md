@@ -270,6 +270,19 @@ drittes Konto mit identischen Koordinaten erhält keinerlei
 Mitgliedsrechte; Position verschieben und neu laden bewahren den
 korrekten, unabhängig gepflegten Mitgliedschaftszustand.
 
+**Missbrauchsgrenze (Audit M2, 2026-11-22):** Jede Einladung und jede Antwort
+darauf ändert eine Mitgliedszeile, erhöht die globale Datenschutz-Generation
+und erzwingt in jedem API-Prozess einen vollständigen Reload der
+Domänenprojektion. Gründungsvorschläge (`POST /circles`) und Einladungen
+(`POST /circles/{id}/invitations`) teilen deshalb ein Budget pro einladendem
+Konto (5 pro Minute, 30 pro Stunde, 100 pro Tag) und pro Paar aus
+Einladendem und Eingeladenem (3 pro Tag, gerichtet). Mit PostgreSQL zählen
+alle Replikas gemeinsam; Überschreitung ergibt `429` mit `Retry-After`, ein
+Ausfall des Zählers `503` (fail-closed). Auch abgewiesene Versuche und
+Einladungen an unbekannte Kennungen verbrauchen Budget, damit sich weder Spam
+noch das Abtasten von Konto-IDs lohnt. Ablehnen, Austreten und Zurückziehen
+bleiben unbegrenzt: Wer gehen will, darf nie an einem Limit scheitern.
+
 ### P1-Nachtrag – Persönliche Nachrichten für Mitgliedschaftsvorgänge
 
 Die P1-Mitgliedschaft darf nicht nur als Status in der Garnrolle sichtbar sein.

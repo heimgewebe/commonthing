@@ -208,4 +208,17 @@ describe("voluntary audience circle API", () => {
       "bereits eingeladen oder Mitglied",
     );
   });
+
+  it("explains the invitation rate limit instead of a generic failure", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response(null, { status: 429 })),
+    );
+    await expect(inviteToCircle("house-1", "neighbor")).rejects.toThrow(
+      "Zu viele Einladungen",
+    );
+    await expect(createHousehold("neighbor")).rejects.toMatchObject({
+      status: 429,
+    });
+  });
 });

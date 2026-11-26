@@ -19,6 +19,24 @@ type AccountLimiter = RateLimiter<String, DefaultKeyedStateStore<String>, Defaul
 
 const SEARCH_GC_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Circle invitations an account may send (founding proposals included), per
+/// window. Every invitation and every answer to it commits a membership row
+/// change, which bumps the global privacy generation and forces a full domain
+/// projection reload in every API process (M2, audit 2026-11-22). The budget
+/// is generous for households and neighbourhoods, but bounds the churn one
+/// account can impose on everyone else's reads.
+pub const CIRCLE_INVITATION_ACCOUNT_LIMITS: [(&str, i64, u32); 3] = [
+    ("circle-invitation-minute", 60, 5),
+    ("circle-invitation-hour", 3_600, 30),
+    ("circle-invitation-day", 86_400, 100),
+];
+
+/// The same inviter may address the same invitee at most this often per day.
+/// A declined invitation deletes its membership row, so without this a
+/// declined person could be re-invited immediately and indefinitely.
+pub const CIRCLE_INVITATION_PAIR_LIMIT: (&str, i64, u32) =
+    ("circle-invitation-pair-day", 86_400, 3);
+
 /// Maps a client address to the subject that IP rate limits count against.
 ///
 /// One IPv6 subscriber usually owns at least a /64, so counting each /128
@@ -48,6 +66,8 @@ pub enum RateLimitError {
     AccountLimited,
     #[error("Too many search requests from IP")]
     SearchIpLimited { retry_after: Duration },
+    #[error("Too many circle invitations")]
+    CircleInvitationLimited { retry_after: Duration },
     #[error("Shared rate-limit backend unavailable: {0}")]
     BackendUnavailable(String),
 }
@@ -69,6 +89,8 @@ pub struct AuthRateLimiter {
     node_delete_limiter_hour: Option<AccountLimiter>,
     search_ip_limiter_min: Option<IpLimiter>,
     search_ip_limiter_hour: Option<IpLimiter>,
+    circle_invitation_limiters: Vec<AccountLimiter>,
+    circle_invitation_pair_limiter: AccountLimiter,
     search_gc_started: Instant,
     search_last_gc_seconds: AtomicU64,
     node_replace_per_min: u32,
@@ -123,6 +145,14 @@ impl AuthRateLimiter {
             node_delete_limiter_hour,
             search_ip_limiter_min,
             search_ip_limiter_hour,
+            circle_invitation_limiters: CIRCLE_INVITATION_ACCOUNT_LIMITS
+                .iter()
+                .map(|&(_, seconds, limit)| Self::window_limiter(seconds, limit))
+                .collect(),
+            circle_invitation_pair_limiter: Self::window_limiter(
+                CIRCLE_INVITATION_PAIR_LIMIT.1,
+                CIRCLE_INVITATION_PAIR_LIMIT.2,
+            ),
             search_gc_started: Instant::now(),
             search_last_gc_seconds: AtomicU64::new(0),
             node_replace_per_min: mutation.replace_per_minute,
@@ -307,6 +337,70 @@ impl AuthRateLimiter {
         Ok(())
     }
 
+    /// Process-local approximation of a fixed window for the in-memory
+    /// fallback: `limit` requests may burst, then one more per window/limit.
+    fn window_limiter(window_seconds: i64, limit: u32) -> AccountLimiter {
+        let limit = NonZeroU32::new(limit).expect("circle invitation limits are non-zero");
+        let period = Duration::from_secs(window_seconds as u64) / limit.get();
+        RateLimiter::keyed(
+            Quota::with_period(period)
+                .expect("non-zero circle invitation period")
+                .allow_burst(limit),
+        )
+    }
+
+    fn retry_after_window(window_seconds: i64) -> Duration {
+        let now = Utc::now().timestamp();
+        Duration::from_secs((window_seconds - now.rem_euclid(window_seconds)) as u64)
+    }
+
+    /// Budget for `POST /circles` and `POST /circles/{id}/invitations`.
+    /// With PostgreSQL the windows are shared across API replicas; a backend
+    /// error fails closed. The windows are checked smallest first, so a burst
+    /// rejected per minute does not drain the hour and day budgets.
+    pub async fn check_circle_invitation(
+        &self,
+        inviter: &str,
+        invitee: &str,
+    ) -> Result<(), RateLimitError> {
+        let pair = format!("{inviter}\u{0}{invitee}");
+        let (pair_scope, pair_seconds, pair_limit) = CIRCLE_INVITATION_PAIR_LIMIT;
+        let checks = CIRCLE_INVITATION_ACCOUNT_LIMITS
+            .iter()
+            .map(|&(scope, seconds, limit)| (scope, inviter, seconds, limit))
+            .chain(std::iter::once((
+                pair_scope,
+                pair.as_str(),
+                pair_seconds,
+                pair_limit,
+            )));
+        if let Some(pool) = &self.db {
+            for (scope, subject, seconds, limit) in checks {
+                let allowed = Self::increment_window(pool, scope, subject, seconds, limit)
+                    .await
+                    .map_err(|error| RateLimitError::BackendUnavailable(error.to_string()))?;
+                if !allowed {
+                    return Err(RateLimitError::CircleInvitationLimited {
+                        retry_after: Self::retry_after_window(seconds),
+                    });
+                }
+            }
+            return Ok(());
+        }
+        let limiters = self
+            .circle_invitation_limiters
+            .iter()
+            .chain(std::iter::once(&self.circle_invitation_pair_limiter));
+        for (limiter, (_, subject, _, _)) in limiters.zip(checks) {
+            if let Err(not_until) = limiter.check_key(&Self::subject_hash(subject)) {
+                return Err(RateLimitError::CircleInvitationLimited {
+                    retry_after: not_until.wait_time_from(DefaultClock::default().now()),
+                });
+            }
+        }
+        Ok(())
+    }
+
     pub async fn check_node_mutation(
         &self,
         account_id: &str,
@@ -414,6 +508,71 @@ mod tests {
             Err(RateLimitError::IpLimited)
         ));
         assert!(limiter.check(elsewhere, "c").is_ok());
+    }
+
+    fn circle_limiter() -> AuthRateLimiter {
+        AuthRateLimiter::new(&AppConfig::load_from_str("{}\n").expect("default config"))
+    }
+
+    #[tokio::test]
+    async fn circle_invitations_are_bounded_per_account_minute() {
+        let limiter = circle_limiter();
+        let per_minute = CIRCLE_INVITATION_ACCOUNT_LIMITS[0].2;
+        for i in 0..per_minute {
+            limiter
+                .check_circle_invitation("inviter", &format!("invitee-{i}"))
+                .await
+                .expect("within the minute budget");
+        }
+        let error = limiter
+            .check_circle_invitation("inviter", "invitee-next")
+            .await
+            .expect_err("minute budget exhausted across different invitees");
+        assert!(matches!(
+            error,
+            RateLimitError::CircleInvitationLimited { retry_after } if retry_after > Duration::ZERO
+        ));
+        limiter
+            .check_circle_invitation("other-inviter", "invitee-next")
+            .await
+            .expect("another account keeps its own budget");
+    }
+
+    #[tokio::test]
+    async fn the_same_pair_cannot_be_reinvited_endlessly_after_declines() {
+        let limiter = circle_limiter();
+        let per_pair = CIRCLE_INVITATION_PAIR_LIMIT.2;
+        assert!(per_pair < CIRCLE_INVITATION_ACCOUNT_LIMITS[0].2);
+        for _ in 0..per_pair {
+            limiter
+                .check_circle_invitation("inviter", "declined")
+                .await
+                .expect("within the pair budget");
+        }
+        assert!(matches!(
+            limiter.check_circle_invitation("inviter", "declined").await,
+            Err(RateLimitError::CircleInvitationLimited { .. })
+        ));
+        limiter
+            .check_circle_invitation("inviter", "someone-else")
+            .await
+            .expect("the pair limit does not block other invitees");
+        limiter
+            .check_circle_invitation("declined", "inviter")
+            .await
+            .expect("the pair limit is directional");
+    }
+
+    #[test]
+    fn circle_invitation_windows_are_ordered_smallest_first() {
+        let seconds: Vec<i64> = CIRCLE_INVITATION_ACCOUNT_LIMITS
+            .iter()
+            .map(|&(_, seconds, _)| seconds)
+            .collect();
+        assert!(seconds.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(CIRCLE_INVITATION_ACCOUNT_LIMITS
+            .windows(2)
+            .all(|pair| pair[0].2 <= pair[1].2));
     }
 
     fn search_limiter(per_min: Option<u32>, per_hour: Option<u32>) -> AuthRateLimiter {
