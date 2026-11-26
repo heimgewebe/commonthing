@@ -149,6 +149,12 @@ impl EmbeddingProviderError {
 /// document or vector; the worker records only bounded outcome labels.
 #[async_trait]
 pub trait EmbeddingProvider: Send + Sync {
+    /// Projection workers must explicitly attest the generation they can
+    /// serve. Query-only or unknown providers cannot produce projections.
+    fn accepts_projection_generation(&self, _generation_id: &str, _dimension: i32) -> bool {
+        false
+    }
+
     async fn embed(
         &self,
         document: &str,
@@ -345,6 +351,19 @@ impl OllamaEmbeddingProvider {
 
 #[async_trait]
 impl EmbeddingProvider for OllamaEmbeddingProvider {
+    fn accepts_projection_generation(&self, generation_id: &str, dimension: i32) -> bool {
+        GenerationSpec {
+            generation_id,
+            provider: "local:ollama",
+            model_id: &self.model_id,
+            model_revision: &self.model_revision,
+            runtime_identity: &self.runtime_identity,
+            dimension,
+        }
+        .validate()
+        .is_ok()
+    }
+
     async fn embed(
         &self,
         document: &str,
@@ -506,6 +525,12 @@ pub struct UnavailableEmbeddingProvider;
 
 #[async_trait]
 impl EmbeddingProvider for UnavailableEmbeddingProvider {
+    fn accepts_projection_generation(&self, _generation_id: &str, _dimension: i32) -> bool {
+        // This provider cannot return a vector. Keep lexical/redaction and
+        // retry handling usable for explicitly scoped generations.
+        true
+    }
+
     async fn embed(
         &self,
         _document: &str,
@@ -612,13 +637,33 @@ impl ProjectionWorker {
         Ok(inserted + reconciled)
     }
 
-    pub async fn claim_and_process_one(&self) -> anyhow::Result<ProcessOutcome> {
+    /// Process only the explicitly selected generation. Different model
+    /// generations can have the same vector dimension but incompatible semantics.
+    pub async fn claim_and_process_one(
+        &self,
+        generation_id: &str,
+    ) -> anyhow::Result<ProcessOutcome> {
+        let dimension: i32 = sqlx::query_scalar(
+            "SELECT dimension FROM search_index_generations WHERE generation_id=$1",
+        )
+        .bind(generation_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .context("search projection generation does not exist")?;
+        // Check before reserving work: a misconfigured worker must not consume
+        // another generation's attempts or leave its jobs in a failed state.
+        if !self
+            .provider
+            .accepts_projection_generation(generation_id, dimension)
+        {
+            anyhow::bail!("search projection provider does not match requested generation");
+        }
         let job = sqlx::query("WITH picked AS (SELECT id FROM search_projection_jobs \
-            WHERE (state IN ('pending','retry') AND available_at <= NOW()) OR (state='claimed' AND claim_until <= NOW()) \
+            WHERE generation_id=$3 AND ((state IN ('pending','retry') AND available_at <= NOW()) OR (state='claimed' AND claim_until <= NOW())) \
             ORDER BY available_at,id FOR UPDATE SKIP LOCKED LIMIT 1) \
             UPDATE search_projection_jobs j SET state='claimed', claimed_by=$1, claim_until=NOW()+make_interval(secs=>$2), attempt_count=j.attempt_count+1 \
             FROM picked WHERE j.id=picked.id RETURNING j.id,j.generation_id,j.node_id,j.source_version,j.source_revision,j.operation,j.attempt_count")
-            .bind(&self.worker_id).bind(CLAIM_SECONDS).fetch_optional(&self.pool).await?;
+            .bind(&self.worker_id).bind(CLAIM_SECONDS).bind(generation_id).fetch_optional(&self.pool).await?;
         let Some(job) = job else {
             return Ok(ProcessOutcome::Empty);
         };
@@ -988,6 +1033,12 @@ impl ProjectionWorker {
             } else {
                 ProcessOutcome::LeaseLost
             }));
+        }
+        if !self
+            .provider
+            .accepts_projection_generation(generation, dimension)
+        {
+            return Ok(Err("provider_identity_mismatch"));
         }
         let embedding = match self
             .provider
