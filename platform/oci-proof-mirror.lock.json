@@ -4,7 +4,7 @@
     "max_inventory_images": 30,
     "max_parallel_pulls": 3,
     "observed_inventory_images": 25,
-    "observed_package_versions": 204,
+    "observed_package_versions": 211,
     "orphan_grace_days": 14,
     "package_version_hard_limit": 512,
     "proof_pull_images": {
@@ -23,33 +23,32 @@
     }
   },
   "generation": {
-    "buildx_version": "github.com/docker/buildx v0.37.2 2d379c0c3f22da0d2759d132a0ec81ca949098f0",
-    "completed_at": "2026-10-11T15:57:48.657752Z",
+    "buildx_version": "github.com/docker/buildx v0.39.1 334b63fe2bb0f0e89a8fd067704a0d113f57ec25",
+    "completed_at": "2026-11-27T17:25:46.645992Z",
     "docker_version": "28.0.4",
     "package_metadata": {
       "bytes": 6608,
-      "sha256": "b82b1f4e63af0f4aebf32a76902a56f141a4e5515af6ac1d1714fa9b152f1930"
+      "sha256": "087adeb1051ace7af77b6424090a0cf97e9987dae7ddb43daaafd7ef5ec321ba"
     },
     "package_preflight": {
       "bytes": 6687,
-      "sha256": "19795e7c2a423e47d5f1fc733f3357463f82c9e69104083ec1f519a8fbafaae5"
+      "sha256": "34ccd86e0683d77e27b06a662e9e2680b755fc3c6368600b9ceb629314fc7c56"
     },
     "provenance": {
-      "bytes": 19854,
-      "sha256": "654c1b870df990ac443a0083f1c8ec21e33bd00a37cc76a1b434d1041759ad7e"
+      "bytes": 19851,
+      "sha256": "ee9355a39ac339cc7713c5dedc17ec15ddfbaf34d983ba51156f522275f83bf1"
     },
     "publisher_actor": "alexdermohr",
     "read_access": {
       "bytes": 6620,
       "checked_images": 25,
-      "sha256": "3ca4bdc7b3649e59f45aac3f01f93da3dde477293da3f7479f4e27435dd4b72a"
+      "sha256": "e904a75845ee55ddd9c8c612205e515b5c4878957673e836c5bca0583f0627e2"
     },
-    "pending_seed_sha256": "c6e58a736fb6ca37304b9a16a638f96b701fa89e5baa52638493c32718af3da9",
-    "seed_sha256": "c6e73ef4328a3b4ae4b7ed4196a4c8033b3d2dc761802efc93b9d5989e187aba",
-    "source_head": "520a1670cfa87f768804afabe14c30b4597f5ff7",
-    "started_at": "2026-10-11T15:57:13.194377Z",
+    "seed_sha256": "c6e58a736fb6ca37304b9a16a638f96b701fa89e5baa52638493c32718af3da9",
+    "source_head": "d727e7912ddbd2ce4b8123a3f9b064295ef590f6",
+    "started_at": "2026-11-27T17:25:17.246642Z",
     "workflow_run_attempt": "1",
-    "workflow_run_id": "38153374540"
+    "workflow_run_id": "46041564662"
   },
   "images": {
     "barman_cloud_plugin": {
@@ -97,12 +96,12 @@
       ]
     },
     "build_node": {
-      "canonical": "docker.io/library/node:20.19.0-alpine@sha256:8bda036ddd59ea51a23bc1a1035d3b5c614e72c01366d989f4120e8adca196d4",
-      "digest": "sha256:8bda036ddd59ea51a23bc1a1035d3b5c614e72c01366d989f4120e8adca196d4",
+      "canonical": "docker.io/library/node:24.22.3-alpine@sha256:116b800c3754b440ee0aa3ed2f20f5bf3d99a554bfd9adeea09ea8017f6e85f5",
+      "digest": "sha256:116b800c3754b440ee0aa3ed2f20f5bf3d99a554bfd9adeea09ea8017f6e85f5",
       "load_into_kind": false,
-      "local_ref": "node:20.19.0-alpine",
-      "mirror": "ghcr.io/heimgewebe/weltgewebe-proof-oci@sha256:8bda036ddd59ea51a23bc1a1035d3b5c614e72c01366d989f4120e8adca196d4",
-      "mirror_tag": "ghcr.io/heimgewebe/weltgewebe-proof-oci:build_node-8bda036ddd59ea51a23bc1a1035d3b5c614e72c01366d989f4120e8adca196d4",
+      "local_ref": "node:24.22.3-alpine",
+      "mirror": "ghcr.io/heimgewebe/weltgewebe-proof-oci@sha256:116b800c3754b440ee0aa3ed2f20f5bf3d99a554bfd9adeea09ea8017f6e85f5",
+      "mirror_tag": "ghcr.io/heimgewebe/weltgewebe-proof-oci:build_node-116b800c3754b440ee0aa3ed2f20f5bf3d99a554bfd9adeea09ea8017f6e85f5",
       "suites": [
         "app-build"
       ]
@@ -344,7 +343,7 @@
     "package_type": "container",
     "repository": "ghcr.io/heimgewebe/weltgewebe-proof-oci",
     "repository_binding": "heimgewebe/commonthing",
-    "updated_at": "2026-10-11T15:57:43Z",
+    "updated_at": "2026-11-27T05:52:31Z",
     "visibility": "private"
   },
   "owner": "heimgewebe/weltgewebe",

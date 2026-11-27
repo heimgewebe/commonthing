@@ -919,7 +919,7 @@ class KubernetesPlatformContractTests(unittest.TestCase):
         self.assertEqual(result["repository_binding"], "heimgewebe/commonthing")
         self.assertEqual(result["image_count"], 25)
         self.assertTrue(result["retention"]["unbounded_growth_prevented"])
-        self.assertEqual(result["retention"]["observed_package_versions"], 204)
+        self.assertEqual(result["retention"]["observed_package_versions"], 211)
         self.assertEqual(result["retention"]["package_version_hard_limit"], 512)
         self.assertEqual(result["retention"]["orphan_grace_days"], 14)
 
@@ -2642,8 +2642,29 @@ class KubernetesPlatformContractTests(unittest.TestCase):
         self.assertFalse(any("@sha256:" in line for line in api_from + web_from))
         self.assertIn("FROM rust:1.89.0-bookworm AS builder", api_from)
         self.assertIn("FROM debian:bookworm-slim", api_from)
-        self.assertIn("FROM node:20.19.0-alpine AS builder", web_from)
+        self.assertIn("FROM node:24.22.3-alpine AS builder", web_from)
         self.assertIn("FROM caddy:2.7", web_from)
+
+    def test_node_toolchain_pins_match_attested_build_image(self) -> None:
+        version = (ROOT / ".node-version").read_text(encoding="utf-8").strip()
+        self.assertRegex(version, r"^24\.\d+\.\d+$")
+        for path in (".nvmrc", "apps/web/.nvmrc"):
+            self.assertEqual((ROOT / path).read_text(encoding="utf-8").strip(), version)
+        lock = self.oci_mirror._load_lock()
+        image = lock["images"]["build_node"]
+        pinned = f"node:{version}-alpine@{image['digest']}"
+        self.assertEqual(image["canonical"], f"docker.io/library/{pinned}")
+        self.assertEqual(
+            (ROOT / "apps/web/Dockerfile").read_text(encoding="utf-8").splitlines()[0],
+            f"FROM {pinned} AS builder",
+        )
+        compose = yaml.safe_load(
+            (ROOT / "infra/compose/compose.core.yml").read_text(encoding="utf-8")
+        )
+        self.assertEqual(compose["services"]["web"]["image"], pinned)
+        for path in ("package.json", "apps/web/package.json"):
+            package = json.loads((ROOT / path).read_text(encoding="utf-8"))
+            self.assertEqual(package["engines"]["node"], "^24.0.0")
 
     def test_strict_oci_dockerfile_rejects_comment_only_contract_tokens(self) -> None:
         lock = json.loads(
