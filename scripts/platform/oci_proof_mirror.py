@@ -160,6 +160,26 @@ def _same_json_value(left: Any, right: Any) -> bool:
         return False
 
 
+def _pinned_source_repository(reference: Any) -> str | None:
+    """Return the exact registry/repository, not its replaceable version tag.
+
+    Pending seeds can request another pinned manifest of the same approved
+    repository. Never accept an unpinned reference or malformed tag.
+    """
+    if not isinstance(reference, str) or reference.count("@") != 1:
+        return None
+    image, digest = reference.split("@", 1)
+    if not FULL_SHA256.fullmatch(digest):
+        return None
+    prefix, separator, tail = image.rpartition("/")
+    if not separator or not prefix or not tail:
+        return None
+    name, tag_separator, tag = tail.partition(":")
+    if not name or (tag_separator and not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", tag)):
+        return None
+    return f"{prefix}/{name}"
+
+
 def _load_seed(seed_bytes: bytes) -> dict[str, Any]:
     """Parse exactly the seed bytes already hashed and bound to Git HEAD."""
     try:
@@ -422,21 +442,17 @@ def _load_lock() -> dict[str, Any]:
             ):
                 raise IntegrityError("pending OCI seed changes non-digest image policy")
             old_ref, staged_ref = old_spec["canonical"], staged_spec["canonical"]
+            old_repository = _pinned_source_repository(old_ref)
             if (
-                not isinstance(old_ref, str)
-                or not isinstance(staged_ref, str)
-                or old_ref.count("@") != 1
-                or staged_ref.count("@") != 1
-                or old_ref.split("@", 1)[0] != staged_ref.split("@", 1)[0]
-                or not FULL_SHA256.fullmatch(old_ref.split("@", 1)[1])
-                or not FULL_SHA256.fullmatch(staged_ref.split("@", 1)[1])
+                old_repository is None
+                or _pinned_source_repository(staged_ref) != old_repository
             ):
                 raise IntegrityError(
                     "pending OCI seed changes image identity or pinning"
                 )
             digest_updates += old_ref != staged_ref
         if not digest_updates:
-            raise IntegrityError("pending OCI seed has no image digest changes")
+            raise IntegrityError("pending OCI seed has no pinned image changes")
         locked_seed_images = previous_images
     suite_counts = {
         suite: sum(1 for spec in images.values() if suite in spec.get("suites", []))
