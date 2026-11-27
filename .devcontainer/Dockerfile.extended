@@ -1,12 +1,12 @@
 # syntax=docker/dockerfile:1.4
-ARG BASE_IMAGE=mcr.microsoft.com/devcontainers/javascript-node:22
+ARG BASE_IMAGE=mcr.microsoft.com/devcontainers/javascript-node:24
 FROM ${BASE_IMAGE}
 ENV DEBIAN_FRONTEND=noninteractive \
     LANG=C.UTF-8 \
     LC_ALL=C.UTF-8
 
 # --- Use base image user (node) to avoid UID conflicts ---
-# The base image mcr.microsoft.com/devcontainers/javascript-node:22
+# The base image mcr.microsoft.com/devcontainers/javascript-node:24
 # already provides the `node` user with UID 1000.
 # Hard invariant: if the requested UID is already owned by a different user, fail
 # fast instead of renaming the foreign user. The devcontainer CLI is responsible

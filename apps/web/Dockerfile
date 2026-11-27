@@ -1,4 +1,4 @@
-FROM node:20.19.0-alpine@sha256:8bda036ddd59ea51a23bc1a1035d3b5c614e72c01366d989f4120e8adca196d4 AS builder
+FROM node:24.22.3-alpine@sha256:116b800c3754b440ee0aa3ed2f20f5bf3d99a554bfd9adeea09ea8017f6e85f5 AS builder
 WORKDIR /workspace
 RUN corepack enable && corepack prepare pnpm@9.11.0 --activate
 COPY apps/web/package.json apps/web/pnpm-lock.yaml ./apps/web/

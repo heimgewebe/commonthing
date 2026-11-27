@@ -10,6 +10,24 @@ relations:
 ---
 # Deployment-Änderungsprotokoll
 
+## 2026-11-27 - Node-Build- und Entwicklungsimage auf Node 24 LTS
+
+**Geänderte Bereiche:** `apps/web/Dockerfile` (Builder-Stage),
+`infra/compose/compose.core.yml` (Dienst `web`, Profil `dev`),
+`platform/oci-proof-mirror.lock.json` sowie `.node-version` und beide
+`.nvmrc`.
+
+**Änderung:** Beide Stellen nutzen statt `node:20.19.0-alpine` jetzt
+`node:24.22.3-alpine@sha256:116b800c3754b440ee0aa3ed2f20f5bf3d99a554bfd9adeea09ea8017f6e85f5`.
+Der Digest ist über den kontrollierten OCI-Proof-Mirror attestiert
+(Publisher-Lauf `46041564662` auf `d727e7912ddb`). CI, Entwicklungsstack
+und Web-Build verwenden damit dieselbe Node-Hauptversion; `engines`
+verlangt `^24.0.0`.
+
+**Produktionsgrenze:** Die Runtime-Stage des Web-Images (Caddy) und die
+Produktions-Compose-Dateien bleiben unverändert. Diese Quellkorrektur ist
+kein Deployment; ein Rollout ist nicht behauptet.
+
 ## 2026-11-02 - PostgreSQL-Sicherheitsaktualisierung (CVE-2026-16239)
 
 **Gezielter Fix:** Der am 02.11.2026 auf `commonserver` nachgewiesene
