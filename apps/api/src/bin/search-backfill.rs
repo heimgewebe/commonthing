@@ -55,7 +55,7 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     let mut completed = 0usize;
     while completed < max_jobs {
-        match worker.claim_and_process_one().await? {
+        match worker.claim_and_process_one(&generation_id).await? {
             ProcessOutcome::Empty => break,
             _ => completed += 1,
         }

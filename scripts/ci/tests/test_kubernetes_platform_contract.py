@@ -1979,6 +1979,24 @@ class KubernetesPlatformContractTests(unittest.TestCase):
             locked["generation"]["seed_sha256"],
         )
 
+    def test_pending_seed_allows_pinned_version_change_without_activating_it(self) -> None:
+        def update_node(seed):
+            seed["images"]["build_node"]["canonical"] = (
+                "docker.io/library/node:24.22.3-alpine@sha256:" + "1" * 64
+            )
+
+        locked = self._validate_pending_oci_seed(mutate_seed=update_node)
+        current = json.loads(
+            (ROOT / "platform/oci-proof-mirror.lock.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(locked["images"], current["images"])
+        self.assertNotEqual(
+            locked["generation"]["pending_seed_sha256"],
+            locked["generation"]["seed_sha256"],
+        )
+
     def test_oci_mirror_pending_seed_parses_the_same_verified_bytes(self) -> None:
         """An on-disk swap after the HEAD check cannot replace policy input."""
         untrusted = json.loads(
@@ -2037,6 +2055,22 @@ class KubernetesPlatformContractTests(unittest.TestCase):
                 "different registry",
                 lambda seed: seed["images"]["build_debian"].__setitem__(
                     "canonical", "docker.io/library/ubuntu@sha256:" + "0" * 64
+                ),
+                None,
+                self.oci_mirror.IntegrityError,
+            ),
+            (
+                "changed registry with same image",
+                lambda seed: seed["images"]["build_debian"].__setitem__(
+                    "canonical", "example.invalid/library/debian:bookworm-slim@sha256:" + "0" * 64
+                ),
+                None,
+                self.oci_mirror.IntegrityError,
+            ),
+            (
+                "malformed version tag",
+                lambda seed: seed["images"]["build_debian"].__setitem__(
+                    "canonical", "docker.io/library/debian:bookworm:invalid@sha256:" + "0" * 64
                 ),
                 None,
                 self.oci_mirror.IntegrityError,

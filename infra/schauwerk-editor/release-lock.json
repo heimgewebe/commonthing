@@ -1,8 +1,8 @@
 {
   "schema_version": "weltgewebe-schauwerk-runtime-lock.v1",
   "source_repository": "heimgewebe/schauwerk",
-  "source_commit": "88cb97cdbf3c8bf317b7d44df409b2c5fc8b91f5",
+  "source_commit": "c7184999fa68344926310bb62cbbd0acadfc13e0",
   "image_repository": "ghcr.io/heimgewebe/schauwerk-schaubild",
-  "image_digest": "sha256:987e4dab6cb9ac07c041ea9f5c7366ae912e517b34e82e47023d6786aa4282ac",
+  "image_digest": "sha256:9687ce3b3214c1464d5e8fcca1718cca6f6d98acdee57f055c88b2d2017257ea",
   "public_base_path": "/schaubild"
 }
