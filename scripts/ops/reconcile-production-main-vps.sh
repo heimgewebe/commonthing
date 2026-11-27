@@ -21,7 +21,8 @@ BASEMAP_DARK_STYLE_URL="${WELTGEWEBE_FRONTEND_BASEMAP_DARK_STYLE_URL:-https://co
 BASEMAP_PMTILES_URL="${WELTGEWEBE_FRONTEND_BASEMAP_PMTILES_URL:-https://commonthing.net/local-basemap/basemap-germany.pmtiles}"
 SCHAUWERK_MANIFEST_URL="${WELTGEWEBE_SCHAUWERK_MANIFEST_URL:-https://commonthing.net/schaubild/manifest.json}"
 API_URL="${WELTGEWEBE_API_VERSION_URL:-https://commonthing.net/api/version}"
-NODE_BUILD_IMAGE="${WELTGEWEBE_NODE_BUILD_IMAGE:-docker.io/library/node@sha256:8898f8ed3c0126667837b678979b4ed83306c856a1227c8bf5f5f77740c25cd6}"
+# Node 24.22.3-bookworm: GNU tar and Corepack are required by the archive build.
+NODE_BUILD_IMAGE="${WELTGEWEBE_NODE_BUILD_IMAGE:-docker.io/library/node@sha256:49f7adaf9f1574bc45c20ea317139b39a59d7e758d0e93745e112fd85cb42623}"
 DEPLOY_HELPER="${WELTGEWEBE_DEPLOY_HELPER:-/usr/local/libexec/weltgewebe-deploy-exact-commit}"
 AUTHORIZER="/usr/local/libexec/weltgewebe-verify-production-hold-release"
 LIVE_VERIFIER="${WELTGEWEBE_LIVE_VERIFIER:-/usr/local/libexec/weltgewebe-verify-public-release}"
@@ -1897,7 +1898,7 @@ temporary_artifact="$ARTIFACT_ROOT/.web-$target_commit.$$.tmp"
     --env PUBLIC_BASEMAP_MODE=local-sovereign \
     --env PUBLIC_BASEMAP_VARIANT=germany \
     "$NODE_BUILD_IMAGE" \
-    sh -lc '{ /usr/bin/tar -xf /source.tar -C /workspace && cd /workspace/apps/web && mkdir -p "$HOME" "$COREPACK_HOME" "$npm_config_cache" /tmp/bin && corepack enable --install-directory /tmp/bin pnpm && export PATH="/tmp/bin:$PATH" && pnpm install --frozen-lockfile && pnpm build; } >&2 && exec /usr/bin/tar --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 --numeric-owner -czf - build'
+    sh -lc '{ actual_node="$(node --version)" && echo "production_node_version=$actual_node" && test "$actual_node" = v24.22.3 && /usr/bin/tar -xf /source.tar -C /workspace && cd /workspace/apps/web && mkdir -p "$HOME" "$COREPACK_HOME" "$npm_config_cache" /tmp/bin && corepack enable --install-directory /tmp/bin pnpm && export PATH="/tmp/bin:$PATH" && pnpm install --frozen-lockfile && pnpm build; } >&2 && exec /usr/bin/tar --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 --numeric-owner -czf - build'
 ) > "$temporary_artifact"
 rm -f -- "$source_archive"
 source_archive=""
