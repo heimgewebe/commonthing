@@ -373,14 +373,27 @@ def _previously_verified_images() -> dict[str, Any]:
     if not oci_proof_mirror.LOCK_PATH.exists():
         # First publication has no prior generation to reuse.
         return {}
-    lock = oci_proof_mirror._load_lock()
-    committed = json.loads(
-        oci_proof_mirror._git_bytes(
-            ["show", "HEAD:platform/oci-proof-mirror.lock.json"]
+    try:
+        lock = oci_proof_mirror._load_lock()
+        committed = json.loads(
+            oci_proof_mirror._git_bytes(
+                ["show", "HEAD:platform/oci-proof-mirror.lock.json"]
+            )
         )
-    )
-    if lock != committed:
-        raise IntegrityError("OCI mirror lock differs from reviewed HEAD")
+        if lock != committed:
+            raise IntegrityError("OCI mirror lock differs from reviewed HEAD")
+    except (
+        oci_proof_mirror.IntegrityError,
+        IntegrityError,
+        json.JSONDecodeError,
+        UnicodeError,
+        OSError,
+    ) as error:
+        # A rejected prior generation has no reuse authority. Recover by
+        # performing fresh canonical checks, never by trusting its entries.
+        # BudgetError and unexpected programming failures remain hard errors.
+        print(f"OCI mirror prior lock reuse unavailable: {error}", file=sys.stderr)
+        return {}
     return lock["images"]
 
 

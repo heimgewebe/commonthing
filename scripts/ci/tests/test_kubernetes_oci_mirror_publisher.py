@@ -207,8 +207,73 @@ class KubernetesOciMirrorPublisherContractTests(unittest.TestCase):
         ), mock.patch.object(
             oci_proof_mirror, "_git_bytes", return_value=b'{"images": {}}'
         ):
-            with self.assertRaisesRegex(self.publisher.IntegrityError, "differs from reviewed HEAD"):
+            with mock.patch.object(self.publisher.sys, "stderr") as stderr:
+                self.assertEqual(self.publisher._previously_verified_images(), {})
+            self.assertIn("differs from reviewed HEAD", stderr.write.call_args_list[0].args[0])
+
+    def test_rejected_prior_lock_has_no_reuse_authority(self) -> None:
+        from scripts.platform import oci_proof_mirror
+
+        output_dir = ROOT / "build/kubernetes-platform"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=output_dir) as tmp:
+            path = Path(tmp) / "lock.json"
+            path.write_text('{"schema_version": 0}', encoding="utf-8")
+            with mock.patch.object(oci_proof_mirror, "LOCK_PATH", path), mock.patch.object(
+                self.publisher.sys, "stderr"
+            ) as stderr, mock.patch.object(
+                self.publisher, "_git_head", return_value="c" * 40
+            ), mock.patch.object(
+                self.publisher, "_sha256", return_value="d" * 64
+            ), mock.patch.object(
+                self.publisher, "_tool_versions", return_value={"docker": "x", "buildx": "y"}
+            ), mock.patch.object(
+                self.publisher, "_publish_one", side_effect=lambda *args: {"action": "reused"}
+            ) as publish_one:
+                result = self.publisher.publish("c" * 40, "d" * 64, Path(tmp) / "provenance.json")
+            self.assertIn("unsupported OCI mirror lock schema", stderr.write.call_args_list[0].args[0])
+        self.assertEqual(result["status"], "pass")
+        flags = {call.args[1]: call.args[5] for call in publish_one.call_args_list}
+        self.assertEqual(flags, {name: False for name in self.publisher.EXPECTED_IMAGES})
+
+    def test_prior_lock_budget_failure_stays_blocking(self) -> None:
+        from scripts.platform import oci_proof_mirror
+
+        with mock.patch.object(
+            oci_proof_mirror, "_load_lock",
+            side_effect=oci_proof_mirror.BudgetError("package limit exceeded"),
+        ):
+            with self.assertRaisesRegex(oci_proof_mirror.BudgetError, "package limit exceeded"):
                 self.publisher._previously_verified_images()
+
+    def test_publish_uses_only_exact_prior_canonical_bindings(self) -> None:
+        seed = self.publisher._load_seed()
+        names = list(seed["images"])
+        exact, changed = names[:2]
+        previous = {
+            exact: {"canonical": seed["images"][exact]["canonical"]},
+            changed: {
+                "canonical": seed["images"][changed]["canonical"].rsplit("@", 1)[0]
+                + "@sha256:" + "0" * 64,
+            },
+        }
+        output_dir = ROOT / "build/kubernetes-platform"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=output_dir) as tmp, mock.patch.object(
+            self.publisher, "_git_head", return_value="c" * 40
+        ), mock.patch.object(
+            self.publisher, "_sha256", return_value="d" * 64
+        ), mock.patch.object(
+            self.publisher, "_tool_versions", return_value={"docker": "x", "buildx": "y"}
+        ), mock.patch.object(
+            self.publisher, "_previously_verified_images", return_value=previous
+        ), mock.patch.object(
+            self.publisher, "_publish_one", side_effect=lambda *args: {"action": "reused"}
+        ) as publish_one:
+            result = self.publisher.publish("c" * 40, "d" * 64, Path(tmp) / "provenance.json")
+        self.assertEqual(result["status"], "pass")
+        flags = {call.args[1]: call.args[5] for call in publish_one.call_args_list}
+        self.assertEqual(flags, {name: name == exact for name in names})
 
     def test_bootstrap_has_no_prior_authority(self) -> None:
         from scripts.platform import oci_proof_mirror
