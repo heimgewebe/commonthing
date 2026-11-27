@@ -44,6 +44,7 @@
       "checked_images": 25,
       "sha256": "3ca4bdc7b3649e59f45aac3f01f93da3dde477293da3f7479f4e27435dd4b72a"
     },
+    "pending_seed_sha256": "c6e58a736fb6ca37304b9a16a638f96b701fa89e5baa52638493c32718af3da9",
     "seed_sha256": "c6e73ef4328a3b4ae4b7ed4196a4c8033b3d2dc761802efc93b9d5989e187aba",
     "source_head": "520a1670cfa87f768804afabe14c30b4597f5ff7",
     "started_at": "2026-10-11T15:57:13.194377Z",
