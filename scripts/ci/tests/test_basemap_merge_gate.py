@@ -104,6 +104,27 @@ class BasemapRequiredMergeGateTests(unittest.TestCase):
             with self.subTest(pattern=pattern):
                 self.assertIsNone(re.search(r"(?<!\\)\+", pattern))
 
+    def test_node_runtime_file_of_proof_jobs_triggers_both_proof_paths(self) -> None:
+        # A Node bump touches only the version file. Derive it from the proof
+        # workflow so a renamed or added runtime file cannot skip the proofs.
+        runtime_files = set(
+            re.findall(
+                r"""^\s+node-version-file:\s*["']([^"']+)["']\s*$""",
+                BASEMAP.read_text(encoding="utf-8"),
+                re.MULTILINE,
+            )
+        )
+        self.assertEqual(runtime_files, {".node-version"})
+        for path in sorted(runtime_files):
+            for source, globs in (
+                ("pull_request", affected_paths()),
+                ("main_push", standalone_push_paths()),
+            ):
+                with self.subTest(path=path, source=source):
+                    self.assertTrue(
+                        any(fnmatch.fnmatchcase(path, pattern) for pattern in globs)
+                    )
+
     def test_shared_map_layout_and_styles_trigger_both_proof_paths(self) -> None:
         # /map inherits the root layout, app.css and token-based map controls.
         for path in (
