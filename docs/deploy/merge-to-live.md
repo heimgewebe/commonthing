@@ -119,6 +119,29 @@ Reconciler innerhalb des laufenden Deployments gestartet. Der nächste reguläre
 Timerlauf verwendet damit den neu gemergten Operatorvertrag. Reine
 `--plan-only`-Läufe bleiben ohne diese Betriebsänderung.
 
+## Übergang des produktiven Web-Builders auf Node 24
+
+Der Reconciler baut den Zielcommit mit dem **bereits installierten**
+Helfer, bevor er den neuen Helfer aus dem Release aktiviert. Deshalb ist
+der Node-24-Wechsel zweistufig:
+
+1. Diesen vorbereitenden Release mit dem noch kompatiblen Engine-Bereich
+   (Node 20/22 und 24) regulär freigeben, bauen und produktiv verifizieren.
+   Der alte Node-20-Builder kann diesen Zwischenstand noch erzeugen. Der
+   installierte neue Reconciler verwendet danach das digestgepinnte
+   Debian-Image Node 24.22.3 (Bookworm, GNU tar und Corepack).
+2. Erst nach öffentlichem Commit-Readback und Hash-Readback des neu
+   installierten Reconciler-Helfers den abschließenden Node-24-only-Release
+   integrieren und regulär freigeben. Den echten Build mit Node 24.22.3
+   (Versionsausgabe im Buildlog) und die öffentliche Frontend-/API-Identität
+   prüfen. Der Builder bricht vor pnpm ab, wenn das Image eine andere
+   Node-Version liefert; ein lokaler Override muss dieselbe Version liefern.
+
+Die Zwischenstufe ist keine abgeschlossene Node-24-Migration. Ein Merge
+beider Stufen vor der ersten produktiven Aktivierung würde den alten
+Builder an der strikten Engine-Prüfung scheitern lassen. Production HOLD,
+Recovery-Belege und alle bestehenden Sperren gelten in beiden Stufen.
+
 ## Sicherheitsgrenze
 
 Der bestehende Checkout `/opt/weltgewebe` darf betriebliche Änderungen und

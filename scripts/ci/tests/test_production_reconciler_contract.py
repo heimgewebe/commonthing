@@ -842,7 +842,7 @@ prune_releases
     def test_reconciler_build_cannot_write_release_or_source(self) -> None:
         script = self.read("scripts/ops/reconcile-production-main-vps.sh")
         self.assertIn(
-            "docker.io/library/node@sha256:8898f8ed3c0126667837b678979b4ed83306c856a1227c8bf5f5f77740c25cd6",
+            "docker.io/library/node@sha256:49f7adaf9f1574bc45c20ea317139b39a59d7e758d0e93745e112fd85cb42623",
             script,
         )
         for expected in (
@@ -856,6 +856,7 @@ prune_releases
             "--tmpfs /workspace:rw,exec,nosuid,nodev,size=3g,mode=1777",
             "dst=/source.tar,readonly",
             'GIT_COMMIT_SHA="$target_commit"',
+            'actual_node="$(node --version)" && echo "production_node_version=$actual_node" && test "$actual_node" = v24.22.3 && /usr/bin/tar',
         ):
             self.assertIn(expected, script)
         for forbidden in (
