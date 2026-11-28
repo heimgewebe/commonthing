@@ -1,6 +1,7 @@
 <script lang="ts">
   import { parseOptionalNodeLocation } from "$lib/api/nodeLocation";
   import { createEventDispatcher, onDestroy, tick } from "svelte";
+  import { invalidate } from "$app/navigation";
   import { selection } from "$lib/stores/uiView";
   import { authStore } from "$lib/auth/store";
   import { ApiRequestError, replaceNode } from "$lib/api/domainWrites";
@@ -64,6 +65,8 @@
   let formTopics: KnottingTopic[] = $state([]);
   let formKeywords = $state("");
   let conflictNode: NodeDetails | null = $state(null);
+  // A selection can return to the same ID while an earlier mutation is pending.
+  let mutationGeneration = 0;
   let SimilarNodesComponent:
     | typeof import("./SimilarNodes.svelte").default
     | null = $state(null);
@@ -97,6 +100,8 @@
   }
 
   function resetMutationState() {
+    mutationGeneration += 1;
+    conflictNode = null;
     activeTab = "uebersicht";
     editing = false;
     saving = false;
@@ -113,7 +118,18 @@
   });
   const nodeDetailsStore = detailsLoader.details;
   const isLoadingDetailsStore = detailsLoader.isLoading;
-  onDestroy(detailsLoader.destroy);
+  onDestroy(() => {
+    mutationGeneration += 1;
+    detailsLoader.destroy();
+  });
+
+  function mutationIsCurrent(id: string, generation: number): boolean {
+    return (
+      generation === mutationGeneration &&
+      $selection?.type === "node" &&
+      $selection.id === id
+    );
+  }
 
   async function ensureSimilarNodesComponent() {
     if (similarNodesLoadStarted) return;
@@ -202,9 +218,12 @@
   }
 
   async function saveNode() {
-    const id = nodeDetails?.id || $selection?.id;
+    const id = $selection?.type === "node" ? $selection.id : undefined;
     const location = parseOptionalNodeLocation(formLat, formLon);
-    if (!id) return;
+    if (!id || saving || deleting || (nodeDetails && nodeDetails.id !== id))
+      return;
+    const generation = mutationGeneration;
+    const revision = nodeDetails?.updated_at;
     if (!formTitle.trim() || !isNodeKind(formKind)) {
       mutationError = "Titel und eine gültige Knotenart werden benötigt.";
       return;
@@ -228,8 +247,17 @@
           info: formInfo.trim() || undefined,
           tags: combineKnottingTags(formTopics, formKeywords.split(",")),
         },
-        nodeDetails?.updated_at,
+        revision,
       );
+      // The canonical map still needs the update, but another selection must
+      // never inherit this operation's result or form state.
+      dispatch("domainChanged", {
+        kind: "node",
+        id,
+        action: "updated",
+        node: updatedNode,
+      });
+      if (!mutationIsCurrent(id, generation)) return;
       detailsLoader.setDetails({
         ...(nodeDetails ?? {}),
         ...updatedNode,
@@ -237,14 +265,11 @@
       conflictNode = null;
       editing = false;
       activeTab = "uebersicht";
-      void focusAfterRender(() => overviewTab);
-      dispatch("domainChanged", {
-        kind: "node",
-        id,
-        action: "updated",
-        node: updatedNode,
-      });
+      void focusAfterRender(() =>
+        mutationIsCurrent(id, generation) ? overviewTab : null,
+      );
     } catch (error) {
+      if (!mutationIsCurrent(id, generation)) return;
       if (
         error instanceof ApiRequestError &&
         error.status === 412 &&
@@ -259,10 +284,11 @@
           ...currentNode,
         } as NodeDetails);
       } else {
-        mutationError = await describeMutationError(error, "save");
+        const message = await describeMutationError(error, "save");
+        if (mutationIsCurrent(id, generation)) mutationError = message;
       }
     } finally {
-      saving = false;
+      if (mutationIsCurrent(id, generation)) saving = false;
     }
   }
 
@@ -287,14 +313,23 @@
   }
 
   async function removeNode() {
-    const id = nodeDetails?.id || $selection?.id;
-    if (!id || deleting) return;
+    const id = $selection?.type === "node" ? $selection.id : undefined;
+    if (!id || deleting || saving || (nodeDetails && nodeDetails.id !== id))
+      return;
+    const generation = mutationGeneration;
+    const revision = nodeDetails?.updated_at;
 
     deleting = true;
     mutationError = "";
     try {
       const { deleteNode } = await import("$lib/api/nodeDelete");
-      const receipt = await deleteNode(id, nodeDetails?.updated_at);
+      const receipt = await deleteNode(id, revision);
+      if (!mutationIsCurrent(id, generation)) {
+        // The map's deletion event closes the current panel. Refresh canonical
+        // data instead when the originating panel is no longer current.
+        await invalidate("weltgewebe:domain-data");
+        return;
+      }
       let action: "deleted" | "archived" = "deleted";
       if (receipt.conversation.effect === "archived") {
         archiveHref = `/archive?id=${encodeURIComponent(receipt.conversation.archive_id)}`;
@@ -302,6 +337,7 @@
       }
       dispatch("domainChanged", { kind: "node", id, action, receipt });
     } catch (error) {
+      if (!mutationIsCurrent(id, generation)) return;
       if (
         error instanceof ApiRequestError &&
         error.status === 412 &&
@@ -314,12 +350,17 @@
           ...(error.body as object),
         } as NodeDetails);
       } else {
-        mutationError = await describeMutationError(error, "delete");
+        const message = await describeMutationError(error, "delete");
+        if (mutationIsCurrent(id, generation)) mutationError = message;
       }
     } finally {
-      deleting = false;
-      deleteConfirmationOpen = false;
-      void focusAfterRender(() => deleteTriggerButton);
+      if (mutationIsCurrent(id, generation)) {
+        deleting = false;
+        deleteConfirmationOpen = false;
+        void focusAfterRender(() =>
+          mutationIsCurrent(id, generation) ? deleteTriggerButton : null,
+        );
+      }
     }
   }
   let nodeDetails = $derived.by(() => $nodeDetailsStore);

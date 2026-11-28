@@ -119,9 +119,10 @@ export function setDirectConversationBlocked(
 
 export function listDirectMessages(
   conversationId: string,
+  cursor?: string | null,
   signal?: AbortSignal,
 ): Promise<MessagePage> {
-  return listConversationMessages(conversationId, null, signal);
+  return listConversationMessages(conversationId, cursor, signal);
 }
 
 export function sendDirectMessage(

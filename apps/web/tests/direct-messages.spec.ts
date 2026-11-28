@@ -483,3 +483,549 @@ test("ein verspätetes Öffnen überschreibt keinen neueren Sidebar-Zustand", as
   await expect(page.getByRole("heading", { name: "Alice" })).toBeVisible();
   await expect(page.getByRole("alert")).toHaveCount(0);
 });
+
+test("verspätetes Senden behält Bobs Verlauf und Entwurf und aktualisiert Alice", async ({
+  page,
+}) => {
+  await installStaticBuildFallback(page);
+  await mockApiResponses(page, {
+    auth: {
+      authenticated: true,
+      account_id: "current-account",
+      role: "weber",
+    },
+  });
+  const api = await installDirectMessagesApi(page);
+  let releaseSend!: () => void;
+  const sendReleased = new Promise<void>((resolve) => {
+    releaseSend = resolve;
+  });
+  await page.route("**/api/conversations/*/messages", async (route) => {
+    if (route.request().method() !== "POST") return route.fallback();
+    expect(new URL(route.request().url()).pathname).toBe(
+      `/api/conversations/${ALICE_CONVERSATION_ID}/messages`,
+    );
+    await sendReleased;
+    return route.fulfill({
+      status: 201,
+      json: {
+        ...message(
+          ALICE_CONVERSATION_ID,
+          "current-account",
+          "Ich",
+          "Nur an Alice",
+        ),
+        id: "aaaaaaaa-1111-4111-8111-111111111111",
+      },
+    });
+  });
+
+  await page.goto("/nachrichten");
+  api.releaseAliceResponse();
+  api.releaseAliceReadResponse();
+  const alice = page.getByRole("button", { name: /Alice/ });
+  const bob = page.getByRole("button", { name: /Bob/ });
+  const composer = page.getByRole("textbox", { name: "Nachricht" });
+  const history = page.locator(".conversation .message-list");
+  await alice.click();
+  await expect(history).toContainText("Verspätete Nachricht von Alice");
+  await composer.fill("Nur an Alice");
+  const sendStarted = page.waitForRequest(
+    (request) =>
+      request.method() === "POST" &&
+      new URL(request.url()).pathname ===
+        `/api/conversations/${ALICE_CONVERSATION_ID}/messages`,
+  );
+  await page.getByRole("button", { name: "Senden", exact: true }).click();
+  await sendStarted;
+  try {
+    await bob.click();
+    await expect(history).toContainText("Aktuelle Nachricht von Bob");
+    await expect(composer).toHaveValue("");
+    await composer.fill("Entwurf für Bob");
+    releaseSend();
+    await expect(alice).toContainText("Nur an Alice");
+    await expect(bob).not.toContainText("Nur an Alice");
+    await expect(history).not.toContainText("Nur an Alice");
+    await expect(composer).toHaveValue("Entwurf für Bob");
+    await alice.click();
+    await expect(composer).toHaveValue("");
+    await bob.click();
+    await expect(composer).toHaveValue("Entwurf für Bob");
+  } finally {
+    releaseSend();
+  }
+});
+
+test("verspätetes Blockieren ändert ausschließlich das ursprüngliche Gespräch", async ({
+  page,
+}) => {
+  await installStaticBuildFallback(page);
+  await mockApiResponses(page, {
+    auth: {
+      authenticated: true,
+      account_id: "current-account",
+      role: "weber",
+    },
+  });
+  const api = await installDirectMessagesApi(page);
+  let releaseBlock!: () => void;
+  const blockReleased = new Promise<void>((resolve) => {
+    releaseBlock = resolve;
+  });
+  await page.route("**/api/direct-conversations/*/block", async (route) => {
+    await blockReleased;
+    return route.fulfill({
+      status: 200,
+      json: { ...conversations[0], blocked_by_me: true, can_send: false },
+    });
+  });
+  await page.goto("/nachrichten");
+  api.releaseAliceResponse();
+  api.releaseAliceReadResponse();
+  const alice = page.getByRole("button", { name: /Alice/ });
+  const bob = page.getByRole("button", { name: /Bob/ });
+  await alice.click();
+  await expect(page.getByRole("heading", { name: "Alice" })).toBeVisible();
+  const blockStarted = page.waitForRequest(
+    (request) =>
+      request.method() === "PUT" &&
+      new URL(request.url()).pathname ===
+        `/api/direct-conversations/${ALICE_CONVERSATION_ID}/block`,
+  );
+  await page.getByRole("button", { name: "Blockieren", exact: true }).click();
+  await blockStarted;
+  try {
+    await bob.click();
+    await expect(page.locator(".conversation .message-list")).toContainText(
+      "Aktuelle Nachricht von Bob",
+    );
+    const blockFinished = page.waitForResponse(
+      (response) =>
+        response.request().method() === "PUT" &&
+        new URL(response.url()).pathname.endsWith("/block"),
+    );
+    releaseBlock();
+    await blockFinished;
+    await page.evaluate(
+      () =>
+        new Promise<void>((resolve) =>
+          requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+        ),
+    );
+    await expect(page.getByRole("heading", { name: "Bob" })).toBeVisible();
+    await expect(
+      page.getByRole("textbox", { name: "Nachricht" }),
+    ).toBeVisible();
+    await alice.click();
+    await expect(page.getByRole("button", { name: "Freigeben" })).toBeVisible();
+  } finally {
+    releaseBlock();
+  }
+});
+
+const ALICE_OLDER_CURSOR = "alice-before-50+opaque/=";
+const BOB_OLDER_CURSOR = "bob-before-first";
+
+function numberedHistoryMessage(
+  conversationId: string,
+  ordinal: number,
+  content: string,
+  createdAt: string,
+) {
+  const alice = conversationId === ALICE_CONVERSATION_ID;
+  return {
+    ...message(
+      conversationId,
+      alice ? "alice-account" : "bob-account",
+      alice ? "Alice" : "Bob",
+      content,
+    ),
+    id: `${conversationId.slice(0, 8)}-3333-4333-8333-${String(ordinal).padStart(12, "0")}`,
+    created_at: createdAt,
+    updated_at: createdAt,
+  };
+}
+
+async function installPagedHistoryApi(page: Page, deferAliceOlder = false) {
+  await installStaticBuildFallback(page);
+  await mockApiResponses(page, {
+    auth: { authenticated: true, account_id: "current-account", role: "weber" },
+  });
+  const api = await installDirectMessagesApi(page);
+  api.releaseAliceResponse();
+  api.releaseAliceReadResponse();
+
+  const recentAlice = Array.from({ length: 50 }, (_, index) =>
+    numberedHistoryMessage(
+      ALICE_CONVERSATION_ID,
+      index + 3,
+      `Alice Nachricht ${index + 3}`,
+      new Date(Date.UTC(2026, 7, 9, 10, 3, index + 2)).toISOString(),
+    ),
+  );
+  const olderAlice = [
+    // A boundary overlap must not duplicate or overwrite an already loaded message.
+    { ...recentAlice[0], content: "Veraltete Überlappung" },
+    numberedHistoryMessage(
+      ALICE_CONVERSATION_ID,
+      2,
+      "Alice Nachricht 2",
+      "2026-08-09T10:03:00.1Z",
+    ),
+    numberedHistoryMessage(
+      ALICE_CONVERSATION_ID,
+      1,
+      "Alice Nachricht 1",
+      "2026-08-09T10:03:00Z",
+    ),
+  ];
+  const requests: Array<{ id: string; cursor: string | null }> = [];
+  let releaseAliceOlder!: () => void;
+  let settleAliceOlder!: () => void;
+  const aliceOlderReleased = new Promise<void>((resolve) => {
+    releaseAliceOlder = resolve;
+  });
+  const aliceOlderSettled = new Promise<void>((resolve) => {
+    settleAliceOlder = resolve;
+  });
+
+  await page.route(
+    /\/api\/conversations\/[^/]+\/messages(?:\?.*)?$/,
+    async (route) => {
+      const request = route.request();
+      if (request.method() !== "GET") return route.fallback();
+      const url = new URL(request.url());
+      const id = decodeURIComponent(url.pathname.split("/")[3]);
+      const cursor = url.searchParams.get("cursor");
+      requests.push({ id, cursor });
+
+      let items;
+      let nextCursor: string | null = null;
+      if (id === ALICE_CONVERSATION_ID && cursor === null) {
+        items = [...recentAlice].reverse();
+        nextCursor = ALICE_OLDER_CURSOR;
+      } else if (
+        id === ALICE_CONVERSATION_ID &&
+        cursor === ALICE_OLDER_CURSOR
+      ) {
+        if (deferAliceOlder) await aliceOlderReleased;
+        items = olderAlice;
+      } else if (id === BOB_CONVERSATION_ID && cursor === null) {
+        items = [
+          numberedHistoryMessage(
+            BOB_CONVERSATION_ID,
+            2,
+            "Bob aktuelle Nachricht",
+            "2026-08-09T10:03:01Z",
+          ),
+        ];
+        nextCursor = BOB_OLDER_CURSOR;
+      } else if (id === BOB_CONVERSATION_ID && cursor === BOB_OLDER_CURSOR) {
+        items = [
+          numberedHistoryMessage(
+            BOB_CONVERSATION_ID,
+            1,
+            "Bob ältere Nachricht",
+            "2026-08-09T10:03:00Z",
+          ),
+        ];
+      } else {
+        return route.fulfill({
+          status: 400,
+          contentType: "application/json",
+          body: JSON.stringify({ code: "invalid_cursor" }),
+        });
+      }
+
+      try {
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({
+            items,
+            page: {
+              limit: 50,
+              next_cursor: nextCursor,
+              has_more: nextCursor !== null,
+            },
+          }),
+        });
+      } catch (error) {
+        // An aborted Alice request after switching is also a valid transport outcome.
+        if (
+          !(
+            deferAliceOlder &&
+            id === ALICE_CONVERSATION_ID &&
+            cursor === ALICE_OLDER_CURSOR
+          )
+        )
+          throw error;
+      } finally {
+        if (id === ALICE_CONVERSATION_ID && cursor === ALICE_OLDER_CURSOR)
+          settleAliceOlder();
+      }
+    },
+  );
+  return { requests, api, releaseAliceOlder, aliceOlderSettled };
+}
+
+test("ältere Direktnachrichten werden über den Cursor vollständig und ohne Duplikate geladen", async ({
+  page,
+}) => {
+  const history = await installPagedHistoryApi(page);
+  await page.goto("/nachrichten");
+  await page.getByRole("button", { name: /Alice/ }).click();
+  const list = page.locator(".conversation .message-list");
+  const rows = list.locator("article.message");
+  await expect(rows).toHaveCount(50);
+  await expect(rows.last()).toContainText("Alice Nachricht 52");
+  await list.evaluate((element) => {
+    element.scrollTop = 0;
+  });
+
+  const original = list.getByText("Alice Nachricht 3", { exact: true });
+  const older = page.getByRole("button", { name: "Ältere Nachrichten laden" });
+  await expect(older).toBeVisible();
+  const originalTop = await original.evaluate(
+    (element) => element.getBoundingClientRect().top,
+  );
+  await older.click();
+
+  await expect(rows).toHaveCount(52);
+  await expect(rows.nth(0)).toContainText("Alice Nachricht 1");
+  await expect(rows.nth(1)).toContainText("Alice Nachricht 2");
+  await expect(rows.nth(2)).toContainText("Alice Nachricht 3");
+  await expect(rows.last()).toContainText("Alice Nachricht 52");
+  await expect(original).toHaveCount(1);
+  await expect(list).not.toContainText("Veraltete Überlappung");
+  await expect(older).toHaveCount(0);
+  expect(history.requests).toEqual([
+    { id: ALICE_CONVERSATION_ID, cursor: null },
+    { id: ALICE_CONVERSATION_ID, cursor: ALICE_OLDER_CURSOR },
+  ]);
+  expect(history.api.markedReadConversationIds).toEqual([
+    ALICE_CONVERSATION_ID,
+  ]);
+  await expect
+    .poll(async () =>
+      Math.abs(
+        (await original.evaluate(
+          (element) => element.getBoundingClientRect().top,
+        )) - originalTop,
+      ),
+    )
+    .toBeLessThanOrEqual(3);
+});
+
+test("eine verspätete ältere Seite bleibt beim Wechsel auf Bob Alice zugeordnet", async ({
+  page,
+}) => {
+  const history = await installPagedHistoryApi(page, true);
+  await page.goto("/nachrichten");
+  await page.getByRole("button", { name: /Alice/ }).click();
+  const list = page.locator(".conversation .message-list");
+  await expect(list.locator("article.message")).toHaveCount(50);
+
+  try {
+    await page
+      .getByRole("button", { name: "Ältere Nachrichten laden" })
+      .click();
+    await expect
+      .poll(() => history.requests)
+      .toContainEqual({
+        id: ALICE_CONVERSATION_ID,
+        cursor: ALICE_OLDER_CURSOR,
+      });
+    await page.getByRole("button", { name: /Bob/ }).click();
+    await expect(page.getByRole("heading", { name: "Bob" })).toBeVisible();
+    await expect(list).toContainText("Bob aktuelle Nachricht");
+    await expect(
+      page.getByRole("button", { name: "Ältere Nachrichten laden" }),
+    ).toBeEnabled();
+  } finally {
+    history.releaseAliceOlder();
+  }
+  await history.aliceOlderSettled;
+  await expect(list).not.toContainText("Alice Nachricht");
+  await page.getByRole("button", { name: "Ältere Nachrichten laden" }).click();
+  await expect(list.locator("article.message")).toHaveCount(2);
+  await expect(list.locator("article.message").first()).toContainText(
+    "Bob ältere Nachricht",
+  );
+  await expect(list.locator("article.message").last()).toContainText(
+    "Bob aktuelle Nachricht",
+  );
+  await expect(list).not.toContainText("Alice Nachricht");
+  expect(history.requests).toEqual([
+    { id: ALICE_CONVERSATION_ID, cursor: null },
+    { id: ALICE_CONVERSATION_ID, cursor: ALICE_OLDER_CURSOR },
+    { id: BOB_CONVERSATION_ID, cursor: null },
+    { id: BOB_CONVERSATION_ID, cursor: BOB_OLDER_CURSOR },
+  ]);
+});
+
+test("Sekundenbruchteile bestimmen die tatsächliche Reihenfolge der Postfachvorschau", async ({
+  page,
+}) => {
+  await installStaticBuildFallback(page);
+  await mockApiResponses(page, {
+    auth: { authenticated: true, account_id: "current-account", role: "weber" },
+  });
+  const api = await installDirectMessagesApi(page);
+  const bob = {
+    ...conversations[1],
+    updated_at: "2026-08-09T10:02:00.100Z",
+    last_message_at: "2026-08-09T10:02:00.100Z",
+  };
+  await page.route("**/api/direct-conversations", (route) => {
+    if (route.request().method() !== "GET") return route.fallback();
+    return route.fulfill({ json: { items: [bob, conversations[0]] } });
+  });
+  await page.route("**/api/conversations/*/messages", (route) => {
+    if (route.request().method() !== "POST") return route.fallback();
+    return route.fulfill({
+      status: 201,
+      json: {
+        ...message(
+          ALICE_CONVERSATION_ID,
+          "current-account",
+          "Ich",
+          "Neuester Sekundenbruchteil",
+        ),
+        id: "aaaaaaaa-1111-4111-8111-111111111111",
+        created_at: "2026-08-09T10:02:00.123456Z",
+        updated_at: "2026-08-09T10:02:00.123456Z",
+      },
+    });
+  });
+  await page.goto("/nachrichten");
+  api.releaseAliceResponse();
+  api.releaseAliceReadResponse();
+  const alice = page.getByRole("button", { name: /Alice/ });
+  await alice.click();
+  await expect(page.locator(".conversation .message-list")).toContainText(
+    "Verspätete Nachricht von Alice",
+  );
+  await page
+    .getByRole("textbox", { name: "Nachricht" })
+    .fill("Neuester Sekundenbruchteil");
+  await page.getByRole("button", { name: "Senden", exact: true }).click();
+  await expect(alice).toContainText("Neuester Sekundenbruchteil");
+  await expect(page.locator(".conversation-list button").first()).toContainText(
+    "Alice",
+  );
+});
+
+test("Kontowechsel verwirft private Direktnachrichten und alte ausstehende Antworten", async ({
+  page,
+}) => {
+  let accountId = "current-account";
+  await installStaticBuildFallback(page);
+  await mockApiResponses(page, {
+    auth: { authenticated: true, account_id: accountId, role: "weber" },
+  });
+  const api = await installDirectMessagesApi(page);
+  await page.route("**/api/auth/me", (route) =>
+    route.fulfill({
+      json: { authenticated: true, account_id: accountId, role: "weber" },
+    }),
+  );
+  await page.route("**/api/direct-conversations", (route) => {
+    if (route.request().method() !== "GET") return route.fallback();
+    return route.fulfill({
+      json: {
+        items: [
+          accountId === "current-account" ? conversations[0] : conversations[1],
+        ],
+      },
+    });
+  });
+  let releaseSend!: () => void;
+  const sendReleased = new Promise<void>((resolve) => {
+    releaseSend = resolve;
+  });
+  await page.route("**/api/conversations/*/messages", async (route) => {
+    if (route.request().method() !== "POST") return route.fallback();
+    await sendReleased;
+    return route.fulfill({
+      status: 201,
+      json: {
+        ...message(
+          ALICE_CONVERSATION_ID,
+          "current-account",
+          "Ich",
+          "Private alte Antwort",
+        ),
+        id: "aaaaaaaa-2222-4222-8222-222222222222",
+      },
+    });
+  });
+  const recheck = async () => {
+    await page.evaluate(async () => {
+      const check = (
+        window as Window & {
+          __commonthingE2ERecheckAuth?: () => Promise<unknown>;
+        }
+      ).__commonthingE2ERecheckAuth;
+      if (!check) throw new Error("Auth recheck test seam unavailable");
+      await check();
+    });
+  };
+  await page.goto("/nachrichten");
+  api.releaseAliceResponse();
+  api.releaseAliceReadResponse();
+  const alice = page.getByRole("button", { name: /Alice/ });
+  const bob = page.getByRole("button", { name: /Bob/ });
+  const history = page.locator(".conversation .message-list");
+  const composer = page.getByRole("textbox", { name: "Nachricht" });
+  await alice.click();
+  await expect(history).toContainText("Verspätete Nachricht von Alice");
+  await composer.fill("Privater alter Entwurf");
+  await recheck();
+  await expect(composer).toHaveValue("Privater alter Entwurf");
+  const sendStarted = page.waitForRequest(
+    (request) =>
+      request.method() === "POST" &&
+      new URL(request.url()).pathname ===
+        "/api/conversations/" + ALICE_CONVERSATION_ID + "/messages",
+  );
+  await page.getByRole("button", { name: "Senden", exact: true }).click();
+  await sendStarted;
+  try {
+    accountId = "other-account";
+    await recheck();
+    await expect(alice).toHaveCount(0);
+    await expect(bob).toBeVisible();
+    await expect(page.getByText("Verspätete Nachricht von Alice")).toHaveCount(
+      0,
+    );
+    await bob.click();
+    await expect(history).toContainText("Aktuelle Nachricht von Bob");
+    await composer.fill("Unabhängiger neuer Entwurf");
+    const completed = page.waitForResponse(
+      (response) =>
+        response.request().method() === "POST" &&
+        new URL(response.url()).pathname ===
+          "/api/conversations/" + ALICE_CONVERSATION_ID + "/messages",
+    );
+    releaseSend();
+    await completed;
+    await page.evaluate(
+      () =>
+        new Promise<void>((resolve) =>
+          requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+        ),
+    );
+    await expect(composer).toHaveValue("Unabhängiger neuer Entwurf");
+    await expect(history).not.toContainText("Private alte Antwort");
+    await expect(alice).toHaveCount(0);
+    accountId = "current-account";
+    await recheck();
+    await alice.click();
+    await expect(composer).toHaveValue("");
+    await expect(history).not.toContainText("Private alte Antwort");
+  } finally {
+    releaseSend();
+  }
+});

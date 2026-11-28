@@ -1,10 +1,13 @@
 <script lang="ts">
-  import { onMount, tick } from "svelte";
+  import { onDestroy, onMount, tick, untrack } from "svelte";
   import { goto } from "$app/navigation";
   import { page } from "$app/stores";
   import { authStore } from "$lib/auth/store";
   import type { ConversationMessage } from "$lib/api/nodeConversation";
-  import { NodeConversationApiError } from "$lib/api/nodeConversation";
+  import {
+    compareApiTimestamps,
+    NodeConversationApiError,
+  } from "$lib/api/nodeConversation";
   import {
     DirectMessagesApiError,
     listDirectConversations,
@@ -21,16 +24,38 @@
   let conversations: DirectConversation[] = $state([]);
   let selected: DirectConversation | null = $state(null);
   let messages: ConversationMessage[] = $state([]);
-  let draft = $state("");
+  let drafts = $state<Record<string, string>>({});
+  let draft = $derived.by(() => (selected ? (drafts[selected.id] ?? "") : ""));
   let loadingInbox = $state(true);
   let loadingConversation = $state(false);
-  let sending = $state(false);
-  let changingBlock = $state(false);
+  let olderCursor: string | null = $state(null);
+  let loadingOlder = $state(false);
+  let olderRequest: AbortController | null = null;
+  let sendingByConversation = $state<Record<string, boolean>>({});
+  let blockingByConversation = $state<Record<string, boolean>>({});
+  let sending = $derived.by(() =>
+    selected ? !!sendingByConversation[selected.id] : false,
+  );
+  let changingBlock = $derived.by(() =>
+    selected ? !!blockingByConversation[selected.id] : false,
+  );
   let error = $state("");
   let initialized = $state(false);
   let handledRecipient: string | null = $state(null);
   let messageList: HTMLElement | null = $state(null);
   let selectionGeneration = 0;
+  let accountGeneration = 0;
+  let boundAccount: string | null | undefined;
+  let authChecked = $state(false);
+
+  function accountIsCurrent(generation: number): boolean {
+    return (
+      generation === accountGeneration &&
+      $authStore.authenticated &&
+      !!boundAccount &&
+      $authStore.account_id === boundAccount
+    );
+  }
 
   function describeError(cause: unknown): string {
     if (
@@ -67,9 +92,11 @@
   }
 
   function sortMessages(items: ConversationMessage[]): ConversationMessage[] {
-    return [...items].sort(
+    // A send acknowledgement and an overlapping history load may include
+    // the same message. Merge by canonical message ID.
+    return [...new Map(items.map((item) => [item.id, item])).values()].sort(
       (left, right) =>
-        left.created_at.localeCompare(right.created_at) ||
+        compareApiTimestamps(left.created_at, right.created_at) ||
         left.id.localeCompare(right.id),
     );
   }
@@ -85,18 +112,22 @@
   }
 
   async function refreshInbox(): Promise<void> {
+    const account = accountGeneration;
+    if (!accountIsCurrent(account)) return;
     loadingInbox = true;
     error = "";
     try {
-      conversations = await listDirectConversations();
+      const items = await listDirectConversations();
+      if (!accountIsCurrent(account)) return;
+      conversations = items;
       if (selected) {
         selected =
           conversations.find((item) => item.id === selected?.id) ?? selected;
       }
     } catch (cause) {
-      error = describeError(cause);
+      if (accountIsCurrent(account)) error = describeError(cause);
     } finally {
-      loadingInbox = false;
+      if (accountIsCurrent(account)) loadingInbox = false;
     }
   }
 
@@ -110,15 +141,23 @@
     conversation: DirectConversation,
     generation = ++selectionGeneration,
   ): Promise<void> {
-    if (generation !== selectionGeneration) return;
+    const account = accountGeneration;
+    if (!accountIsCurrent(account) || generation !== selectionGeneration)
+      return;
+    olderRequest?.abort();
+    olderRequest = null;
+    olderCursor = null;
+    loadingOlder = false;
     selected = conversation;
     messages = [];
     loadingConversation = true;
     error = "";
     try {
       const response = await listDirectMessages(conversation.id);
-      if (generation !== selectionGeneration) return;
-      messages = sortMessages(response.items);
+      if (!accountIsCurrent(account) || generation !== selectionGeneration)
+        return;
+      messages = sortMessages([...response.items, ...messages]);
+      olderCursor = response.page.has_more ? response.page.next_cursor : null;
       const newestLoadedMessage = messages.at(-1);
       if (newestLoadedMessage) {
         await markDirectConversationRead(
@@ -126,30 +165,108 @@
           newestLoadedMessage.id,
         );
       }
+      if (!accountIsCurrent(account)) return;
       conversations = conversations.map((item) =>
         item.id === conversation.id ? { ...item, unread_count: 0 } : item,
       );
       if (generation !== selectionGeneration) return;
-      selected = { ...conversation, unread_count: 0 };
+      selected = {
+        ...(conversations.find((item) => item.id === conversation.id) ??
+          conversation),
+        unread_count: 0,
+      };
+      loadingConversation = false;
       await scrollToNewest(generation);
     } catch (cause) {
-      if (generation === selectionGeneration) {
+      if (accountIsCurrent(account) && generation === selectionGeneration) {
         error = describeError(cause);
       }
     } finally {
-      if (generation === selectionGeneration) {
+      if (accountIsCurrent(account) && generation === selectionGeneration) {
         loadingConversation = false;
       }
     }
   }
 
+  async function loadOlder(): Promise<void> {
+    if (!selected || !olderCursor || loadingOlder || loadingConversation)
+      return;
+
+    const conversationId = selected.id;
+    const cursor = olderCursor;
+    const generation = selectionGeneration;
+    const account = accountGeneration;
+    if (!accountIsCurrent(account)) return;
+    const controller = new AbortController();
+    olderRequest = controller;
+    loadingOlder = true;
+    error = "";
+
+    const isCurrent = () =>
+      olderRequest === controller &&
+      accountIsCurrent(account) &&
+      generation === selectionGeneration &&
+      selected?.id === conversationId &&
+      !controller.signal.aborted;
+
+    try {
+      const response = await listDirectMessages(
+        conversationId,
+        cursor,
+        controller.signal,
+      );
+      if (!isCurrent()) return;
+
+      const nextCursor = response.page.has_more
+        ? response.page.next_cursor
+        : null;
+      if (response.page.has_more && (!nextCursor || nextCursor === cursor)) {
+        throw new Error("Invalid continuation cursor");
+      }
+
+      // Retain the position of existing content, even when the load button
+      // disappears or an overlapping page contains an already loaded message.
+      const list = messageList;
+      const anchor = list?.querySelector<HTMLElement>("article.message");
+      const previousTop = anchor?.getBoundingClientRect().top;
+      messages = sortMessages([...response.items, ...messages]);
+      olderCursor = nextCursor;
+      await tick();
+      if (
+        isCurrent() &&
+        list &&
+        messageList === list &&
+        anchor?.isConnected &&
+        previousTop !== undefined
+      ) {
+        list.scrollTop += anchor.getBoundingClientRect().top - previousTop;
+      }
+    } catch (cause) {
+      if (isCurrent()) error = describeError(cause);
+    } finally {
+      if (olderRequest === controller) {
+        olderRequest = null;
+        loadingOlder = false;
+      }
+    }
+  }
+
+  onDestroy(() => {
+    accountGeneration += 1;
+    selectionGeneration += 1;
+    olderRequest?.abort();
+    olderRequest = null;
+  });
+
   async function startConversation(accountId: string): Promise<void> {
-    if (!$authStore.authenticated || accountId === $authStore.account_id)
+    const account = accountGeneration;
+    if (!accountIsCurrent(account) || accountId === $authStore.account_id)
       return;
     const generation = ++selectionGeneration;
     error = "";
     try {
       const conversation = await openDirectConversation(accountId);
+      if (!accountIsCurrent(account)) return;
       const existingIndex = conversations.findIndex(
         (item) => item.id === conversation.id,
       );
@@ -163,70 +280,122 @@
       }
       if (!isCurrentSelection) return;
       await selectConversation(conversation, generation);
-      if (generation !== selectionGeneration) return;
+      if (!accountIsCurrent(account) || generation !== selectionGeneration)
+        return;
       await goto(`/nachrichten?id=${encodeURIComponent(conversation.id)}`, {
         replaceState: true,
         keepFocus: true,
         noScroll: true,
       });
     } catch (cause) {
-      if (generation === selectionGeneration) {
+      if (accountIsCurrent(account) && generation === selectionGeneration) {
         error = describeError(cause);
       }
     }
   }
 
   async function send(): Promise<void> {
-    const content = draft.trim();
-    if (!selected || !content || sending || !selected.can_send) return;
-    sending = true;
+    const account = accountGeneration;
+    const submittedDraft = draft;
+    const content = submittedDraft.trim();
+    if (
+      !accountIsCurrent(account) ||
+      !selected ||
+      !content ||
+      sending ||
+      !selected.can_send
+    )
+      return;
+    const conversationId = selected.id;
+    sendingByConversation[conversationId] = true;
     error = "";
     try {
       const created = await sendDirectMessage(
-        selected.id,
+        conversationId,
         content,
         crypto.randomUUID(),
       );
-      messages = sortMessages([...messages, created]);
-      draft = "";
+      if (!accountIsCurrent(account)) return;
+      if (created.conversation_id !== conversationId) {
+        throw new Error("Message response belongs to a different conversation");
+      }
+      // Clear only the unchanged draft submitted to this conversation.
+      if (drafts[conversationId] === submittedDraft) {
+        delete drafts[conversationId];
+      }
       const preview = content.slice(0, 160);
       conversations = conversations
         .map((item) =>
-          item.id === selected?.id
+          item.id === conversationId &&
+          (!item.last_message_at ||
+            compareApiTimestamps(item.last_message_at, created.created_at) <= 0)
             ? {
                 ...item,
                 last_message_preview: preview,
                 last_message_at: created.created_at,
-                updated_at: created.created_at,
+                updated_at:
+                  compareApiTimestamps(item.updated_at, created.created_at) > 0
+                    ? item.updated_at
+                    : created.created_at,
               }
             : item,
         )
-        .sort((left, right) => right.updated_at.localeCompare(left.updated_at));
-      await scrollToNewest();
+        .sort((left, right) =>
+          compareApiTimestamps(right.updated_at, left.updated_at),
+        );
+      if (selected?.id === conversationId) {
+        messages = sortMessages([...messages, created]);
+        await scrollToNewest(selectionGeneration);
+      }
     } catch (cause) {
-      error = describeError(cause);
+      if (accountIsCurrent(account) && selected?.id === conversationId)
+        error = describeError(cause);
     } finally {
-      sending = false;
+      if (accountIsCurrent(account))
+        delete sendingByConversation[conversationId];
     }
   }
 
   async function toggleBlock(): Promise<void> {
-    if (!selected || changingBlock) return;
-    changingBlock = true;
+    const account = accountGeneration;
+    if (!accountIsCurrent(account) || !selected || changingBlock) return;
+    const conversationId = selected.id;
+    const blocked = !selected.blocked_by_me;
+    blockingByConversation[conversationId] = true;
     error = "";
     try {
       const updated = await setDirectConversationBlocked(
-        selected.id,
-        !selected.blocked_by_me,
+        conversationId,
+        blocked,
       );
-      selected = updated;
+      if (!accountIsCurrent(account)) return;
+      if (updated.id !== conversationId) {
+        throw new Error("Block response belongs to a different conversation");
+      }
+      // Only the block state belongs to this operation. A concurrent send can
+      // already have refreshed the sidebar preview and timestamps.
       conversations = conversations.map((item) =>
-        item.id === updated.id ? updated : item,
+        item.id === conversationId
+          ? {
+              ...item,
+              blocked_by_me: updated.blocked_by_me,
+              can_send: updated.can_send,
+            }
+          : item,
       );
+      if (selected?.id === conversationId) {
+        selected = {
+          ...selected,
+          blocked_by_me: updated.blocked_by_me,
+          can_send: updated.can_send,
+        };
+      }
     } catch (cause) {
-      error = describeError(cause);
+      if (accountIsCurrent(account) && selected?.id === conversationId)
+        error = describeError(cause);
     } finally {
-      changingBlock = false;
+      if (accountIsCurrent(account))
+        delete blockingByConversation[conversationId];
     }
   }
 
@@ -244,8 +413,39 @@
     }
 
     await authStore.checkAuth();
-    if ($authStore.authenticated) {
+    authChecked = true;
+  });
+
+  // The mounted inbox can survive a server-authorized account switch.
+  // Clear account-private state synchronously before fetching another inbox.
+  function bindAccount(owner: string | null): void {
+    const switching = boundAccount !== undefined;
+    boundAccount = owner;
+    const account = ++accountGeneration;
+    selectionGeneration += 1;
+    olderRequest?.abort();
+    olderRequest = null;
+    conversations = [];
+    selected = null;
+    messages = [];
+    drafts = {};
+    sendingByConversation = {};
+    blockingByConversation = {};
+    olderCursor = null;
+    loadingOlder = false;
+    loadingConversation = false;
+    error = "";
+    initialized = false;
+    // A recipient URL left over from another account is not a new intent.
+    if (switching) handledRecipient = $page.url.searchParams.get("mit");
+    if (!owner) {
+      loadingInbox = false;
+      initialized = true;
+      return;
+    }
+    void (async () => {
       await refreshInbox();
+      if (!accountIsCurrent(account)) return;
       const requestedId = $page.url.searchParams.get("id");
       if (requestedId) {
         const conversation = conversations.find(
@@ -253,10 +453,16 @@
         );
         if (conversation) await selectConversation(conversation);
       }
-    } else {
-      loadingInbox = false;
-    }
-    initialized = true;
+      if (accountIsCurrent(account)) initialized = true;
+    })();
+  }
+
+  $effect.pre(() => {
+    const owner = $authStore.authenticated
+      ? ($authStore.account_id ?? null)
+      : null;
+    if (!authChecked || boundAccount === owner) return;
+    untrack(() => bindAccount(owner));
   });
   let requestedRecipient = $derived($page.url.searchParams.get("mit"));
   $effect.pre(() => {
@@ -396,7 +602,19 @@
             {:else if messages.length === 0}
               <p class="muted">Noch keine Nachricht.</p>
             {:else}
-              {#each messages as message}
+              {#if olderCursor}
+                <button
+                  type="button"
+                  class="quiet load-older"
+                  onclick={loadOlder}
+                  disabled={loadingOlder}
+                >
+                  {loadingOlder
+                    ? "Lade ältere Nachrichten…"
+                    : "Ältere Nachrichten laden"}
+                </button>
+              {/if}
+              {#each messages as message (message.id)}
                 <article
                   class="message"
                   class:own={message.author_account_id ===
@@ -444,7 +662,10 @@
               <label for="direct-message">Nachricht</label>
               <textarea
                 id="direct-message"
-                bind:value={draft}
+                value={draft}
+                oninput={(event) => {
+                  if (selected) drafts[selected.id] = event.currentTarget.value;
+                }}
                 maxlength="4000"
                 rows="4"
                 onkeydown={handleComposerKeydown}
@@ -671,6 +892,7 @@
   }
 
   .message-list {
+    max-height: min(58vh, 42rem);
     overflow-y: auto;
     display: flex;
     flex-direction: column;
@@ -678,7 +900,13 @@
     padding: 0.25rem;
   }
 
+  .load-older {
+    align-self: center;
+    flex-shrink: 0;
+  }
+
   .message {
+    flex-shrink: 0;
     max-width: min(78%, 38rem);
     align-self: flex-start;
     padding: 0.7rem 0.8rem;

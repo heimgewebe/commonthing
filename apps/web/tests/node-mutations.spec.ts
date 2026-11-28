@@ -1,5 +1,6 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
-import { mockApiResponses } from "./fixtures/mockApi";
+import { mockApiResponses, mockListResponse } from "./fixtures/mockApi";
+import { demoNodes } from "../src/lib/demo/demoData";
 import { waitForNodeMarker } from "./fixtures/mapReady";
 
 async function openFirstNode(page: Page) {
@@ -641,3 +642,281 @@ test.describe("Knoten bearbeiten und löschen", () => {
     ).toHaveCount(0);
   });
 });
+
+test("verspätetes Speichern überschreibt keinen inzwischen ausgewählten Knoten", async ({
+  page,
+}) => {
+  await mockApiResponses(page, {
+    auth: {
+      authenticated: true,
+      account_id: "e2e-weber",
+      role: "weber",
+    },
+  });
+  const secondNode = {
+    ...demoNodes[0],
+    id: "d1acebed-1111-4111-8111-111111111111",
+    title: "Zweiter Testknoten",
+    location: { lat: 53.561, lon: 10.058 },
+    address: "Teststraße 2",
+    tags: [],
+  };
+  // The shared demo intentionally has only one node. Add a second real
+  // addressable entity to exercise a selection switch in the same panel.
+  await page.route("**/api/nodes*", async (route) => {
+    if (
+      route.request().method() !== "GET" ||
+      new URL(route.request().url()).pathname !== "/api/nodes"
+    ) {
+      return route.fallback();
+    }
+    return route.fulfill({
+      status: 200,
+      json: mockListResponse(route.request().url(), [demoNodes[0], secondNode]),
+    });
+  });
+  await page.route(`**/api/nodes/${secondNode.id}`, async (route) => {
+    if (route.request().method() === "GET") {
+      return route.fulfill({ status: 200, json: secondNode });
+    }
+    if (route.request().method() === "PUT") {
+      return route.fulfill({
+        status: 200,
+        json: {
+          ...secondNode,
+          ...route.request().postDataJSON(),
+          id: secondNode.id,
+          updated_at: "2026-11-25T12:00:00Z",
+        },
+      });
+    }
+    return route.fallback();
+  });
+  let releaseSave!: () => void;
+  const saveReleased = new Promise<void>((resolve) => {
+    releaseSave = resolve;
+  });
+  let firstSave = true;
+  await page.route("**/api/nodes/*", async (route) => {
+    if (route.request().method() === "PUT" && firstSave) {
+      firstSave = false;
+      await saveReleased;
+    }
+    return route.fallback();
+  });
+  await page.goto("/map");
+  await waitForNodeMarker(page);
+  await page
+    .getByRole("button", { name: /fairschenkbox/ })
+    .evaluate((marker) => {
+      marker.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+  const panel = page.locator('[data-testid="context-panel"]');
+  await expect(panel.locator("h3")).toHaveText("fairschenkbox");
+  const originalTitle = "fairschenkbox";
+  await panel.getByRole("tab", { name: "Bearbeiten" }).click();
+  await panel.getByRole("button", { name: "Bearbeiten", exact: true }).click();
+  await panel.getByLabel("Titel").fill("Verspäteter Knoten A");
+  const putA = page.waitForRequest(
+    (request) =>
+      request.method() === "PUT" &&
+      /\/api\/nodes\/[^/]+$/.test(new URL(request.url()).pathname),
+  );
+  await panel.getByRole("button", { name: "Änderungen speichern" }).click();
+  const firstRequest = await putA;
+  try {
+    const secondMarker = page.getByRole("button", {
+      name: /Zweiter Testknoten/,
+    });
+    await expect(secondMarker).toBeVisible();
+    await secondMarker.evaluate((marker) =>
+      marker.dispatchEvent(new MouseEvent("click", { bubbles: true })),
+    );
+    await expect(panel.locator("h3")).not.toHaveText(originalTitle);
+    const secondTitle = await panel.locator("h3").innerText();
+    await panel.getByRole("tab", { name: "Bearbeiten" }).click();
+    await panel
+      .getByRole("button", { name: "Bearbeiten", exact: true })
+      .click();
+    await panel.getByLabel("Titel").fill("Unabhängiger Knoten B");
+    const saveFinished = page.waitForResponse(
+      (response) =>
+        response.request().method() === "PUT" &&
+        response.url() === firstRequest.url(),
+    );
+    releaseSave();
+    await saveFinished;
+    await page.evaluate(
+      () =>
+        new Promise<void>((resolve) =>
+          requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+        ),
+    );
+    await expect(panel.locator("h3")).toHaveText(secondTitle);
+    await expect(panel.getByLabel("Titel")).toHaveValue(
+      "Unabhängiger Knoten B",
+    );
+    const putB = page.waitForRequest(
+      (request) =>
+        request.method() === "PUT" &&
+        /\/api\/nodes\/[^/]+$/.test(new URL(request.url()).pathname),
+    );
+    await panel.getByRole("button", { name: "Änderungen speichern" }).click();
+    expect((await putB).url()).not.toBe(firstRequest.url());
+    await expect(panel.locator("h3")).toHaveText("Unabhängiger Knoten B");
+  } finally {
+    releaseSave();
+  }
+});
+
+for (const scenario of [
+  { name: "erfolgreich nach A → B", conflict: false, returnToA: false },
+  { name: "412 nach A → B", conflict: true, returnToA: false },
+  { name: "412 nach A → B → A", conflict: true, returnToA: true },
+]) {
+  test("verspätetes Löschen: " + scenario.name, async ({ page }) => {
+    await mockApiResponses(page, {
+      auth: {
+        authenticated: true,
+        account_id: "e2e-weber",
+        role: "weber",
+      },
+    });
+    const firstNode = demoNodes[0];
+    const secondNode = {
+      ...firstNode,
+      id: "d1acebed-2222-4222-8222-222222222222",
+      title: "Zweiter Löschtestknoten",
+      location: { lat: 53.561, lon: 10.058 },
+      address: "Teststraße 2",
+      tags: [],
+    };
+    let removed = false;
+    await page.route("**/api/nodes*", async (route) => {
+      if (
+        route.request().method() !== "GET" ||
+        new URL(route.request().url()).pathname !== "/api/nodes"
+      ) {
+        return route.fallback();
+      }
+      return route.fulfill({
+        status: 200,
+        json: mockListResponse(
+          route.request().url(),
+          removed ? [secondNode] : [firstNode, secondNode],
+        ),
+      });
+    });
+    await page.route("**/api/nodes/" + secondNode.id, async (route) => {
+      if (route.request().method() === "GET") {
+        return route.fulfill({ status: 200, json: secondNode });
+      }
+      return route.fallback();
+    });
+    let releaseDelete!: () => void;
+    const deleteReleased = new Promise<void>((resolve) => {
+      releaseDelete = resolve;
+    });
+    let observeDelete!: () => void;
+    const deleteObserved = new Promise<void>((resolve) => {
+      observeDelete = resolve;
+    });
+    await page.route("**/api/nodes/" + firstNode.id, async (route) => {
+      if (route.request().method() !== "DELETE") {
+        return route.fallback();
+      }
+      observeDelete();
+      await deleteReleased;
+      if (scenario.conflict) {
+        return route.fulfill({
+          status: 412,
+          json: {
+            ...firstNode,
+            title: "Verspäteter Konfliktstand A",
+            updated_at: "2026-11-25T12:00:00Z",
+          },
+        });
+      }
+      removed = true;
+      return route.fulfill({
+        status: 200,
+        json: {
+          node_id: firstNode.id,
+          node_state: "removed",
+          removed_edge_ids: [],
+          conversation: { effect: "not_applicable" },
+        },
+      });
+    });
+    await page.goto("/map");
+    await waitForNodeMarker(page);
+    const firstMarker = page.locator(
+      '.map-marker[data-id="' + firstNode.id + '"]',
+    );
+    const secondMarker = page.locator(
+      '.map-marker[data-id="' + secondNode.id + '"]',
+    );
+    const selectMarker = async (marker: Locator) => {
+      await expect(marker).toBeVisible();
+      await marker.evaluate((element) => {
+        element.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+    };
+    const panel = page.getByTestId("context-panel");
+    await selectMarker(firstMarker);
+    await expect(panel.locator("h3")).toHaveText(firstNode.title);
+    await panel.getByRole("tab", { name: "Bearbeiten" }).click();
+    try {
+      await confirmNodeRemoval(panel);
+      await deleteObserved;
+      await selectMarker(secondMarker);
+      await expect(panel.locator("h3")).toHaveText(secondNode.title);
+      if (scenario.returnToA) {
+        await selectMarker(firstMarker);
+        await expect(panel.locator("h3")).toHaveText(firstNode.title);
+      }
+      const selectedTitle = scenario.returnToA
+        ? firstNode.title
+        : secondNode.title;
+      await panel.getByRole("tab", { name: "Bearbeiten" }).click();
+      await panel
+        .getByRole("button", { name: "Bearbeiten", exact: true })
+        .click();
+      await panel.getByLabel("Titel").fill("Neuer unabhängiger Entwurf");
+      const finished = page.waitForResponse(
+        (response) =>
+          response.request().method() === "DELETE" &&
+          new URL(response.url()).pathname === "/api/nodes/" + firstNode.id,
+      );
+      releaseDelete();
+      expect((await finished).status()).toBe(scenario.conflict ? 412 : 200);
+      await page.evaluate(
+        () =>
+          new Promise<void>((resolve) =>
+            requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+          ),
+      );
+      if (scenario.conflict) {
+        await expect(firstMarker).toHaveCount(1);
+      } else {
+        // Success still has to reach the canonical map despite the selection
+        // switch; a stale DELETE must never close or replace the new panel.
+        await expect(firstMarker).toHaveCount(0);
+      }
+      await expect(secondMarker).toHaveCount(1);
+      await expect(panel).toBeVisible();
+      await expect(panel.locator("h3")).toHaveText(selectedTitle);
+      await expect(panel.getByLabel("Titel")).toHaveValue(
+        "Neuer unabhängiger Entwurf",
+      );
+      await expect(panel.getByText("Verspäteter Konfliktstand A")).toHaveCount(
+        0,
+      );
+      await expect(
+        panel.getByText(/Der Knoten wurde in der Zwischenzeit geändert/),
+      ).toHaveCount(0);
+    } finally {
+      releaseDelete();
+    }
+  });
+}
