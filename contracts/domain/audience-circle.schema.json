@@ -14,11 +14,11 @@
       "enum": ["household", "community"]
     },
     "name": {
-      "description": "1 to 80 Unicode code points, trimmed, without control characters. The API defaults to 'Hausgemeinschaft' or 'Gemeinschaft'. The database CHECK enforces only the length bound; trimming and the control-character rule are enforced by the HTTP handler, the only writer.",
+      "description": "1 to 80 Unicode code points, trimmed with Rust Unicode White_Space semantics, without control characters (U+FEFF is not whitespace for Rust). The API defaults to 'Hausgemeinschaft' or 'Gemeinschaft'. The database CHECK enforces only the length bound; trimming and the control-character rule are enforced by the HTTP handler, the only writer.",
       "type": "string",
       "minLength": 1,
       "maxLength": 80,
-      "pattern": "^[^\\s\\u0000-\\u001f\\u007f-\\u009f](?:[^\\u0000-\\u001f\\u007f-\\u009f]*[^\\s\\u0000-\\u001f\\u007f-\\u009f])?$"
+      "pattern": "^[^\\u0020\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\u0000-\\u001f\\u007f-\\u009f](?:[^\\u0000-\\u001f\\u007f-\\u009f]*[^\\u0020\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\u0000-\\u001f\\u007f-\\u009f])?$"
     },
     "state": {
       "description": "forming: founder active, founding invitation pending, nobody has content rights. active: became active when a second non-disabled member confirmed, and stays active while at least one active member remains (a circle can therefore be active with a single member). inactive: terminal; the founding proposal had no pending invitation left, or the last active member left. The API never moves a circle out of inactive.",

@@ -853,6 +853,11 @@ pub(crate) mod tests {
         assert!(named(&"ä".repeat(81)).validate("account-a").is_err());
         assert!(named("a\u{85}b").validate("account-a").is_err());
         assert_eq!(
+            named("\u{feff}Haus").validate("account-a").unwrap().1,
+            "\u{feff}Haus",
+            "Rust trim preserves U+FEFF; the domain schema must accept the stored name"
+        );
+        assert_eq!(
             named("  Haus  ").validate("account-a").unwrap().1,
             "Haus",
             "the stored name is trimmed"
