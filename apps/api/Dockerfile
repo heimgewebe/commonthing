@@ -50,10 +50,11 @@ WORKDIR /app
 # repositories to fix CVE-2026-109518 (base provides 2.6.1; fixed: 2.6.2).
 # Refresh libpcre2-8-0 and perl-base for their already-documented fixes too.
 # Refresh the four installed PAM packages together for CVE-2025-6020.
+# Refresh the installed libzstd1 for CVE-2026-124851.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        ca-certificates wget jq libssl3 apt libapt-pkg6.0 libpcre2-8-0 passwd perl-base \
-       libpam-modules libpam-modules-bin libpam-runtime libpam0g \
+       libpam-modules libpam-modules-bin libpam-runtime libpam0g libzstd1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the binary from builder
