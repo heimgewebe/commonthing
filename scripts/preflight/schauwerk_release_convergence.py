@@ -41,7 +41,7 @@ def _timestamp(value: Any) -> dt.datetime:
     return parsed.astimezone(dt.timezone.utc)
 
 
-def latest_accepted_release(payload: Any) -> dict[str, Any]:
+def _accepted_runs(payload: Any) -> list[tuple[dt.datetime, int, dict[str, Any]]]:
     if not isinstance(payload, dict) or not isinstance(payload.get("workflow_runs"), list):
         raise ConvergenceError("Schauwerk workflow evidence shape mismatch")
     accepted: list[tuple[dt.datetime, int, dict[str, Any]]] = []
@@ -61,12 +61,34 @@ def latest_accepted_release(payload: Any) -> dict[str, Any]:
         accepted.append((_timestamp(run.get("created_at")), run_id, run))
     if not accepted:
         raise ConvergenceError("no accepted Schauwerk native Schaubild publish exists")
-    _created, _id, run = max(accepted, key=lambda item: (item[0], item[1]))
+    return accepted
+
+
+def latest_accepted_release(payload: Any) -> dict[str, Any]:
+    _created, _id, run = max(
+        _accepted_runs(payload), key=lambda item: (item[0], item[1])
+    )
     return {
         "source_commit": run["head_sha"],
         "workflow_run_id": run["id"],
         "created_at": run["created_at"],
     }
+
+
+def pending_since(payload: Any, locked_commit: str) -> str | None:
+    """Publish time of the first accepted release after the locked one.
+
+    The promotion has been owed since then; measuring from the latest publish
+    would let every further publish restart the clock while the lock stays
+    behind. None when the locked release is not among the accepted runs, so a
+    consumer cannot mistake an unknown lag for a short one.
+    """
+    accepted = _accepted_runs(payload)
+    locked = [created for created, _id, run in accepted if run["head_sha"] == locked_commit]
+    if not locked:
+        return None
+    newer = [(created, run) for created, _id, run in accepted if created > max(locked)]
+    return min(newer, key=lambda item: item[0])[1]["created_at"] if newer else None
 
 
 def evaluate_convergence(lock_path: Path, workflow_payload: Any) -> dict[str, Any]:
@@ -80,7 +102,7 @@ def evaluate_convergence(lock_path: Path, workflow_payload: Any) -> dict[str, An
         if lock["source_commit"] == desired["source_commit"]
         else "promotion_pending"
     )
-    return {
+    receipt = {
         "schema_version": SCHEMA,
         "state": state,
         "locked_source_commit": lock["source_commit"],
@@ -90,6 +112,11 @@ def evaluate_convergence(lock_path: Path, workflow_payload: Any) -> dict[str, An
         "desired_published_at": desired["created_at"],
         "action_required": state != "current",
     }
+    if state != "current":
+        since = pending_since(workflow_payload, lock["source_commit"])
+        if since is not None:
+            receipt["pending_since"] = since
+    return receipt
 
 
 def main() -> int:

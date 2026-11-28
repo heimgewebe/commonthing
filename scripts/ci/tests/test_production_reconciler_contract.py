@@ -1786,12 +1786,21 @@ prune_releases
         convergence_upload = workflow.index(
             "- name: Upload Schaubild release convergence receipt", live_readback
         )
-        enforcement = workflow.index(
-            "- name: Enforce Schaubild release convergence", convergence_upload
+        classify = workflow.index(
+            "- name: Classify production live state", convergence_upload
         )
         self.assertLess(convergence, live_readback)
         self.assertLess(live_readback, convergence_upload)
-        self.assertLess(convergence_upload, enforcement)
+        self.assertLess(convergence_upload, classify)
+        # The classifier is the single judge of app state and Schaubild
+        # convergence; no second all-or-nothing gate may fail the app job.
+        self.assertNotIn("Enforce Schaubild release convergence", workflow)
+        self.assertNotIn('payload.get("state") != "current"', workflow)
+        self.assertIn("--schaubild-receipt schaubild-release-convergence.json", workflow[classify:])
+        self.assertIn("--schaubild-pending-grace-seconds 21600", workflow[classify:])
+        self.assertIn("--main-ci-grace-seconds 3600", workflow[classify:])
+        self.assertIn("GITHUB_TOKEN: " + chr(36) + "{{ github.token }}", workflow[classify:])
+        self.assertIn("actions: read", workflow[workflow.index("  verify-live-commit:"):classify])
         convergence_slice = workflow[convergence:live_readback]
         self.assertIn("continue-on-error: true", convergence_slice)
         self.assertIn('"state": "invalid"', convergence_slice)
@@ -1802,7 +1811,6 @@ prune_releases
         self.assertIn("GITHUB_TOKEN: " + chr(36) + "{{ github.token }}", convergence_slice)
         self.assertIn("Authorization: Bearer $GITHUB_TOKEN", convergence_slice)
         self.assertIn("--header 'Accept: application/vnd.github+json'", convergence_slice)
-        self.assertIn('payload.get("state") != "current"', workflow[enforcement:])
 
 
 if __name__ == "__main__":

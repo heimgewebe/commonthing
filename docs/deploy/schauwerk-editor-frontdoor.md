@@ -124,11 +124,20 @@ latest accepted Schauwerk source commit with the source commit in
   yet been promoted into the consumer lock;
 - `invalid` means the producer evidence or consumer lock could not be verified.
 
-A non-current convergence result is fail-closed, but it does not suppress the
-ordinary public frontend/API identity readback. Both observations are collected
-in the same workflow run before the final convergence enforcement step decides
-the job result. This keeps "new release not promoted" distinct from unrelated
-production drift.
+A non-current convergence result never suppresses the ordinary public
+frontend/API identity readback, and a young lag is not a Commonthing app
+outage. The classifier (`classify_production_live_state.py`) judges both
+observations in one step. A `promotion_pending` receipt that carries the full
+proof and a `pending_since` (publish time of the first accepted release after
+the locked one, so later publishes do not restart the clock) younger than
+`--schaubild-pending-grace-seconds` (21600 in the workflow) leaves the app
+state as classified and is reported as `schaubild: "pending"` in
+`production-live-state.json`, without changing the alert fingerprint. Overdue,
+undated, contradictory (`pending_since` after `desired_published_at`),
+unproven, `invalid` or missing convergence evidence stays an
+`invalid` alert with `schaubild: "only"`/`"also"`; app failures stay alerts
+regardless. This keeps "new release not promoted" distinct from unrelated
+production drift without a second state machine.
 
 Promotion remains a consumer-authorized mutation rather than a producer
 cross-repository write. `scripts/preflight/schauwerk_editor_promotion.py`

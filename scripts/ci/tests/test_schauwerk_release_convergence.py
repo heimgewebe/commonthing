@@ -68,6 +68,35 @@ def test_new_accepted_release_reports_promotion_pending(tmp_path: Path) -> None:
     assert result["desired_source_commit"] == NEW
 
 
+def test_pending_receipt_dates_the_first_unpromoted_publish(tmp_path: Path) -> None:
+    payload = _runs()
+    payload["workflow_runs"].insert(
+        0,
+        {
+            "id": 23,
+            "event": "workflow_dispatch",
+            "status": "completed",
+            "conclusion": "success",
+            "head_sha": "d" * 40,
+            "created_at": "2026-10-03T09:00:00Z",
+        },
+    )
+    result = MODULE.evaluate_convergence(_lock(tmp_path), payload)
+    # Owed since the first publish after the lock, not since the latest one.
+    assert result["desired_source_commit"] == "d" * 40
+    assert result["pending_since"] == "2026-10-02T15:32:32Z"
+
+
+def test_pending_since_is_absent_when_the_locked_release_is_unknown(tmp_path: Path) -> None:
+    result = MODULE.evaluate_convergence(_lock(tmp_path, "e" * 40), _runs())
+    assert result["state"] == "promotion_pending"
+    assert "pending_since" not in result
+
+
+def test_current_receipt_has_no_pending_since(tmp_path: Path) -> None:
+    assert "pending_since" not in MODULE.evaluate_convergence(_lock(tmp_path, NEW), _runs())
+
+
 def test_already_current_is_clean_noop_state(tmp_path: Path) -> None:
     result = MODULE.evaluate_convergence(_lock(tmp_path, NEW), _runs())
     assert result["state"] == "current"

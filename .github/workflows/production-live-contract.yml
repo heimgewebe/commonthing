@@ -244,6 +244,9 @@ jobs:
     needs: contract-tests
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag: v7.0.1
         with:
@@ -333,6 +336,8 @@ jobs:
       - name: Classify production live state
         if: always()
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           git fetch --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
@@ -342,6 +347,8 @@ jobs:
             --expected-commit "${{ steps.target.outputs.commit }}" \
             --main-commit "$main_commit" \
             --pending-grace-seconds 1200 \
+            --main-ci-grace-seconds 3600 \
+            --schaubild-pending-grace-seconds 21600 \
             --schaubild-receipt schaubild-release-convergence.json \
             --output production-live-state.json
       - name: Upload production live state
@@ -360,25 +367,6 @@ jobs:
           path: production-live-receipt.json
           if-no-files-found: error
           retention-days: 30
-      - name: Enforce Schaubild release convergence
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          import json
-          from pathlib import Path
-
-          path = Path("schaubild-release-convergence.json")
-          if not path.is_file():
-              raise SystemExit("Schaubild release convergence receipt is missing")
-          payload = json.loads(path.read_text(encoding="utf-8"))
-          if payload.get("state") != "current" or payload.get("action_required") is not False:
-              raise SystemExit(
-                  "Schaubild release convergence is not current: "
-                  + json.dumps(payload, sort_keys=True)
-              )
-          PY
 
   alert:
     name: Deliver production alert

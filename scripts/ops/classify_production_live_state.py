@@ -10,23 +10,27 @@ human. This classifier separates them:
                   and passes every receipt check against that newer commit.
                   This run is not a production proof; the newer commit's own
                   run is. It never resolves an open alert.
-* ``pending``     production still serves an older main commit, but the first
-                  main commit after it landed less than the grace period ago.
-                  Later merges do not restart that clock.
-* ``stale``       production still serves an older main commit after the grace
-                  period: the deploy or the reconciler is stuck.
+* ``pending``     production still serves an older main commit during bounded
+                  CI wait or the deploy grace after exact Main CI success.
+* ``stale``       CI failed, exceeded its wait budget, or deploy is overdue.
+                  A separate oldest-debt bound prevents later merges from
+                  postponing the alarm forever.
 * ``divergent``   frontend and API disagree, or the live commit is not on the
                   main lineage at all.
 * ``invalid``     the expected (or a newer main) commit is live, but the
                   receipt fails for another reason (cache headers, build
                   headers, artifact declaration).
 * ``outage``      an endpoint could not be read or did not answer 200.
-* ``monitor_failure`` the receipt is missing or unreadable.
+* ``monitor_failure`` the receipt or required exact CI evidence is unavailable.
 
 The Schaubild release convergence is a mandatory part of the same contract.
 When ``--schaubild-receipt`` is given and that receipt is missing or not
 ``current``, an otherwise non-alerting state becomes ``invalid``; no run can
-resolve an alert while Schaubild has not converged.
+resolve an alert while Schaubild has not converged. The one exception is a
+fully proven ``promotion_pending`` whose promotion has been owed for less than
+``--schaubild-pending-grace-seconds``: the app state stays as classified and
+the result carries ``schaubild: "pending"``. Unknown, unproven, invalid or
+overdue lag still alerts.
 
 Only ``current``, ``superseded`` and ``pending`` exit 0.
 """
@@ -36,6 +40,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -47,10 +52,16 @@ from typing import Any, Callable
 
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 IMAGE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
-# Matches the push run's 1200 s wait: once that wait is over, a lag is stale.
+# Deployment time starts only once exact Main CI has succeeded.
 DEFAULT_PENDING_GRACE_SECONDS = 1200
+# CI has a 30-minute main job plus a dependent 15-minute Web E2E job.
+# Allow setup/queue time but keep a bounded oldest-debt clock.
+DEFAULT_MAIN_CI_GRACE_SECONDS = 3600
 NON_ALERTING_STATES = frozenset({"current", "superseded", "pending"})
 SCHAUBILD_SCHEMA = "weltgewebe-schauwerk-release-convergence.v1"
+# Promotion of a published Schaubild release is a reviewed consumer PR, not an
+# automatic rollout; hours of lag are routine, a day of it is not.
+DEFAULT_SCHAUBILD_PENDING_GRACE_SECONDS = 21600
 
 
 @dataclass(frozen=True)
@@ -66,10 +77,16 @@ class Classification:
     api_commit: str | None = None
     # "only" when Schaubild is the sole alert cause, "also" when it fails next
     # to another alert, so recovery of either cause changes the fingerprint.
+    # "pending" is an excused, still-young promotion lag: never an alert and
+    # not part of the fingerprint.
     schaubild: str | None = None
+    schaubild_note: str | None = None
     # The failed contract checks behind an ``invalid`` state, so a change of
     # cause on the same commit (one check repaired, another broken) is visible.
     causes: tuple[str, ...] = ()
+    rollout_stage: str | None = None
+    ci_target_commit: str | None = None
+    ci_run_id: int | None = None
 
     def fingerprint(self) -> str:
         """Stable identity of an alert, used to deduplicate notifications."""
@@ -82,7 +99,9 @@ class Classification:
         if self.causes:
             digest = hashlib.sha256("\n".join(sorted(self.causes)).encode()).hexdigest()
             identity = f"{identity}#{digest[:12]}"
-        return f"{identity}+schaubild-{self.schaubild}" if self.schaubild else identity
+        if self.schaubild in ("only", "also"):
+            return f"{identity}+schaubild-{self.schaubild}"
+        return identity
 
 
 def _is_commit(value: Any) -> bool:
@@ -134,6 +153,67 @@ def git_rollout_start(repo: Path, live: str, target: str) -> int | None:
     if completed.returncode != 0 or not lines:
         return None
     return git_commit_time(repo, lines[0])
+
+
+@dataclass(frozen=True)
+class MainCIObservation:
+    commit: str
+    state: str
+    run_id: int | None = None
+    ready_at: int | None = None
+    detail: str = ""
+
+
+def _hold_release_module():
+    # Share the exact run selector with routine admission. The tests load
+    # scripts directly, so make the sibling import independent of cwd.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        import verify_production_hold_release as hold
+    finally:
+        sys.path.pop(0)
+    return hold
+
+
+def _timestamp(value: object) -> int | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return int(parsed.timestamp()) if parsed.tzinfo is not None else None
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def main_ci_observation(payload: object, commit: str) -> MainCIObservation:
+    hold = _hold_release_module()
+    try:
+        run = hold.select_latest_main_ci_run(payload, commit)
+    except hold.HoldReleaseError as exc:
+        return MainCIObservation(commit, "unavailable", detail=str(exc))
+    run_id = run.get("id")
+    status, conclusion = run.get("status"), run.get("conclusion")
+    if (type(run_id) is not int or run_id <= 0
+            or run["run_number"] <= 0 or run["run_attempt"] <= 0):
+        return MainCIObservation(commit, "unavailable", detail="invalid exact CI run identity")
+    if status in ("queued", "in_progress", "waiting", "requested", "pending") and conclusion is None:
+        return MainCIObservation(commit, "waiting", run_id, detail=status)
+    if status == "completed" and isinstance(conclusion, str) and conclusion:
+        if conclusion != "success":
+            return MainCIObservation(commit, "failed", run_id, detail=conclusion)
+        created, updated = _timestamp(run.get("created_at")), _timestamp(run.get("updated_at"))
+        if created is not None and updated is not None and created <= updated:
+            return MainCIObservation(commit, "ready", run_id, updated)
+    return MainCIObservation(commit, "unavailable", run_id, detail="invalid exact CI status or timestamps")
+
+
+def observe_main_ci(commit: str) -> MainCIObservation:
+    hold = _hold_release_module()
+    try:
+        payload = hold.fetch_main_ci_runs(commit, token=os.environ.get("GITHUB_TOKEN"))
+    except hold.HoldReleaseError as exc:
+        return MainCIObservation(commit, "unavailable", detail=str(exc))
+    return main_ci_observation(payload, commit)
 
 
 def revalidate_against(receipt: dict[str, Any], commit: str) -> list[str]:
@@ -189,6 +269,8 @@ def classify(
     pending_grace_seconds: int,
     is_ancestor: Callable[[str, str], bool | None],
     rollout_start: Callable[[str, str], int | None],
+    main_ci: Callable[[str], MainCIObservation],
+    main_ci_grace_seconds: int = DEFAULT_MAIN_CI_GRACE_SECONDS,
 ) -> Classification:
     observed: dict[str, str | None] = {"frontend": None, "api": None}
 
@@ -256,8 +338,13 @@ def classify(
         failures = revalidate_against(receipt, live)
         if failures:
             return result("invalid", live, "; ".join(failures), tuple(failures))
-        # The clock starts at the first commit after ``live``, so a stream of
-        # merges cannot keep a stuck deployment pending forever.
+        # The reconciler deploys the current main, not a superseded target.
+        if target != main_commit:
+            if is_ancestor(target, main_commit) is not True:
+                return result("divergent", live, f"rollout target {target} is not on main {main_commit}")
+            target = main_commit
+        # Preserve the oldest missing commit as a separate hard debt bound,
+        # even when newer commits cancel and restart the required CI.
         owed_since = rollout_start(live, target)
         if owed_since is None:
             return result(
@@ -270,18 +357,48 @@ def classify(
             return result(
                 "stale", live, f"the first commit after {live} is dated {-age}s in the future"
             )
-        if age < pending_grace_seconds:
-            return result(
-                "pending",
-                live,
-                f"older main commit {live} is live; rollout towards {target} is owed for "
-                f"{age}s (grace {pending_grace_seconds}s)",
+        ci = main_ci(target)
+
+        def rollout(state: str, stage: str, reason: str, cause: str = "") -> Classification:
+            return replace(
+                result(state, live, reason, (cause,) if cause else ()),
+                rollout_stage=stage,
+                ci_target_commit=target,
+                ci_run_id=ci.run_id if ci.commit == target else None,
             )
-        return result(
-            "stale",
-            live,
-            f"older main commit {live} is still live {age}s after the next main commit landed",
-        )
+
+        if ci.commit != target or ci.state == "unavailable":
+            return rollout("monitor_failure", "ci_unavailable",
+                           f"exact main CI evidence unavailable for {target}: {ci.detail}",
+                           "main-ci-evidence-unavailable")
+        if ci.state == "failed":
+            return rollout("stale", "ci_failed",
+                           f"exact main CI for {target} failed: {ci.detail}",
+                           f"main-ci-failed:{ci.detail}")
+        if ci.state == "waiting":
+            if age < main_ci_grace_seconds:
+                return rollout("pending", "ci_waiting",
+                               f"exact main CI for {target} is {ci.detail}; oldest rollout debt {age}s")
+            return rollout("stale", "ci_wait_overdue",
+                           f"main CI still waiting after {age}s without a rollout",
+                           "main-ci-wait-overdue")
+        if (ci.state != "ready" or type(ci.ready_at) is not int
+                or not owed_since <= ci.ready_at <= int(now)):
+            return rollout("monitor_failure", "ci_unavailable",
+                           f"invalid exact main CI readiness timestamp for {target}",
+                           "main-ci-readiness-invalid")
+        ready_age = int(now) - ci.ready_at
+        # A later successful run can start the deploy clock, but cannot
+        # postpone an already excessive oldest-debt age without bound.
+        if (ready_age < pending_grace_seconds
+                and age < main_ci_grace_seconds + pending_grace_seconds):
+            return rollout("pending", "deploy_pending",
+                           f"exact main CI for {target} succeeded {ready_age}s ago; "
+                           f"rollout grace {pending_grace_seconds}s")
+        return rollout("stale", "deploy_overdue",
+                       f"older main commit {live} is still live {ready_age}s after "
+                       f"exact CI success; oldest rollout debt {age}s",
+                       "deploy-overdue")
 
     if live == expected_commit:
         if receipt.get("pass") is True:
@@ -387,6 +504,47 @@ def _schaubild_proof_problem(payload: dict[str, Any]) -> str | None:
     return None
 
 
+def schaubild_pending_note(path: Path, *, now: float, grace_seconds: int) -> str | None:
+    """Note for a proven promotion lag younger than the grace, else None.
+
+    Everything but a well-formed ``promotion_pending`` with a valid
+    ``pending_since`` inside the grace stays a failure.
+    """
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("state") != "promotion_pending" or payload.get("action_required") is not True:
+        return None
+    locked, desired = payload.get("locked_source_commit"), payload.get("desired_source_commit")
+    if not (_is_commit(locked) and _is_commit(desired)) or locked == desired:
+        return None
+    # Same proof fields as a current receipt, except that the pair differs.
+    if _schaubild_proof_problem({**payload, "locked_source_commit": desired}):
+        return None
+    try:
+        since = datetime.fromisoformat(str(payload.get("pending_since")).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if since.tzinfo is None:
+        return None
+    # The first unpromoted publish cannot be newer than the latest one; a
+    # receipt claiming a young lag behind an older release is contradictory.
+    # desired_published_at is already validated by _schaubild_proof_problem.
+    published = datetime.fromisoformat(str(payload["desired_published_at"]).replace("Z", "+00:00"))
+    if since > published:
+        return None
+    age = int(now - since.timestamp())
+    if age < 0 or age >= grace_seconds:
+        return None
+    return (
+        f"Schaubild promotion to {desired} pending for {age}s "
+        f"(grace {grace_seconds}s), locked {locked}"
+    )
+
+
 def with_schaubild(classification: Classification, failure: str | None) -> Classification:
     if failure is None:
         return classification
@@ -417,7 +575,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--pending-grace-seconds", type=int, default=DEFAULT_PENDING_GRACE_SECONDS
     )
+    parser.add_argument("--main-ci-grace-seconds", type=int, default=DEFAULT_MAIN_CI_GRACE_SECONDS)
     parser.add_argument("--schaubild-receipt", type=Path)
+    parser.add_argument(
+        "--schaubild-pending-grace-seconds",
+        type=int,
+        default=DEFAULT_SCHAUBILD_PENDING_GRACE_SECONDS,
+    )
     parser.add_argument("--output", type=Path, required=True)
     return parser
 
@@ -436,8 +600,9 @@ def main(argv: list[str] | None = None) -> int:
         if not COMMIT_RE.fullmatch(getattr(args, name)):
             print(f"ERROR: --{name.replace('_', '-')} must be a full SHA", file=sys.stderr)
             return 2
-    if args.pending_grace_seconds < 0:
-        print("ERROR: --pending-grace-seconds must not be negative", file=sys.stderr)
+    if min(args.pending_grace_seconds, args.main_ci_grace_seconds,
+           args.schaubild_pending_grace_seconds) < 0:
+        print("ERROR: grace seconds must not be negative", file=sys.stderr)
         return 2
 
     classification = classify(
@@ -448,13 +613,24 @@ def main(argv: list[str] | None = None) -> int:
         pending_grace_seconds=args.pending_grace_seconds,
         is_ancestor=lambda a, d: git_is_ancestor(args.repo, a, d),
         rollout_start=lambda live, target: git_rollout_start(args.repo, live, target),
+        main_ci=observe_main_ci,
+        main_ci_grace_seconds=args.main_ci_grace_seconds,
     )
     if args.schaubild_receipt is not None:
-        classification = with_schaubild(classification, schaubild_failure(args.schaubild_receipt))
+        failure = schaubild_failure(args.schaubild_receipt)
+        note = failure and schaubild_pending_note(
+            args.schaubild_receipt, now=time.time(), grace_seconds=args.schaubild_pending_grace_seconds
+        )
+        if note:
+            classification = replace(classification, schaubild="pending", schaubild_note=note)
+        else:
+            classification = with_schaubild(classification, failure)
     payload = asdict(classification)
     payload["fingerprint"] = classification.fingerprint()
     args.output.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
     print(f"production_live_state={classification.state} reason={classification.reason}")
+    if classification.schaubild_note:
+        print(f"schaubild_convergence=pending {classification.schaubild_note}")
     return 1 if classification.alert else 0
 
 

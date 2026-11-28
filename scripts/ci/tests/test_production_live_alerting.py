@@ -85,6 +85,7 @@ def classify(data: dict | None, expected: str, main: str = C, age: int = 5000):
         pending_grace_seconds=1200,
         is_ancestor=ancestor,
         rollout_start=lambda _live, _target: 10_000 - age,
+        main_ci=lambda target: CLASSIFY.MainCIObservation(target, "ready", 42, 10_000 - age),
     )
 
 
@@ -259,9 +260,79 @@ class ClassifyProductionLiveStateTest(unittest.TestCase):
             pending_grace_seconds=1200,
             is_ancestor=ancestor,
             rollout_start=first_after,
+            main_ci=lambda target: CLASSIFY.MainCIObservation(target, "ready", 42, landed[C]),
         )
         self.assertEqual(result.state, "stale")
         self.assertTrue(result.alert)
+
+    def test_ci_aware_rollout_windows(self) -> None:
+        # Exact timings from 45586886140 and the first live-contract attempt:
+        # oldest debt 1363 s, successful CI update only 243 s earlier.
+        def classify_ci(ci, *, age=1363, expected=C, main=C):
+            return CLASSIFY.classify(
+                receipt(A), expected_commit=expected, main_commit=main,
+                now=10_000, pending_grace_seconds=1200, is_ancestor=ancestor,
+                rollout_start=lambda live, target: 10_000 - age,
+                main_ci=lambda target: ci,
+            )
+
+        fresh = CLASSIFY.MainCIObservation(C, "ready", 42, 10_000 - 243)
+        pending = classify_ci(fresh)
+        self.assertEqual((pending.state, pending.rollout_stage, pending.alert),
+                         ("pending", "deploy_pending", False))
+        self.assertEqual((pending.ci_target_commit, pending.ci_run_id), (C, 42))
+        waiting = CLASSIFY.MainCIObservation(C, "waiting", 43, detail="in_progress")
+        self.assertEqual(classify_ci(waiting).rollout_stage, "ci_waiting")
+        self.assertFalse(classify_ci(waiting).alert)
+        self.assertEqual(classify_ci(waiting, age=3600).rollout_stage, "ci_wait_overdue")
+        self.assertTrue(classify_ci(waiting, age=3600).alert)
+        failure = CLASSIFY.MainCIObservation(C, "failed", 43, detail="failure")
+        self.assertEqual(classify_ci(failure, age=1).rollout_stage, "ci_failed")
+        self.assertTrue(classify_ci(failure, age=1).alert)
+        overdue = CLASSIFY.MainCIObservation(C, "ready", 42, 10_000 - 1200)
+        self.assertEqual(classify_ci(overdue).rollout_stage, "deploy_overdue")
+        self.assertTrue(classify_ci(overdue).alert)
+        self.assertTrue(classify_ci(fresh, age=4800).alert)
+        for bad in (
+            CLASSIFY.MainCIObservation(B, "ready", 42, 9757),
+            CLASSIFY.MainCIObservation(C, "ready", 42, 10_001),
+            CLASSIFY.MainCIObservation(C, "ready", 42, 8000),
+            CLASSIFY.MainCIObservation(C, "unavailable"),
+        ):
+            with self.subTest(bad=bad):
+                observed = classify_ci(bad)
+                self.assertEqual(observed.state, "monitor_failure")
+                self.assertTrue(observed.alert)
+        # Even an older workflow run observes the actual current main target.
+        self.assertEqual(classify_ci(fresh, expected=B).ci_target_commit, C)
+
+    def test_exact_ci_observation_uses_latest_push_attempt_only(self) -> None:
+        run = {
+            "head_sha": C, "head_branch": "main", "event": "push",
+            "path": ".github/workflows/ci.yml",
+            "repository": {"full_name": "heimgewebe/commonthing"},
+            "head_repository": {"full_name": "heimgewebe/commonthing"},
+            "id": 42, "run_number": 10, "run_attempt": 1,
+            "status": "completed", "conclusion": "success",
+            "created_at": "2026-11-25T09:35:42Z",
+            "updated_at": "2026-11-25T09:54:19Z",
+        }
+        def observe(*runs):
+            return CLASSIFY.main_ci_observation({"workflow_runs": list(runs)}, C)
+        self.assertEqual(observe(run).state, "ready")
+        self.assertEqual(observe(run).ready_at, CLASSIFY._timestamp(run["updated_at"]))
+        newer = {**run, "run_attempt": 2, "status": "queued", "conclusion": None}
+        self.assertEqual(observe(run, newer).state, "waiting")
+        self.assertEqual(observe(run, {**newer, "status": "completed", "conclusion": "failure"}).state, "failed")
+        for invalid in (
+            {**run, "head_sha": B}, {**run, "event": "pull_request"},
+            {**run, "path": ".github/workflows/not-ci.yml"},
+            {**run, "updated_at": "not-a-time"}, {**run, "id": True},
+            {**run, "updated_at": "2026-11-25T09:00:00Z"},
+        ):
+            with self.subTest(invalid=invalid):
+                self.assertEqual(observe(invalid).state, "unavailable")
+        self.assertEqual(observe().state, "unavailable")
 
     def test_future_commit_time_does_not_extend_the_grace_period(self) -> None:
         result = classify(receipt(B), C, age=-3600)
@@ -317,6 +388,7 @@ class ClassifyProductionLiveStateTest(unittest.TestCase):
             pending_grace_seconds=1200,
             is_ancestor=ancestor,
             rollout_start=lambda _live, _target: None,
+            main_ci=lambda target: CLASSIFY.MainCIObservation(target, "unavailable"),
         )
         self.assertEqual(result.state, "stale")
 
@@ -417,6 +489,75 @@ class ClassifyProductionLiveStateTest(unittest.TestCase):
             schaubild.unlink()
             self.assertEqual(CLASSIFY.main(args), 1)
             self.assertIn("unreadable", json.loads(output.read_text())["reason"])
+
+    def test_young_schaubild_promotion_lag_is_not_an_app_alert(self) -> None:
+        import datetime as dt
+        import time
+
+        def stamp(age: int) -> str:
+            moment = dt.datetime.fromtimestamp(time.time() - age, dt.timezone.utc)
+            return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        pending = {
+            "schema_version": CLASSIFY.SCHAUBILD_SCHEMA,
+            "state": "promotion_pending",
+            "action_required": True,
+            "locked_source_commit": A,
+            "locked_image_digest": "sha256:" + "e" * 64,
+            "desired_source_commit": B,
+            "desired_workflow_run_id": 4242,
+            "desired_published_at": stamp(60),
+            "pending_since": stamp(3600),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            receipt_path = Path(tmp) / "receipt.json"
+            schaubild = Path(tmp) / "schaubild.json"
+            output = Path(tmp) / "state.json"
+            args = ["--receipt", str(receipt_path), "--expected-commit", C, "--main-commit", C,
+                    "--repo", tmp, "--schaubild-receipt", str(schaubild),
+                    "--schaubild-pending-grace-seconds", "7200", "--output", str(output)]
+
+            def run(app: dict, schaubild_payload: dict | None) -> tuple[int, dict]:
+                receipt_path.write_text(json.dumps(app))
+                if schaubild_payload is not None:
+                    schaubild.write_text(json.dumps(schaubild_payload))
+                code = CLASSIFY.main(args)
+                return code, json.loads(output.read_text())
+
+            # App live and exact, Schaubild young pending: green, separately visible.
+            code, payload = run(receipt(C, passed=True), pending)
+            self.assertEqual((code, payload["state"], payload["alert"]), (0, "current", False))
+            self.assertEqual(payload["schaubild"], "pending")
+            self.assertIn(B, payload["schaubild_note"])
+            # Not part of the fingerprint: no new alert identity, so no noise.
+            self.assertEqual(payload["fingerprint"], f"current:{C}")
+
+            # App failures stay red whatever Schaubild says.
+            for broken in (receipt(None), receipt(C, passed=False), receipt(A, passed=True)):
+                code, payload = run(broken, pending)
+                self.assertEqual(code, 1, payload)
+                self.assertTrue(payload["alert"])
+                self.assertEqual(payload["schaubild"], "pending")
+
+            # Overdue, undated, future-dated, invalid and unproven lag all alert.
+            for bad in (
+                {**pending, "pending_since": stamp(7300)},
+                {k: v for k, v in pending.items() if k != "pending_since"},
+                {**pending, "pending_since": "yesterday"},
+                {**pending, "pending_since": stamp(-600)},
+                # A young lag behind an older latest release contradicts itself.
+                {**pending, "desired_published_at": stamp(2 * 86400)},
+                {**pending, "locked_image_digest": "latest"},
+                {**pending, "action_required": False},
+                {**pending, "state": "invalid"},
+                {"state": "invalid", "action_required": True, "error": "lookup failed"},
+            ):
+                code, payload = run(receipt(C, passed=True), bad)
+                self.assertEqual((code, payload["state"]), (1, "invalid"), bad)
+                self.assertEqual(payload["schaubild"], "only")
+            schaubild.unlink()
+            code, payload = run(receipt(C, passed=True), None)
+            self.assertEqual((code, payload["schaubild"]), (1, "only"))
 
     def test_schaubild_schema_matches_the_producer(self) -> None:
         producer = (OPS.parent / "preflight/schauwerk_release_convergence.py").read_text(
