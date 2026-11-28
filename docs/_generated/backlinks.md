@@ -878,6 +878,10 @@ Generated automatically. Do not edit.
 
 - [supersedes] docs/reports/domain-edge-write-path-proof.md
 
+## docs/reports/domain-edge-faden-lifecycle-proof.md
+
+- [relates_to] docs/proofs/commonthing-codepruefung-20261125.md
+
 ## docs/reports/domain-edge-reference-audit.md
 
 - [relates_to] docs/reports/domain-runtime-data-source-reconciliation.md
@@ -958,6 +962,7 @@ Generated automatically. Do not edit.
 ## docs/reports/optimierungsbericht.md
 
 - [relates_to] docs/blueprints/domain-data-postgres-cutover.md
+- [relates_to] docs/proofs/commonthing-codepruefung-20261125.md
 - [depends_on] docs/reports/optimierungsstatus.md
 
 ## docs/reports/optimierungsstatus.md
