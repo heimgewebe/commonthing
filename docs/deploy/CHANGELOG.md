@@ -10,6 +10,17 @@ relations:
 ---
 # Deployment-Änderungsprotokoll
 
+## 2026-11-28 - libzstd1-Sicherheitsaktualisierung im API-Image
+
+**Änderung:** Die Runtime-Stage aktualisiert das bereits installierte
+`libzstd1` über den bestehenden APT-Installationsschritt. Trivy meldete
+CVE-2026-124851 in 1.5.4+dfsg2-5; behoben ab 1.5.4+dfsg2-5+deb12u1.
+Die korrigierte Paketversion wurde im exakt gepinnten Debian-Basisimage
+isoliert installiert und per `dpkg-query` verifiziert. Basisimage-Digest,
+OCI-Mirror-Bindung und Sicherheitsprüfschwelle bleiben unverändert.
+Der vollständige Image-Neubau, erneute Sicherheitscheck und produktive
+Versions-/Funktionsnachweis sind zur Abnahme erforderlich.
+
 ## 2026-11-27 - PAM-Sicherheitsaktualisierung im API-Image
 
 **Änderung:** Die Runtime-Stage in `apps/api/Dockerfile` aktualisiert
