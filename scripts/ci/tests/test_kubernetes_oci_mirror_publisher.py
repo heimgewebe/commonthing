@@ -130,6 +130,160 @@ class KubernetesOciMirrorPublisherContractTests(unittest.TestCase):
         self.assertTrue(result["mirror_tag"].endswith("test-" + "a" * 64))
         create.assert_not_called()
 
+    def test_verified_unchanged_mirror_avoids_upstream_quota(self) -> None:
+        digest = "sha256:" + "a" * 64
+        canonical = "docker.io/library/test:v1@" + digest
+        target = "ghcr.io/heimgewebe/weltgewebe-proof-oci"
+        with mock.patch.object(
+            self.publisher, "_manifest_digest", return_value=digest
+        ) as inspect, mock.patch.object(self.publisher, "_create_mirror") as create:
+            result = self.publisher._publish_one(
+                target, "test", canonical, self.policy(),
+                self.publisher.Deadline.after(60), previously_verified=True,
+            )
+        self.assertEqual(result["action"], "reused")
+        self.assertEqual(result["mirror_digest"], digest)
+        inspect.assert_called_once()
+        self.assertEqual(inspect.call_args.args[0], target + ":test-" + "a" * 64)
+        create.assert_not_called()
+
+    def test_new_binding_still_checks_upstream_even_if_target_exists(self) -> None:
+        digest = "sha256:" + "a" * 64
+        canonical = "docker.io/library/test:v2@" + digest
+        with mock.patch.object(
+            self.publisher, "_manifest_digest",
+            side_effect=[digest, self.publisher.AvailabilityError("429")],
+        ) as inspect, mock.patch.object(self.publisher, "_create_mirror") as create:
+            with self.assertRaises(self.publisher.AvailabilityError):
+                self.publisher._publish_one(
+                    "ghcr.io/heimgewebe/weltgewebe-proof-oci", "test",
+                    canonical, self.policy(), self.publisher.Deadline.after(60),
+                )
+        self.assertEqual(inspect.call_args_list[1].args[0], canonical)
+        create.assert_not_called()
+
+    def test_missing_verified_target_still_checks_source_and_copies(self) -> None:
+        digest = "sha256:" + "a" * 64
+        canonical = "docker.io/library/test:v1@" + digest
+        with mock.patch.object(
+            self.publisher, "_manifest_digest", side_effect=[None, digest, digest]
+        ) as inspect, mock.patch.object(self.publisher, "_create_mirror") as create:
+            result = self.publisher._publish_one(
+                "ghcr.io/heimgewebe/weltgewebe-proof-oci", "test",
+                canonical, self.policy(), self.publisher.Deadline.after(60),
+                previously_verified=True,
+            )
+        self.assertEqual(result["action"], "published")
+        self.assertEqual(inspect.call_args_list[1].args[0], canonical)
+        create.assert_called_once()
+
+    def test_wrong_verified_target_digest_is_not_reused_or_overwritten(self) -> None:
+        canonical = "docker.io/library/test:v1@sha256:" + "a" * 64
+        with mock.patch.object(
+            self.publisher, "_manifest_digest", return_value="sha256:" + "b" * 64
+        ) as inspect, mock.patch.object(self.publisher, "_create_mirror") as create:
+            with self.assertRaisesRegex(self.publisher.IntegrityError, "existing mirror tag digest mismatch"):
+                self.publisher._publish_one(
+                    "ghcr.io/heimgewebe/weltgewebe-proof-oci", "test",
+                    canonical, self.policy(), self.publisher.Deadline.after(60),
+                    previously_verified=True,
+                )
+        inspect.assert_called_once()
+        create.assert_not_called()
+
+    def test_prior_lock_must_match_reviewed_head_and_pass_existing_validator(self) -> None:
+        from scripts.platform import oci_proof_mirror
+
+        lock = {"images": {"test": {"canonical": "example"}}}
+        with mock.patch.object(
+            oci_proof_mirror, "_load_lock", return_value=lock
+        ) as validate, mock.patch.object(
+            oci_proof_mirror, "_git_bytes", return_value=json.dumps(lock).encode()
+        ):
+            self.assertEqual(self.publisher._previously_verified_images(), lock["images"])
+        validate.assert_called_once_with()
+        with mock.patch.object(
+            oci_proof_mirror, "_load_lock", return_value=lock
+        ), mock.patch.object(
+            oci_proof_mirror, "_git_bytes", return_value=b'{"images": {}}'
+        ):
+            with mock.patch.object(self.publisher.sys, "stderr") as stderr:
+                self.assertEqual(self.publisher._previously_verified_images(), {})
+            self.assertIn("differs from reviewed HEAD", stderr.write.call_args_list[0].args[0])
+
+    def test_rejected_prior_lock_has_no_reuse_authority(self) -> None:
+        from scripts.platform import oci_proof_mirror
+
+        output_dir = ROOT / "build/kubernetes-platform"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=output_dir) as tmp:
+            path = Path(tmp) / "lock.json"
+            path.write_text('{"schema_version": 0}', encoding="utf-8")
+            with mock.patch.object(oci_proof_mirror, "LOCK_PATH", path), mock.patch.object(
+                self.publisher.sys, "stderr"
+            ) as stderr, mock.patch.object(
+                self.publisher, "_git_head", return_value="c" * 40
+            ), mock.patch.object(
+                self.publisher, "_sha256", return_value="d" * 64
+            ), mock.patch.object(
+                self.publisher, "_tool_versions", return_value={"docker": "x", "buildx": "y"}
+            ), mock.patch.object(
+                self.publisher, "_publish_one", side_effect=lambda *args: {"action": "reused"}
+            ) as publish_one:
+                result = self.publisher.publish("c" * 40, "d" * 64, Path(tmp) / "provenance.json")
+            self.assertIn("unsupported OCI mirror lock schema", stderr.write.call_args_list[0].args[0])
+        self.assertEqual(result["status"], "pass")
+        flags = {call.args[1]: call.args[5] for call in publish_one.call_args_list}
+        self.assertEqual(flags, {name: False for name in self.publisher.EXPECTED_IMAGES})
+
+    def test_prior_lock_budget_failure_stays_blocking(self) -> None:
+        from scripts.platform import oci_proof_mirror
+
+        with mock.patch.object(
+            oci_proof_mirror, "_load_lock",
+            side_effect=oci_proof_mirror.BudgetError("package limit exceeded"),
+        ):
+            with self.assertRaisesRegex(oci_proof_mirror.BudgetError, "package limit exceeded"):
+                self.publisher._previously_verified_images()
+
+    def test_publish_uses_only_exact_prior_canonical_bindings(self) -> None:
+        seed = self.publisher._load_seed()
+        names = list(seed["images"])
+        exact, changed = names[:2]
+        previous = {
+            exact: {"canonical": seed["images"][exact]["canonical"]},
+            changed: {
+                "canonical": seed["images"][changed]["canonical"].rsplit("@", 1)[0]
+                + "@sha256:" + "0" * 64,
+            },
+        }
+        output_dir = ROOT / "build/kubernetes-platform"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=output_dir) as tmp, mock.patch.object(
+            self.publisher, "_git_head", return_value="c" * 40
+        ), mock.patch.object(
+            self.publisher, "_sha256", return_value="d" * 64
+        ), mock.patch.object(
+            self.publisher, "_tool_versions", return_value={"docker": "x", "buildx": "y"}
+        ), mock.patch.object(
+            self.publisher, "_previously_verified_images", return_value=previous
+        ), mock.patch.object(
+            self.publisher, "_publish_one", side_effect=lambda *args: {"action": "reused"}
+        ) as publish_one:
+            result = self.publisher.publish("c" * 40, "d" * 64, Path(tmp) / "provenance.json")
+        self.assertEqual(result["status"], "pass")
+        flags = {call.args[1]: call.args[5] for call in publish_one.call_args_list}
+        self.assertEqual(flags, {name: name == exact for name in names})
+
+    def test_bootstrap_has_no_prior_authority(self) -> None:
+        from scripts.platform import oci_proof_mirror
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            oci_proof_mirror, "LOCK_PATH", Path(tmp) / "missing.json"
+        ), mock.patch.object(oci_proof_mirror, "_load_lock") as validate:
+            self.assertEqual(self.publisher._previously_verified_images(), {})
+        validate.assert_not_called()
+
     def test_copy_preserves_single_manifest_shape_and_uses_full_digest_tag(self) -> None:
         result = mock.Mock(returncode=0)
         with mock.patch.object(self.publisher.subprocess, "run", return_value=result) as run:
@@ -181,7 +335,7 @@ class KubernetesOciMirrorPublisherContractTests(unittest.TestCase):
             },
         }
 
-        def publish_one(_target, name, canonical, _policy, _deadline):
+        def publish_one(_target, name, canonical, _policy, _deadline, _previously_verified):
             if name == "two":
                 raise self.publisher.AvailabilityError("offline")
             return {
@@ -203,6 +357,8 @@ class KubernetesOciMirrorPublisherContractTests(unittest.TestCase):
             self.publisher, "_load_seed", return_value=seed
         ), mock.patch.object(
             self.publisher, "_tool_versions", return_value={"docker": "x", "buildx": "y"}
+        ), mock.patch.object(
+            self.publisher, "_previously_verified_images", return_value={}
         ), mock.patch.object(
             self.publisher, "_publish_one", side_effect=publish_one
         ):
@@ -232,6 +388,8 @@ class KubernetesOciMirrorPublisherContractTests(unittest.TestCase):
             )
             self.assertEqual(checkout["with"]["ref"], "${{ github.sha }}")
             self.assertFalse(checkout["with"]["persist-credentials"])
+            if job_name == "publish":
+                self.assertEqual(checkout["with"]["fetch-depth"], 0)
         contract_steps = {
             step["name"]: step for step in jobs["contract"]["steps"] if "name" in step
         }
