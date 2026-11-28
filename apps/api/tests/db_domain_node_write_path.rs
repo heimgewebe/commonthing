@@ -6439,3 +6439,141 @@ async fn postgres_cookie_owner_and_foreign_admin_visibility_after_commit() -> Re
         .await?;
     Ok(())
 }
+
+/// Wait for a real relation-lock waiter, not an elapsed-time guess. The
+/// blocker holds the edge table only; it has not yet touched the projection
+/// generation singleton.
+async fn wait_for_domain_edge_lock_waiter(pool: &PgPool, blocker_pid: i32) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks l \
+                 WHERE l.locktype = 'relation' AND l.relation = 'domain_edges'::regclass \
+                   AND NOT l.granted AND $1 = ANY(pg_blocking_pids(l.pid)))",
+            )
+            .bind(blocker_pid)
+            .fetch_one(pool)
+            .await?;
+            if waiting {
+                return Ok::<(), sqlx::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("the mutation did not reach the blocked edge relation")??;
+    Ok(())
+}
+
+/// A create used to INSERT its node (taking the projection singleton through
+/// the trigger) and only then wait for the edge table. A concurrent deletion
+/// holding that table needs the same singleton, completing a deadlock cycle.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
+#[serial]
+async fn domain_edge_lock_order_create() -> Result<()> {
+    const ACTOR_ID: &str = "20000000-0000-4000-8000-000000000191";
+    let pool = connect_pool().await;
+    run_migrations(&pool).await;
+    clean_all_nodes(&pool).await;
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+    let (app, cookie, _state) = postgres_write_app(pool.clone(), ACTOR_ID).await?;
+
+    let mut blocker = pool.begin().await?;
+    let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *blocker)
+        .await?;
+    sqlx::query("LOCK TABLE domain_edges IN EXCLUSIVE MODE")
+        .execute(&mut *blocker)
+        .await?;
+    let task = tokio::spawn(async move {
+        app.oneshot(post_node_req(
+            &cookie,
+            r#"{"title":"Lock order node","kind":"place","address":"Testweg 1","location":{"lat":53.55,"lon":10.0}}"#,
+        )).await
+    });
+    let waiting = wait_for_domain_edge_lock_waiter(&pool, blocker_pid).await;
+    let projection = if waiting.is_ok() {
+        Some(sqlx::query_scalar::<_, i64>(
+            "SELECT version FROM domain_projection_state WHERE singleton = TRUE FOR UPDATE NOWAIT",
+        ).fetch_one(&mut *blocker).await)
+    } else {
+        None
+    };
+    // Release and join even on the expected red phase.
+    blocker.rollback().await?;
+    let response = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .context("create did not complete after releasing edge table")???;
+    waiting?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    projection
+        .expect("probe executed")
+        .context("node create held projection singleton while waiting for edge table")?;
+    clean_all_nodes(&pool).await;
+    Ok(())
+}
+
+/// Guest exit also changes nodes before deleting account Fäden. It must not
+/// own the projection singleton while waiting for the edge table.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
+#[serial]
+async fn domain_edge_lock_order_guest_exit() -> Result<()> {
+    const ACTOR_ID: &str = "20000000-0000-4000-8000-000000000192";
+    let pool = connect_pool().await;
+    run_migrations(&pool).await;
+    clean_all_nodes(&pool).await;
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+    let (app, cookie, _state) = postgres_write_app(pool.clone(), ACTOR_ID).await?;
+    let response = app.oneshot(post_node_req(
+        &cookie,
+        r#"{"title":"Guest lock order node","kind":"place","address":"Testweg 2","location":{"lat":53.55,"lon":10.0}}"#,
+    )).await?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    sqlx::query("UPDATE domain_accounts SET role='gast' WHERE id=$1")
+        .bind(ACTOR_ID)
+        .execute(&pool)
+        .await?;
+    let owned: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM domain_nodes WHERE payload->>'created_by_account_id'=$1",
+    )
+    .bind(ACTOR_ID)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(owned, 1, "exit must actually write a node");
+
+    let mut blocker = pool.begin().await?;
+    let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *blocker)
+        .await?;
+    sqlx::query("LOCK TABLE domain_edges IN EXCLUSIVE MODE")
+        .execute(&mut *blocker)
+        .await?;
+    let exit_pool = pool.clone();
+    let task = tokio::spawn(async move { delete_guest_account(&exit_pool, ACTOR_ID).await });
+    let waiting = wait_for_domain_edge_lock_waiter(&pool, blocker_pid).await;
+    let projection = if waiting.is_ok() {
+        Some(sqlx::query_scalar::<_, i64>(
+            "SELECT version FROM domain_projection_state WHERE singleton = TRUE FOR UPDATE NOWAIT",
+        ).fetch_one(&mut *blocker).await)
+    } else {
+        None
+    };
+    blocker.rollback().await?;
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .context("guest exit did not complete after releasing edge table")???;
+    waiting?;
+    projection
+        .expect("probe executed")
+        .context("guest exit held projection singleton while waiting for edge table")?;
+    clean_all_nodes(&pool).await;
+    Ok(())
+}

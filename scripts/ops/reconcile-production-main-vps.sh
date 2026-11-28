@@ -1608,6 +1608,7 @@ preflight_main="$(git -C "$SOURCE_CHECKOUT" ls-remote --exit-code origin refs/he
 # successful deployment and does not create state, Git refs or Docker effects.
 # Any malformed/withdrawn HOLD remains fatal through the preceding --preflight.
 approval_error=""
+routine_lock_held=false
 if ! approval_error="$(python3 -I "$AUTHORIZER" --commit "$preflight_main" 2>&1)"; then
   approved_commit="$(python3 -I "$AUTHORIZER" --approved-commit)" ||
     fail "production HOLD approval could not be revalidated"
@@ -1617,8 +1618,26 @@ if ! approval_error="$(python3 -I "$AUTHORIZER" --commit "$preflight_main" 2>&1)
     printf '%s\n' "$approval_error" >&2
     fail "production HOLD rejected its own approved commit"
   fi
-  echo "production_reconcile=awaiting_approval approved=$approved_commit remote=$preflight_main no_deploy_effects=true"
-  exit "$EXIT_APPROVAL_PENDING"
+  if ! python3 -I "$AUTHORIZER" --routine-enabled; then
+    echo "production_reconcile=awaiting_approval approved=$approved_commit remote=$preflight_main no_deploy_effects=true"
+    exit "$EXIT_APPROVAL_PENDING"
+  fi
+  # Routine admission is only available on an initialized production instance.
+  # Reuse the existing deployment lock, not a second authorization service.
+  [[ -f "$PRODUCTION_LOCK_FILE" && ! -L "$PRODUCTION_LOCK_FILE" ]] ||
+    fail "routine admission requires the existing production deployment lock"
+  acquire_production_lock
+  routine_lock_held=true
+  if ! git -C "$SOURCE_CHECKOUT" cat-file -e "$preflight_main^{commit}" 2> /dev/null; then
+    git -C "$SOURCE_CHECKOUT" fetch --no-write-fetch-head --no-tags \
+      --no-auto-gc --no-recurse-submodules origin "$preflight_main" ||
+      fail "routine source object fetch failed"
+  fi
+  if ! python3 -I "$AUTHORIZER" --admit-routine "$preflight_main" \
+    --source-repository "$SOURCE_CHECKOUT" --production-lock-file "$PRODUCTION_LOCK_FILE"; then
+    echo "production_reconcile=awaiting_approval approved=$approved_commit remote=$preflight_main no_deploy_effects=true"
+    exit "$EXIT_APPROVAL_PENDING"
+  fi
 fi
 # Admission must bind the OCI digest from immutable source bytes before
 # shared state directories, tracking refs, timers, locks or Docker effects.
@@ -1638,7 +1657,9 @@ install -d -o root -g root -m 0700 \
   "$ARTIFACT_ROOT" "$RECEIPT_ROOT" "$DEPLOY_RECEIPT_ROOT" "$DOCKER_CONFIG"
 install -d -o root -g root -m 0700 "$DEPLOY_RECEIPT_ROOT/contention"
 install -d -o root -g root -m 0755 "$RELEASE_ROOT"
-acquire_production_lock
+if [[ "$routine_lock_held" != true ]]; then
+  acquire_production_lock
+fi
 prune_deploy_contention_receipts
 
 available_kib="$(df -Pk "$ARTIFACT_ROOT" | awk 'NR==2 {print $4}')"

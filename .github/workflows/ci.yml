@@ -119,6 +119,9 @@ jobs:
               - 'apps/web/vite.config.ts'
               - 'apps/web/svelte.config.*'
               - 'map-style/**'
+              # Every proof job installs Node from this file; a runtime bump
+              # changes the build and the Playwright runner under the proof.
+              - '.node-version'
             heavy:
               - '.github/workflows/*.yml'
               - '.github/workflows/*.yaml'

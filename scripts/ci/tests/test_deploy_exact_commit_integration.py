@@ -636,12 +636,12 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
         checker_source = (ROOT / "scripts/ops/verify_production_hold_release.py").read_text(
             encoding="utf-8"
         )
-        original_root = 'root: Path = Path("/etc"), *, expected_uid: int = 0,'
+        original_root = 'HOLD_ROOT = Path("/etc")'
         if checker_source.count(original_root) != 1:
             raise AssertionError("test HOLD checker source changed unexpectedly")
         checker_source = checker_source.replace(
             original_root,
-            f"root: Path = Path({str(self.hold_etc)!r}), *, expected_uid: int = 0,",
+            f"HOLD_ROOT = Path({str(self.hold_etc)!r})",
             1,
         )
         self.test_hold_checker.write_text(checker_source, encoding="utf-8")
@@ -1372,6 +1372,42 @@ class DeployExactCommitIntegrationTests(unittest.TestCase):
                     self.assertIn("Schaubild OCI digest differs", result.stderr)
                 self.assertFalse((self.root / "weltgewebe-up.log").exists())
                 self.assertFalse((self.root / "deploy-complete").exists())
+
+    def test_routine_ui_successor_uses_existing_reconciler_without_rewriting_hold(self) -> None:
+        baseline = self.commit
+        root_grant = {**self.hold_data, "routine_web_releases": True}
+        self.install_root_json(self.hold_file, root_grant)
+        self.install_root_text(self.state / "production-deployment.lock", "")
+        checker = run(self.privileged(["cat", str(self.test_hold_checker)])).stdout
+        insertion = 'if __name__ == "__main__":'
+        self.assertEqual(checker.count(insertion), 1)
+        checker = checker.replace(insertion, (
+            "def verify_local_recovery(*args, **kwargs):\n"
+            "    return None\n"
+            "def verify_main_ci(commit):\n"
+            "    return 123\n\n"
+        ) + insertion)
+        self.install_root_text(self.test_hold_checker, checker)
+        run(self.privileged(["chmod", "0755", str(self.test_hold_checker)]))
+        web = self.seed / "apps/web/src"
+        web.mkdir(parents=True)
+        (web / "routine.ts").write_text("export const routine = true;\n")
+        run(["git", "add", "."], cwd=self.seed)
+        run(["git", "commit", "-m", "routine successor"], cwd=self.seed)
+        run(["git", "push", "origin", "main"], cwd=self.seed)
+        self.commit = run(["git", "rev-parse", "HEAD"], cwd=self.seed).stdout.strip()
+        self.assertNotEqual(self.commit, baseline)
+        self.make_artifact()
+        result = self.reconcile_stale_public_commit(deploy_helper=self.test_deploy_script)
+        self.restore_test_ownership()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("production_routine_release=admitted", result.stdout)
+        self.assertIn("production_reconcile=verified", result.stdout)
+        self.assertEqual(json.loads(self.hold_file.read_text()), root_grant)
+        receipt = json.loads((self.hold_file.parent / "production-routine-release.json").read_text())
+        self.assertEqual(receipt["commit"], self.commit)
+        self.assertEqual(receipt["ci_run_id"], 123)
+        self.assertTrue((self.root / "deploy-complete").exists())
 
     def test_reconciler_repairs_same_commit_regional_public_bundle(self) -> None:
         marker = self.root / "deploy-complete"

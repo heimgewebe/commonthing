@@ -363,26 +363,49 @@ def _create_mirror(
     )
 
 
+def _previously_verified_images() -> dict[str, Any]:
+    """Reuse only entries from the reviewed, ancestry-validated active lock."""
+    if __name__ == "__main__":
+        import oci_proof_mirror
+    else:
+        from scripts.platform import oci_proof_mirror
+
+    if not oci_proof_mirror.LOCK_PATH.exists():
+        # First publication has no prior generation to reuse.
+        return {}
+    try:
+        lock = oci_proof_mirror._load_lock()
+        committed = json.loads(
+            oci_proof_mirror._git_bytes(
+                ["show", "HEAD:platform/oci-proof-mirror.lock.json"]
+            )
+        )
+        if lock != committed:
+            raise IntegrityError("OCI mirror lock differs from reviewed HEAD")
+    except (
+        oci_proof_mirror.IntegrityError,
+        IntegrityError,
+        json.JSONDecodeError,
+        UnicodeError,
+        OSError,
+    ) as error:
+        # A rejected prior generation has no reuse authority. Recover by
+        # performing fresh canonical checks, never by trusting its entries.
+        # BudgetError and unexpected programming failures remain hard errors.
+        print(f"OCI mirror prior lock reuse unavailable: {error}", file=sys.stderr)
+        return {}
+    return lock["images"]
+
+
 def _publish_one(
     target_repository: str,
     name: str,
     canonical: str,
     policy: dict[str, Any],
     deadline: Deadline,
+    previously_verified: bool = False,
 ) -> dict[str, Any]:
     canonical_digest = canonical.rsplit("@", 1)[1]
-    observed_canonical = _manifest_digest(
-        canonical,
-        attempts=policy["canonical_inspect_attempts"],
-        backoff_seconds=policy["retry_backoff_seconds"],
-        operation_timeout=policy["operation_timeout_seconds"],
-        deadline=deadline,
-    )
-    if observed_canonical != canonical_digest:
-        raise IntegrityError(
-            f"canonical manifest digest mismatch for {name}: "
-            f"{observed_canonical} != {canonical_digest}"
-        )
     target_tag = f"{target_repository}:{name}-{canonical_digest.removeprefix('sha256:')}"
     existing = _manifest_digest(
         target_tag,
@@ -392,12 +415,28 @@ def _publish_one(
         deadline=deadline,
         allow_missing=True,
     )
-    if existing is not None:
-        if existing != canonical_digest:
+    if existing is not None and existing != canonical_digest:
+        raise IntegrityError(
+            f"existing mirror tag digest mismatch for {name}: "
+            f"{existing} != {canonical_digest}"
+        )
+    # A prior verified source binding plus a fresh identical target digest
+    # is sufficient for an unchanged image. New or missing images still
+    # require a fresh source check, including on a partially completed run.
+    if existing is None or not previously_verified:
+        observed_canonical = _manifest_digest(
+            canonical,
+            attempts=policy["canonical_inspect_attempts"],
+            backoff_seconds=policy["retry_backoff_seconds"],
+            operation_timeout=policy["operation_timeout_seconds"],
+            deadline=deadline,
+        )
+        if observed_canonical != canonical_digest:
             raise IntegrityError(
-                f"existing mirror tag digest mismatch for {name}: "
-                f"{existing} != {canonical_digest}"
+                f"canonical manifest digest mismatch for {name}: "
+                f"{observed_canonical} != {canonical_digest}"
             )
+    if existing is not None:
         return {
             "action": "reused",
             "canonical": canonical,
@@ -474,6 +513,7 @@ def publish(expected_head: str, expected_seed_sha256: str, output: Path) -> dict
     if observed_seed != expected_seed_sha256:
         raise PublisherError(f"seed mismatch: {observed_seed} != {expected_seed_sha256}")
     seed = _load_seed()
+    previous_images = _previously_verified_images()
     policy = seed["publisher"]
     deadline = Deadline.after(policy["overall_deadline_seconds"])
     payload: dict[str, Any] = {
@@ -525,6 +565,7 @@ def publish(expected_head: str, expected_seed_sha256: str, output: Path) -> dict
                     spec["canonical"],
                     policy,
                     deadline,
+                    previous_images.get(name, {}).get("canonical") == spec["canonical"],
                 )
                 futures[future] = (name, spec)
             for future in concurrent.futures.as_completed(futures):
