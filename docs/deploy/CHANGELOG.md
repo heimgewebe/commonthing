@@ -10,6 +10,15 @@ relations:
 ---
 # Deployment-Änderungsprotokoll
 
+## 2026-11-27 - PAM-Sicherheitsaktualisierung im API-Image
+
+**Änderung:** Die Runtime-Stage in `apps/api/Dockerfile` aktualisiert
+`libpam-modules`, `libpam-modules-bin`, `libpam-runtime` und `libpam0g`
+gemeinsam über den bestehenden APT-Installationsschritt. Trivy meldete
+CVE-2025-6020 in 1.5.2-6+deb12u2; behoben ab 1.5.2-6+deb12u3.
+Der Basisimage-Digest und die OCI-Mirror-Bindung bleiben unverändert.
+Der Image-Neubau und erneute Sicherheitscheck sind zur Abnahme erforderlich.
+
 ## 2026-11-02 - PostgreSQL-Sicherheitsaktualisierung (CVE-2026-16239)
 
 **Gezielter Fix:** Der am 02.11.2026 auf `commonserver` nachgewiesene
