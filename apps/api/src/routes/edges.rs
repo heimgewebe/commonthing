@@ -412,6 +412,50 @@ pub(crate) fn edge_is_permanently_unreachable(edge: &Edge) -> bool {
     edge_lifecycle_window(edge).is_err()
 }
 
+/// Cache admission retains future and fully undated legacy Fäden, but never
+/// an invalid or already expired projection. Historical identity and replay
+/// remain the responsibility of the complete persistence source.
+pub(crate) fn edge_cache_admissible_at(edge: &Edge, now: DateTime<Utc>) -> bool {
+    edge_has_valid_faden_metadata(edge)
+        && match edge_lifecycle_window(edge) {
+            Ok(EdgeLifecycleWindow::Unbounded) => true,
+            Ok(EdgeLifecycleWindow::Bounded { end, .. }) => now < end,
+            Err(_) => false,
+        }
+}
+
+/// PostgreSQL owns a typed creation timestamp, so its canonical expiry can
+/// be tested without casting arbitrary JSON payload strings.
+pub(crate) fn edge_cache_cutoff(now: DateTime<Utc>) -> DateTime<Utc> {
+    now - Duration::hours(FADEN_LIFETIME_HOURS)
+}
+
+/// Publish a durable result without exceeding the configured cache bound.
+/// An expired replay must not overwrite a newer, live projection. Pruning only
+/// when another slot is required avoids a full cache scan on ordinary writes.
+pub(crate) fn publish_edge_to_cache(
+    cache: &mut OrderedCache<Edge>,
+    edge: Edge,
+    now: DateTime<Utc>,
+) {
+    if !edge_cache_admissible_at(&edge, now) {
+        if cache
+            .get(&edge.id)
+            .is_some_and(|cached| !edge_cache_admissible_at(cached, now))
+        {
+            cache.remove(&edge.id);
+        }
+        return;
+    }
+    let limit = max_edges_cache_limit();
+    if cache.get(&edge.id).is_none() && cache.len() >= limit {
+        cache.retain(|cached| edge_cache_admissible_at(cached, now));
+    }
+    if cache.get(&edge.id).is_some() || cache.len() < limit {
+        cache.insert(edge.id.clone(), edge);
+    }
+}
+
 fn edge_has_valid_faden_metadata(edge: &Edge) -> bool {
     match (&edge.faden_type, &edge.faden_subject_id) {
         (None, None) => true,
@@ -465,6 +509,7 @@ pub async fn load_edges() -> std::io::Result<OrderedCache<Edge>> {
     let mut cache_limit_warned = false;
 
     let max_edges = max_edges_cache_limit();
+    let now = Utc::now();
 
     while let Some(line) = lines.next_line().await? {
         line_number += 1;
@@ -498,6 +543,9 @@ pub async fn load_edges() -> std::io::Result<OrderedCache<Edge>> {
             continue;
         }
 
+        if !edge_cache_admissible_at(&edge, now) {
+            continue;
+        }
         if records_read >= max_edges {
             if !cache_limit_warned {
                 tracing::warn!(
@@ -1207,6 +1255,9 @@ struct EdgePersistenceStatus {
     /// The file already holds at least `max_edges_cache_limit()` cache-admissible
     /// edges, so another appended edge would not be materialized after restart.
     cache_limit_reached: bool,
+    /// Replacing the matched operation may reuse its own admitted slot, but
+    /// cannot consume an additional slot if the historical row has expired.
+    reactivation_limit_reached: bool,
     /// The id already exists somewhere in the persistence source, even when
     /// it is not in the in-memory cache (e.g. in a suffix the loader
     /// truncated away).
@@ -1216,8 +1267,8 @@ struct EdgePersistenceStatus {
 }
 
 /// Scan the persisted edges file once before an append. Cache-limit accounting
-/// follows [`load_edges`] for parseable edges that could ever be active (matching
-/// [`edge_is_permanently_unreachable`]). The scan is strict about JSON and `Edge`
+/// follows load_edges for valid edges with an unexpired or unbounded lifetime.
+/// The scan is strict about JSON and Edge
 /// projection for the same reason as startup: a create must never append to a
 /// canonical file that the next restart would reject. The scan remains read-only
 /// and preserves every existing byte. A final unterminated line is still read.
@@ -1238,6 +1289,7 @@ async fn inspect_edge_persistence_for_create(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(EdgePersistenceStatus {
                 cache_limit_reached: max_edges == 0,
+                reactivation_limit_reached: max_edges == 0,
                 duplicate_id: false,
                 existing_operation: None,
             });
@@ -1249,6 +1301,8 @@ async fn inspect_edge_persistence_for_create(
     let mut lines_read = 0usize;
     let mut duplicate_id = false;
     let mut existing_operation = None;
+    let mut existing_operation_occupies_slot = false;
+    let now = Utc::now();
     let mut line_number = 0usize;
 
     while let Some(line) = lines.next_line().await? {
@@ -1296,13 +1350,19 @@ async fn inspect_edge_persistence_for_create(
             existing_operation = Some(edge.clone());
         }
 
-        if !edge_is_permanently_unreachable(&edge) {
+        if edge_cache_admissible_at(&edge, now) {
             lines_read += 1;
+            if operation_matches {
+                existing_operation_occupies_slot = true;
+            }
         }
     }
 
     Ok(EdgePersistenceStatus {
         cache_limit_reached: lines_read >= max_edges,
+        reactivation_limit_reached: lines_read
+            .saturating_sub(usize::from(existing_operation_occupies_slot))
+            >= max_edges,
         duplicate_id,
         existing_operation,
     })
@@ -1565,6 +1625,9 @@ async fn project_derived_faden(
                     ));
                 }
                 if projection_mode == FadenProjectionMode::Reactivate {
+                    if persistence.reactivation_limit_reached {
+                        return Err((StatusCode::CONFLICT, "edge cache limit reached".to_string()));
+                    }
                     let operation = operation
                         .as_ref()
                         .expect("an existing operation result always has an operation key");
@@ -1589,7 +1652,8 @@ async fn project_derived_faden(
                             )
                         })?;
                     let mut edges = state.edges.write().await;
-                    edges.insert(reactivated.id.clone(), reactivated.clone());
+                    publish_edge_to_cache(&mut edges, reactivated.clone(), Utc::now());
+                    state.metrics.set_edges_cache_count(edges.len() as i64);
                     tracing::info!(
                         event = "edge.reactivated",
                         edge_id = %reactivated.id,
@@ -1599,7 +1663,8 @@ async fn project_derived_faden(
                     return Ok((StatusCode::OK, Json(reactivated)));
                 }
                 let mut edges = state.edges.write().await;
-                edges.insert(existing.id.clone(), existing.clone());
+                publish_edge_to_cache(&mut edges, existing.clone(), Utc::now());
+                state.metrics.set_edges_cache_count(edges.len() as i64);
                 return Ok((StatusCode::OK, Json(existing)));
             }
             if persistence.duplicate_id {
@@ -1632,7 +1697,8 @@ async fn project_derived_faden(
             }
 
             let mut edges = state.edges.write().await;
-            edges.insert(edge.id.clone(), edge.clone());
+            publish_edge_to_cache(&mut edges, edge.clone(), Utc::now());
+            state.metrics.set_edges_cache_count(edges.len() as i64);
         }
         DomainEdgeWriteSource::Postgres => {
             // PostgreSQL mode never inspects or appends JSONL. The existing
@@ -1673,6 +1739,10 @@ async fn project_derived_faden(
                         let reactivated = reactivate_domain_edge(pool, &reactivated, operation)
                             .await
                             .map_err(|error| match error {
+                                EdgeWriteError::CacheLimitReached => (
+                                    StatusCode::CONFLICT,
+                                    "edge cache limit reached".to_string(),
+                                ),
                                 EdgeWriteError::OperationConflict => (
                                     StatusCode::CONFLICT,
                                     "edge operation id was already used for different data".to_string(),
@@ -1686,7 +1756,8 @@ async fn project_derived_faden(
                                 }
                             })?;
                         let mut edges = state.edges.write().await;
-                        edges.insert(reactivated.id.clone(), reactivated.clone());
+                        publish_edge_to_cache(&mut edges, reactivated.clone(), Utc::now());
+                        state.metrics.set_edges_cache_count(edges.len() as i64);
                         tracing::info!(
                             event = "edge.reactivated",
                             edge_id = %reactivated.id,
@@ -1696,7 +1767,8 @@ async fn project_derived_faden(
                         return Ok((StatusCode::OK, Json(reactivated)));
                     }
                     let mut edges = state.edges.write().await;
-                    edges.insert(existing.id.clone(), existing.clone());
+                    publish_edge_to_cache(&mut edges, existing.clone(), Utc::now());
+                    state.metrics.set_edges_cache_count(edges.len() as i64);
                     return Ok((StatusCode::OK, Json(existing)));
                 }
                 Err(EdgeWriteError::DuplicateId) => {
@@ -1715,7 +1787,8 @@ async fn project_derived_faden(
             }
 
             let mut edges = state.edges.write().await;
-            edges.insert(edge.id.clone(), edge.clone());
+            publish_edge_to_cache(&mut edges, edge.clone(), Utc::now());
+            state.metrics.set_edges_cache_count(edges.len() as i64);
         }
     }
 
@@ -3005,6 +3078,90 @@ mod tests {
             .as_object()
             .expect("object")
             .contains_key("expires_at"));
+    }
+
+    #[test]
+    #[serial]
+    fn cache_admission_keeps_future_and_undated_but_not_expired_history() {
+        let _limit = EnvGuard::set("MAX_EDGES_CACHE", "1");
+        let now = Utc.with_ymd_and_hms(2026, 7, 24, 10, 0, 0).unwrap();
+        let expired = lifecycle_edge(Some("2026-07-17T10:00:00Z"), Some("2026-07-24T10:00:00Z"));
+        let future = lifecycle_edge(Some("2026-07-25T10:00:00Z"), None);
+        let undated = lifecycle_edge(None, None);
+        let invalid = lifecycle_edge_with_null_expiry(Some("2026-07-25T10:00:00Z"));
+        assert!(!super::edge_cache_admissible_at(&expired, now));
+        assert!(super::edge_cache_admissible_at(
+            &expired,
+            now - Duration::microseconds(1)
+        ));
+        assert!(super::edge_cache_admissible_at(&future, now));
+        assert!(!edge_is_active_at(&future, now));
+        assert!(super::edge_cache_admissible_at(&undated, now));
+        assert!(!super::edge_cache_admissible_at(&invalid, now));
+        let mut cache = crate::state::OrderedCache::new();
+        cache.insert(expired.id.clone(), expired.clone());
+        let mut next = future.clone();
+        next.id = "next".into();
+        super::publish_edge_to_cache(&mut cache, next.clone(), now);
+        assert_eq!(cache.len(), 1);
+        assert!(cache.get("next").is_some());
+        assert!(cache.get(&expired.id).is_none());
+        super::publish_edge_to_cache(&mut cache, expired.clone(), now);
+        super::publish_edge_to_cache(&mut cache, undated.clone(), now);
+        assert_eq!(cache.len(), 1);
+        assert!(cache.get("next").is_some());
+        let mut old = expired;
+        old.id = "next".into();
+        super::publish_edge_to_cache(&mut cache, old, now);
+        assert_eq!(cache.get("next").unwrap().created_at, next.created_at);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn jsonl_reactivation_reserves_capacity_only_for_new_projection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _dir = EnvGuard::set("GEWEBE_IN_DIR", tmp.path().to_str().unwrap());
+        let _limit = EnvGuard::set("MAX_EDGES_CACHE", "1");
+        let op = operation_key();
+        let mut historical = operation_record(
+            "00000000-0000-0000-0000-0000000000e1",
+            "2020-01-01T00:00:00Z",
+        );
+        historical["expires_at"] = json!("2020-01-08T00:00:00Z");
+        let live = lifecycle_edge(None, None);
+        let mut live = serde_json::to_value(live).unwrap();
+        live["id"] = json!("00000000-0000-0000-0000-0000000000e2");
+        let path = crate::utils::edges_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = format!("{}\n{}\n", historical, live);
+        fs::write(&path, &original).unwrap();
+        let inspection = super::inspect_edge_persistence_for_create("new", Some(&op))
+            .await
+            .unwrap();
+        assert!(inspection.cache_limit_reached);
+        assert!(inspection.reactivation_limit_reached);
+        assert!(inspection.existing_operation.is_some());
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        fs::write(&path, format!("{}\n", historical)).unwrap();
+        let inspection = super::inspect_edge_persistence_for_create("new", Some(&op))
+            .await
+            .unwrap();
+        assert!(!inspection.cache_limit_reached);
+        assert!(!inspection.reactivation_limit_reached);
+        let now = Utc::now();
+        historical["created_at"] = json!(LifecycleTimestamp::from_datetime(now));
+        historical["expires_at"] = json!(LifecycleTimestamp::from_datetime(
+            now + Duration::hours(FADEN_LIFETIME_HOURS)
+        ));
+        fs::write(&path, format!("{}\n", historical)).unwrap();
+        let inspection = super::inspect_edge_persistence_for_create("new", Some(&op))
+            .await
+            .unwrap();
+        assert!(inspection.cache_limit_reached);
+        assert!(
+            !inspection.reactivation_limit_reached,
+            "renewal reuses its own slot"
+        );
     }
 
     #[test]

@@ -1290,7 +1290,7 @@ async fn postgres_edge_create_rejects_when_limit_filled_by_non_object_payload_ro
     // into.
     sqlx::query(
         "INSERT INTO domain_edges (id, source_id, target_id, edge_kind, created_at, payload) \
-         VALUES ($1, $2, $3, 'reference', '2026-06-01T00:00:00Z', '[\"expires_at\"]'::jsonb)",
+         VALUES ($1, $2, $3, 'reference', NOW(), '[\"expires_at\"]'::jsonb)",
     )
     .bind(EDGE_ID_DUP)
     .bind(NODE_ID)
@@ -1324,6 +1324,168 @@ async fn postgres_edge_create_rejects_when_limit_filled_by_non_object_payload_ro
     assert!(text.contains("edge cache limit reached"), "body: {text}");
     assert!(state.edges.read().await.get(EDGE_ID_A).is_none());
 
+    clean(&pool).await;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
+#[serial]
+async fn expired_faden_history_frees_capacity_without_reusing_identity_postgres() -> Result<()> {
+    const ACTOR_ID: &str = "writepath-edge-expired-history";
+    const OPERATION_ID: &str = "40000000-0000-4000-8000-000000000011";
+    let pool = connect_pool().await;
+    run_migrations(&pool).await;
+    clean(&pool).await;
+    let _limit = EnvVarGuard::set("MAX_EDGES_CACHE", "1".to_string());
+    let tmp = tempfile::tempdir()?;
+    let in_dir = tmp.path().join("in");
+    std::fs::create_dir_all(&in_dir)?;
+    let _env = set_gewebe_in_dir(&in_dir);
+    let request = format!(
+        r#"{{"source_id":"{NODE_ID}","source_type":"node","target_id":"{ACCOUNT_ID}","target_type":"account","edge_kind":"reference","operation_id":"{OPERATION_ID}"}}"#
+    );
+    let (app, cookie, _) = edge_write_app(
+        pool.clone(),
+        ACTOR_ID,
+        Role::Admin,
+        DomainReadSource::Postgres,
+        DomainEdgeWriteSource::Postgres,
+    )
+    .await?;
+    let first = app.oneshot(post_edges_req(&cookie, &request)).await?;
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let first = read_json_body(first).await?;
+    let id = first["id"].as_str().context("old edge id")?;
+    sqlx::query("UPDATE domain_edges SET created_at = TIMESTAMPTZ '2020-01-01T00:00:00Z', payload = payload - 'expires_at' WHERE id = $1")
+        .bind(id).execute(&pool).await?;
+    let before: (chrono::DateTime<chrono::Utc>, serde_json::Value) =
+        sqlx::query_as("SELECT created_at,payload FROM domain_edges WHERE id=$1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await?;
+
+    let (app, cookie, state) = edge_write_app(
+        pool.clone(),
+        ACTOR_ID,
+        Role::Admin,
+        DomainReadSource::Postgres,
+        DomainEdgeWriteSource::Postgres,
+    )
+    .await?;
+    assert!(
+        state.edges.read().await.get(id).is_none(),
+        "expired history cannot occupy the only slot"
+    );
+    let next = app
+        .clone()
+        .oneshot(post_edges_req(&cookie, &create_body(EDGE_ID_A, None)))
+        .await?;
+    assert_eq!(next.status(), StatusCode::CREATED);
+    let replay = app
+        .clone()
+        .oneshot(post_edges_req(&cookie, &request))
+        .await?;
+    assert_eq!(replay.status(), StatusCode::OK);
+    assert_eq!(read_json_body(replay).await?["id"], id);
+    assert_eq!(
+        app.oneshot(post_edges_req(&cookie, &create_body(id, None)))
+            .await?
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let after: (chrono::DateTime<chrono::Utc>, serde_json::Value) =
+        sqlx::query_as("SELECT created_at,payload FROM domain_edges WHERE id=$1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(before, after);
+    {
+        let cache = state.edges.read().await;
+        assert_eq!(cache.len(), 1);
+        assert!(cache.get(id).is_none());
+        assert!(cache.get(EDGE_ID_A).is_some());
+    }
+    assert_eq!(load_edges_from_postgres(&pool).await?.len(), 1);
+    clean(&pool).await;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL pointing to direct PostgreSQL"]
+#[serial]
+async fn expired_faden_reactivation_obeys_capacity_and_serializes_with_new_create() -> Result<()> {
+    use weltgewebe_api::domain_db::{
+        insert_domain_edge, reactivate_domain_edge, CreateOperationKey, CreateWriteOutcome,
+        EdgeWriteError,
+    };
+    use weltgewebe_api::routes::edges::LifecycleTimestamp;
+    let pool = connect_pool().await;
+    run_migrations(&pool).await;
+    clean(&pool).await;
+    let _limit = EnvVarGuard::set("MAX_EDGES_CACHE", "1".to_string());
+    let operation = CreateOperationKey {
+        actor_id: "writepath-edge-reactivation".to_owned(),
+        operation_id: "40000000-0000-4000-8000-000000000012".to_owned(),
+    };
+    let now = chrono::Utc::now();
+    let mut expected: Edge = serde_json::from_value(serde_json::json!({
+        "id": EDGE_ID_DUP, "source_id": NODE_ID, "target_id": ACCOUNT_ID,
+        "source_type":"node", "target_type":"account", "edge_kind":"reference",
+        "created_at": now.to_rfc3339(), "expires_at": (now + chrono::Duration::days(7)).to_rfc3339()
+    }))?;
+    expected.created_at = Some(LifecycleTimestamp::from_datetime(now));
+    expected.expires_at = Some(Some(LifecycleTimestamp::from_datetime(
+        now + chrono::Duration::days(7),
+    )));
+    sqlx::query("INSERT INTO domain_edges (id,source_id,target_id,edge_kind,created_at,payload,create_actor_id,create_operation_id) VALUES ($1,$2,$3,'reference',TIMESTAMPTZ '2020-01-01T00:00:00Z','{\"source_type\":\"node\",\"target_type\":\"account\"}'::jsonb,$4,$5)")
+        .bind(EDGE_ID_DUP).bind(NODE_ID).bind(ACCOUNT_ID).bind(&operation.actor_id).bind(&operation.operation_id).execute(&pool).await?;
+    let mut other = expected.clone();
+    other.id = EDGE_ID_A.to_owned();
+    sqlx::query("INSERT INTO domain_edges (id,source_id,target_id,edge_kind,created_at,payload) VALUES ($1,$2,$3,'reference',NOW(),'{}'::jsonb)")
+        .bind(EDGE_ID_A).bind(NODE_ID).bind(ACCOUNT_ID).execute(&pool).await?;
+    assert!(
+        matches!(
+            reactivate_domain_edge(&pool, &expected, &operation).await,
+            Err(EdgeWriteError::CacheLimitReached)
+        ),
+        "expired reactivation must not exceed active capacity"
+    );
+    let original: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT created_at FROM domain_edges WHERE id=$1")
+            .bind(EDGE_ID_DUP)
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(original.to_rfc3339(), "2020-01-01T00:00:00+00:00");
+
+    sqlx::query("DELETE FROM domain_edges WHERE id=$1")
+        .bind(EDGE_ID_A)
+        .execute(&pool)
+        .await?;
+    let (renewal, creation) = tokio::join!(
+        reactivate_domain_edge(&pool, &expected, &operation),
+        insert_domain_edge(&pool, &other, None)
+    );
+    assert!(
+        (renewal.is_ok() && matches!(creation, Err(EdgeWriteError::CacheLimitReached)))
+            || (matches!(renewal, Err(EdgeWriteError::CacheLimitReached))
+                && matches!(creation, Ok(CreateWriteOutcome::Created))),
+        "exactly one operation may occupy the freed slot"
+    );
+    assert_eq!(load_edges_from_postgres(&pool).await?.len(), 1);
+    if renewal.is_err() {
+        sqlx::query("UPDATE domain_edges SET created_at = TIMESTAMPTZ '2020-01-01T00:00:00Z', payload = payload - 'expires_at' WHERE id=$1")
+            .bind(EDGE_ID_A).execute(&pool).await?;
+        reactivate_domain_edge(&pool, &expected, &operation).await?;
+    }
+    {
+        assert!(
+            reactivate_domain_edge(&pool, &expected, &operation)
+                .await
+                .is_ok(),
+            "renewing an already admitted edge at the cap consumes no additional slot"
+        );
+    }
     clean(&pool).await;
     Ok(())
 }

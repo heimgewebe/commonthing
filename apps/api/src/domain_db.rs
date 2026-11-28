@@ -21,7 +21,10 @@ use crate::routes::accounts::{
     MIN_RADIUS_M, RADIUS_PROJECTION_KEY,
 };
 use crate::routes::auth::MAX_EMAIL_LEN;
-use crate::routes::edges::{edge_is_permanently_unreachable, Edge, FadenType, LifecycleTimestamp};
+use crate::routes::edges::{
+    edge_cache_admissible_at, edge_cache_cutoff, edge_is_permanently_unreachable, Edge, FadenType,
+    LifecycleTimestamp,
+};
 use crate::routes::nodes::{normalize_account_id, Location, Node, SearchVisibility};
 use crate::state::OrderedCache;
 
@@ -308,21 +311,24 @@ pub async fn load_edges_from_postgres_counted(
     pool: &PgPool,
 ) -> Result<(OrderedCache<Edge>, usize)> {
     let max_edges = crate::routes::edges::max_edges_cache_limit();
+    let now = Utc::now();
+    // Exclude expired history using the typed column before streaming payloads.
     // No SQL-side LIMIT: rejected rows must not consume a physical row slot
     // that a later valid row would need. The decoder bounds physical reads
     // itself, stopping as soon as it has examined `max_edges + 1` *accepted*
     // rows (the `+ 1` only confirms truncation; it is never cached).
     let mut rows = sqlx::query_as::<_, EdgeRow>(
         "SELECT id, source_id, target_id, edge_kind, created_at, payload::text \
-         FROM domain_edges ORDER BY id ASC",
+         FROM domain_edges WHERE created_at IS NULL OR created_at > $1 ORDER BY id ASC",
     )
+    .bind(edge_cache_cutoff(now))
     .fetch(pool);
     let mut received = 0usize;
 
     if max_edges < EDGE_PIPELINE_MIN_LIMIT {
         // Small limits keep the exact read bound: decode inline and stop the
         // stream at the first row past the limit.
-        let mut decoder = EdgeDecoder::new(max_edges);
+        let mut decoder = EdgeDecoder::new(max_edges, now);
         while let Some(row) = rows
             .try_next()
             .await
@@ -346,7 +352,7 @@ pub async fn load_edges_from_postgres_counted(
     let (sender, mut receiver) =
         tokio::sync::mpsc::channel::<Vec<EdgeRow>>(EDGE_DECODE_QUEUE_BATCHES);
     let decoder = tokio::task::spawn_blocking(move || {
-        let mut decoder = EdgeDecoder::new(max_edges);
+        let mut decoder = EdgeDecoder::new(max_edges, now);
         'batches: while let Some(batch) = receiver.blocking_recv() {
             for row in batch {
                 if decoder.push(row).is_break() {
@@ -646,6 +652,7 @@ const EDGE_PIPELINE_MIN_LIMIT: usize = 64 * 1024;
 /// are unchanged from the former single-loop loader.
 struct EdgeDecoder {
     max_edges: usize,
+    now: DateTime<Utc>,
     cache: OrderedCache<Edge>,
     seen: usize,
     skipped: usize,
@@ -653,9 +660,10 @@ struct EdgeDecoder {
 }
 
 impl EdgeDecoder {
-    fn new(max_edges: usize) -> Self {
+    fn new(max_edges: usize, now: DateTime<Utc>) -> Self {
         Self {
             max_edges,
+            now,
             cache: OrderedCache::new(),
             seen: 0,
             skipped: 0,
@@ -705,6 +713,10 @@ impl EdgeDecoder {
             return ControlFlow::Continue(());
         }
 
+        if !edge_cache_admissible_at(&edge, self.now) {
+            self.skipped += 1;
+            return ControlFlow::Continue(());
+        }
         if self.seen >= self.max_edges {
             self.truncated = true;
             return ControlFlow::Break(());
@@ -3005,6 +3017,77 @@ pub enum EdgeWriteError {
     Database(#[source] sqlx::Error),
 }
 
+/// Capacity belongs to the active/future projection, not durable history.
+/// Callers hold the same table lock before counting and writing. A replacement
+/// excludes its own row from the count so a live Faden can renew at the cap.
+async fn ensure_domain_edge_capacity(
+    tx: &mut Transaction<'_, Postgres>,
+    replacing_id: Option<&str>,
+) -> Result<(), EdgeWriteError> {
+    let max_edges = crate::routes::edges::max_edges_cache_limit();
+    let max_edges_i64 = i64::try_from(max_edges).unwrap_or(i64::MAX);
+    // Mirrors `edge_is_permanently_unreachable` for every case that is safe
+    // to check without parsing the payload's `expires_at` string as a
+    // timestamp (which `jsonb_typeof` never needs to do, so this can never
+    // throw regardless of what a corrupted row contains):
+    //   - a present `expires_at` that is neither `null` nor a string is
+    //     malformed and never becomes a valid `Edge` at all;
+    //   - a dated `created_at` paired with an explicit `expires_at: null`;
+    //   - an absent `created_at` paired with a concrete `expires_at` string.
+    // `payload ? 'expires_at'` is a definite boolean (never SQL NULL), so a
+    // missing key short-circuits every branch to a definite `false` instead
+    // of the `->` operator's SQL NULL silently propagating through equality
+    // checks (as an earlier version of this condition did).
+    //
+    // The whole exclusion is additionally guarded on the payload actually
+    // being a JSON object. `?` matches array *elements*, not just object
+    // keys, so a non-object payload such as `["expires_at"]` would otherwise
+    // make `payload ? 'expires_at'` true while `payload -> 'expires_at'`
+    // returns SQL NULL — `jsonb_typeof(NULL)` is itself NULL, propagating
+    // through the same three-valued-logic trap the `?` operator was meant to
+    // avoid. `payload_string`/`payload_lifecycle_field` only ever look up
+    // keys via `Value::get`, which returns `None` for any non-object value
+    // regardless of its contents, so the loader treats a non-object payload
+    // exactly like `{}` (a reachable, omitted-expiry edge) — the capacity
+    // count must agree instead of quietly excluding it.
+    //
+    // Deliberately not covered: a dated `created_at` with a present string
+    // `expires_at` that is unparseable or not exactly the canonical 168-hour
+    // duration. Validating that would require casting the payload string to
+    // a timestamp, which raises a hard error for any non-timestamp string
+    // anywhere in the table instead of evaluating to a boolean — turning a
+    // conservative over-count into a query failure that blocks every create.
+    // Closing that gap needs a safe-cast SQL helper (a schema migration),
+    // not a WHERE clause; the loader already fails such rows closed at read
+    // time, so at worst a persisted row that could never occur through this
+    // API's own write path (which always emits a canonical duration) counts
+    // toward capacity a little too eagerly.
+    let (limit_reached,): (bool,) = sqlx::query_as(
+        "SELECT COUNT(*) >= $1 FROM domain_edges \
+         WHERE ($2::text IS NULL OR id <> $2) \
+         AND (created_at IS NULL OR created_at > $3) \
+         AND NOT (\
+             jsonb_typeof(payload) = 'object' \
+             AND payload ? 'expires_at' \
+             AND (\
+                 jsonb_typeof(payload -> 'expires_at') NOT IN ('null', 'string') \
+                 OR (created_at IS NOT NULL AND jsonb_typeof(payload -> 'expires_at') = 'null') \
+                 OR (created_at IS NULL AND jsonb_typeof(payload -> 'expires_at') = 'string')\
+             )\
+         )",
+    )
+    .bind(max_edges_i64)
+    .bind(replacing_id)
+    .bind(edge_cache_cutoff(Utc::now()))
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(EdgeWriteError::Database)?;
+    if limit_reached {
+        return Err(EdgeWriteError::CacheLimitReached);
+    }
+    Ok(())
+}
+
 /// Insert exactly one edge row into `domain_edges` (Phase E-C).
 ///
 /// The PostgreSQL create path is serialized in a transaction:
@@ -3056,63 +3139,7 @@ async fn insert_domain_edge_in_transaction(
         return Err(EdgeWriteError::DuplicateId);
     }
 
-    let max_edges = crate::routes::edges::max_edges_cache_limit();
-    let max_edges_i64 = i64::try_from(max_edges).unwrap_or(i64::MAX);
-    // Mirrors `edge_is_permanently_unreachable` for every case that is safe
-    // to check without parsing the payload's `expires_at` string as a
-    // timestamp (which `jsonb_typeof` never needs to do, so this can never
-    // throw regardless of what a corrupted row contains):
-    //   - a present `expires_at` that is neither `null` nor a string is
-    //     malformed and never becomes a valid `Edge` at all;
-    //   - a dated `created_at` paired with an explicit `expires_at: null`;
-    //   - an absent `created_at` paired with a concrete `expires_at` string.
-    // `payload ? 'expires_at'` is a definite boolean (never SQL NULL), so a
-    // missing key short-circuits every branch to a definite `false` instead
-    // of the `->` operator's SQL NULL silently propagating through equality
-    // checks (as an earlier version of this condition did).
-    //
-    // The whole exclusion is additionally guarded on the payload actually
-    // being a JSON object. `?` matches array *elements*, not just object
-    // keys, so a non-object payload such as `["expires_at"]` would otherwise
-    // make `payload ? 'expires_at'` true while `payload -> 'expires_at'`
-    // returns SQL NULL — `jsonb_typeof(NULL)` is itself NULL, propagating
-    // through the same three-valued-logic trap the `?` operator was meant to
-    // avoid. `payload_string`/`payload_lifecycle_field` only ever look up
-    // keys via `Value::get`, which returns `None` for any non-object value
-    // regardless of its contents, so the loader treats a non-object payload
-    // exactly like `{}` (a reachable, omitted-expiry edge) — the capacity
-    // count must agree instead of quietly excluding it.
-    //
-    // Deliberately not covered: a dated `created_at` with a present string
-    // `expires_at` that is unparseable or not exactly the canonical 168-hour
-    // duration. Validating that would require casting the payload string to
-    // a timestamp, which raises a hard error for any non-timestamp string
-    // anywhere in the table instead of evaluating to a boolean — turning a
-    // conservative over-count into a query failure that blocks every create.
-    // Closing that gap needs a safe-cast SQL helper (a schema migration),
-    // not a WHERE clause; the loader already fails such rows closed at read
-    // time, so at worst a persisted row that could never occur through this
-    // API's own write path (which always emits a canonical duration) counts
-    // toward capacity a little too eagerly.
-    let (limit_reached,): (bool,) = sqlx::query_as(
-        "SELECT COUNT(*) >= $1 FROM domain_edges \
-         WHERE NOT (\
-             jsonb_typeof(payload) = 'object' \
-             AND payload ? 'expires_at' \
-             AND (\
-                 jsonb_typeof(payload -> 'expires_at') NOT IN ('null', 'string') \
-                 OR (created_at IS NOT NULL AND jsonb_typeof(payload -> 'expires_at') = 'null') \
-                 OR (created_at IS NULL AND jsonb_typeof(payload -> 'expires_at') = 'string')\
-             )\
-         )",
-    )
-    .bind(max_edges_i64)
-    .fetch_one(&mut **tx)
-    .await
-    .map_err(EdgeWriteError::Database)?;
-    if limit_reached {
-        return Err(EdgeWriteError::CacheLimitReached);
-    }
+    ensure_domain_edge_capacity(tx, None).await?;
 
     let result = sqlx::query(
         "INSERT INTO domain_edges \
@@ -3162,8 +3189,8 @@ pub async fn insert_domain_edge(
 
 /// Refresh one existing operation-bound Faden without changing its identity.
 ///
-/// A row lock makes lookup, semantic validation and lifecycle replacement one
-/// atomic database action without blocking unrelated Fäden. The durable domain
+/// The same table lock as create serializes capacity admission before the row
+/// lock, semantic validation and lifecycle replacement. The durable domain
 /// action remains the historical source of truth; this row is only its current
 /// map projection.
 pub async fn reactivate_domain_edge(
@@ -3173,6 +3200,10 @@ pub async fn reactivate_domain_edge(
 ) -> Result<Edge, EdgeWriteError> {
     let row = NewDomainEdgeRow::from_edge(expected).map_err(EdgeWriteError::Mapping)?;
     let mut tx = pool.begin().await.map_err(EdgeWriteError::Database)?;
+    sqlx::query("LOCK TABLE domain_edges IN EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await
+        .map_err(EdgeWriteError::Database)?;
 
     let existing: Option<EdgeRow> = sqlx::query_as(
         "SELECT id, source_id, target_id, edge_kind, created_at, payload::text \
@@ -3190,6 +3221,8 @@ pub async fn reactivate_domain_edge(
     if existing.id != expected.id || !edge_matches_projection(&existing, expected) {
         return Err(EdgeWriteError::OperationConflict);
     }
+
+    ensure_domain_edge_capacity(&mut tx, Some(&existing.id)).await?;
 
     let update = sqlx::query(
         "UPDATE domain_edges SET created_at = $1, payload = $2::jsonb \
