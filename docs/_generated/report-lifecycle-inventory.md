@@ -124,7 +124,7 @@ This section is a readable projection of `.wgx/generated-artifacts.yml`; the reg
 | docs/reports/domain-backfill-proof.md | report | deprecated | archived | proof | OPT-ARC-001 |  |  | deprecated | 2 | 5 | 4 | review_after |  |
 | docs/reports/domain-edge-cache-limit-design.md | report | active | active | decision-prep | DOMAIN-PG-003 | 2026-09-29 |  | not_decision_relevant | 0 | 4 | 5 |  |  |
 | docs/reports/domain-edge-create-semantics-preflight.md | report | deprecated | superseded | decision-prep | OPT-ARC-001 |  | docs/reports/domain-edge-write-path-proof.md | deprecated | 1 | 6 | 7 | review_after |  |
-| docs/reports/domain-edge-faden-lifecycle-proof.md | report | active | active | proof | OPT-ARC-001 | 2026-10-17 |  | not_decision_relevant | 1 | 5 | 3 |  |  |
+| docs/reports/domain-edge-faden-lifecycle-proof.md | report | active | active | proof | OPT-ARC-001 | 2026-10-17 |  | not_decision_relevant | 2 | 5 | 3 |  |  |
 | docs/reports/domain-edge-reference-audit.md | report | deprecated | archived | audit | OPT-ARC-001 |  |  | deprecated | 3 | 5 | 6 | review_after |  |
 | docs/reports/domain-edge-write-path-proof.md | report | deprecated | superseded | proof | OPT-ARC-001 | 2026-07-16 | docs/reports/domain-edge-faden-lifecycle-proof.md | deprecated | 3 | 7 | 8 |  |  |
 | docs/reports/domain-node-write-path-proof.md | report | deprecated | archived | proof | OPT-ARC-001 |  |  | deprecated | 4 | 5 | 6 | review_after |  |
@@ -141,7 +141,7 @@ This section is a readable projection of `.wgx/generated-artifacts.yml`; the reg
 | docs/reports/map-basemap-proof-gap-reconciliation.md | report | deprecated | archived | audit | DOCMETA-REPORT-LIFECYCLE-001 | 2026-09-29 |  | deprecated | 2 | 6 | 6 |  |  |
 | docs/reports/map-status-matrix.md | status-matrix | deprecated | archived |  |  |  |  | deprecated | 8 | 6 | 3 | lifecycle, owner_task, review_after |  |
 | docs/reports/map-status.md | report | active | active | audit | DOCMETA-REPORT-LIFECYCLE-001 | 2026-08-12 |  | not_decision_relevant | 4 | 6 | 2 |  |  |
-| docs/reports/optimierungsbericht.md | report | active | active | audit | DOCMETA-REPORT-LIFECYCLE-001 | 2026-09-29 |  | not_decision_relevant | 3 | 4 | 4 |  |  |
+| docs/reports/optimierungsbericht.md | report | active | active | audit | DOCMETA-REPORT-LIFECYCLE-001 | 2026-09-29 |  | not_decision_relevant | 4 | 4 | 4 |  |  |
 | docs/reports/optimierungsstatus.md | status-matrix | active |  |  |  |  |  | not_decision_relevant | 25 | 5 | 4 | lifecycle, owner_task, review_after, lifecycle_state |  |
 | docs/reports/passkey-register-verify-prep.md | report | deprecated | archived | decision-prep | AUTH-PG-002 |  |  | deprecated | 1 | 5 | 4 | review_after |  |
 | docs/reports/planning-registration-findings.md | report | deprecated | archived | audit | TASK-CTL-005 |  |  | deprecated | 1 | 5 | 2 | review_after |  |
@@ -363,6 +363,7 @@ This section is a readable projection of `.wgx/generated-artifacts.yml`; the reg
   - `docs/reports/domain-edge-write-path-proof.md`
 
 - `docs/reports/domain-edge-faden-lifecycle-proof.md`
+  - `docs/proofs/commonthing-codepruefung-20261125.md`
   - `docs/reports/domain-edge-write-path-proof.md`
 
 - `docs/reports/domain-edge-reference-audit.md`
@@ -448,6 +449,7 @@ This section is a readable projection of `.wgx/generated-artifacts.yml`; the reg
 
 - `docs/reports/optimierungsbericht.md`
   - `docs/blueprints/domain-data-postgres-cutover.md`
+  - `docs/proofs/commonthing-codepruefung-20261125.md`
   - `docs/proofs/weltgewebe-os-v1-t036-documentation-drift-reconciliation.md`
   - `docs/reports/optimierungsstatus.md`
 

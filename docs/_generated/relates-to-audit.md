@@ -14,13 +14,13 @@ Generated automatically. Do not edit.
 
 | Metrik | Wert |
 | --- | --- |
-| Relationen gesamt | 759 |
+| Relationen gesamt | 761 |
 | — depends_on | 34 |
 | — implements | 1 |
-| — relates_to | 702 |
+| — relates_to | 704 |
 | — supersedes | 13 |
 | — verifies | 9 |
-| relates_to Anteil | 92% |
+| relates_to Anteil | 93% |
 
 ### Mögliche supersedes-Lücken
 
@@ -32,7 +32,7 @@ _Keine Lücken erkannt._
 
 > Zusammenhängende Gruppen im relates_to-Graphen.
 
-**Cluster 1** (300 Dokumente):
+**Cluster 1** (301 Dokumente):
 
 - `.github/workflows/api.yml`
 - `.github/workflows/basemap-runtime-proof.yml`
@@ -169,6 +169,7 @@ _Keine Lücken erkannt._
 - `docs/process/report-lifecycle.md`
 - `docs/process/sprache.md`
 - `docs/proofs/basemap-hamburg-artifact-proof.md`
+- `docs/proofs/commonthing-codepruefung-20261125.md`
 - `docs/proofs/gewebezelle-two-operator-pilot-contract-v1.md`
 - `docs/proofs/repoground-agent-utility-v1-t003-vertical-pilot.md`
 - `docs/proofs/sqlx-pgbouncer-session-crud-proof.md`

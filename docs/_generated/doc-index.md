@@ -127,6 +127,7 @@ Generated automatically. Do not edit.
 | process.report-lifecycle-contract-alignment | Report Lifecycle Contract Alignment | decision | active | docs/process/report-lifecycle-contract-alignment.md |
 | process.sprache | Sprache | reference | active | docs/process/sprache.md |
 | proof.gewebezelle-two-operator-pilot-contract-v1 | Beweisgrenze Zwei-Betreiber-GewebeZelle-Pilotvertrag v1 | proof | active | docs/proofs/gewebezelle-two-operator-pilot-contract-v1.md |
+| proofs.commonthing-codepruefung-20261125 | Codeprüfung vom 25. November 2026 | proof | active | docs/proofs/commonthing-codepruefung-20261125.md |
 | proofs.sqlx-pgbouncer-session-crud-proof | SQLx → PgBouncer → Postgres — Session-CRUD-Proof | report | active | docs/proofs/sqlx-pgbouncer-session-crud-proof.md |
 | proofs.sqlx-postgres-direct-session-crud-proof | SQLx \u2192 direkter PostgreSQL \u2014 Session-CRUD-Proof | report | active | docs/proofs/sqlx-postgres-direct-session-crud-proof.md |
 | proofs.weltgewebe-os-v1-t005-two-cell-proof | WELTGEWEBE-OS-V1-T005 — Zwei-Zellen-Beweis | report | active | docs/proofs/weltgewebe-os-v1-t005-two-cell-proof.md |
