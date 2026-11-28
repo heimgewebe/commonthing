@@ -3629,5 +3629,280 @@ class WatchTests(unittest.TestCase):
             )
             self.assertFalse((directory / "events.jsonl").exists())
 
+
+class BackupObservationTests(unittest.TestCase):
+
+    def sources(self, *, now=NOW, daily_age=2, restore_age=48,
+                offhost_age=3, pulled_age=1, daily_result="success",
+                restore_result="success", offhost_result="success",
+                missing=(), daily_stamp=True):
+        def unit(name, age, result, stamp=True):
+            completed = "@" + str(int((now - timedelta(hours=age)).timestamp())) if stamp else ""
+            return "\n".join((
+                f"Id={watch.BACKUP_UNITS[name]}", "LoadState=loaded",
+                f"Result={result}", f"ExecMainStatus={0 if result == 'success' else 1}",
+                f"ExecMainExitTimestamp={completed}",
+            ))
+        backup_name = (now - timedelta(hours=offhost_age)).strftime("%Y%m%dT%H%M%SZ")
+        pulled_at = (now - timedelta(hours=pulled_age)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        rows = {
+            "server": unit("backup_daily", daily_age, daily_result, daily_stamp)
+                      + "\n\n" + unit("backup_restore", restore_age, restore_result),
+            "offhost_unit": unit("backup_offhost", pulled_age, offhost_result, False),
+            "offhost_receipt": (
+                "contract=weltgewebe-offhost-backup-pull-v2\n"
+                f"file=weltgewebe-postgres-{backup_name}.sql.gz.age\n"
+                f"pulled_at={pulled_at}\nresult=ok\n"
+            ),
+        }
+        def read(name):
+            if name in missing:
+                raise OSError("private reader unavailable")
+            return rows[name]
+        return read
+
+    def observe(self, reader, *, now=NOW, previous=None, product=None):
+        return watch.evaluate(
+            now, product or WatchTests().fixtures(), backup_reader=reader,
+            previous_backup_success=previous,
+        )
+
+    def codes(self, result, severity="P1"):
+        return {issue["code"] for issue in result["issues"]
+                if issue["severity"] == severity}
+
+    def test_healthy_fresh_proofs_even_after_user_manager_restart(self):
+        result = self.observe(self.sources())
+        self.assertEqual(result["status"], "HEALTHY")
+        self.assertEqual(set(result["backup_success"]),
+                         set(watch.BACKUP_UNITS) | {watch.BACKUP_OFFHOST_PULLED_AT})
+
+    def test_all_three_failed_runs_are_actionable_even_with_recent_receipt(self):
+        result = self.observe(self.sources(
+            daily_result="exit-code", restore_result="timeout", offhost_result="exit-code",
+        ))
+        self.assertEqual(self.codes(result), {
+            "backup_daily_failed", "backup_restore_failed", "backup_offhost_failed",
+        })
+        self.assertEqual(result["status"], "ALARM")
+
+    def test_overdue_runs_and_old_dump_are_not_refreshed_by_new_receipt(self):
+        result = self.observe(self.sources(
+            daily_age=31, restore_age=193, offhost_age=31, pulled_age=1,
+        ))
+        self.assertEqual(self.codes(result), {
+            "backup_daily_stale", "backup_restore_stale", "backup_offhost_stale",
+        })
+
+    def test_empty_exit_timestamp_is_not_a_success_proof(self):
+        result = self.observe(self.sources(daily_stamp=False))
+        self.assertIn("backup_daily_unverified", self.codes(result))
+        self.assertNotIn("backup_daily", result["backup_success"])
+
+    def test_temporary_reader_loss_has_grace_but_stale_evidence_alerts(self):
+        baseline = self.observe(self.sources())
+        absent = self.sources(missing=("server", "offhost_unit", "offhost_receipt"))
+        temporary = self.observe(absent, previous=baseline["backup_success"])
+        self.assertEqual(self.codes(temporary), set())
+        self.assertEqual(self.codes(temporary, "P2"), {
+            "backup_daily_unverified", "backup_restore_unverified", "backup_offhost_unverified",
+        })
+        overdue = self.observe(absent, now=NOW + timedelta(hours=31),
+                               previous=baseline["backup_success"])
+        self.assertEqual(self.codes(overdue), {
+            "backup_daily_unverified", "backup_offhost_unverified",
+        })
+        self.assertIn("backup_restore_unverified", self.codes(overdue, "P2"))
+        self.assertEqual(overdue["backup_success"], {
+            name: baseline["backup_success"][name] for name in watch.BACKUP_UNITS
+        })
+
+    def test_new_failure_journal_deduplicates_and_no_false_recovery_on_timeout(self):
+        import json
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            healthy = self.observe(self.sources())
+            self.assertIsNone(watch.record(healthy, directory))
+            prior = json.loads((directory / "state.json").read_text())["backup_success"]
+            failed = self.observe(self.sources(daily_result="exit-code"), previous=prior)
+            self.assertEqual(watch.record(failed, directory), "ALARM")
+            repeated = self.observe(self.sources(daily_result="exit-code"), previous=prior)
+            self.assertIsNone(watch.record(repeated, directory))
+            uncertain = self.observe(self.sources(missing=("server",)), previous=prior)
+            watch.record(uncertain, directory)
+            self.assertEqual(uncertain["status"], "ALARM")
+            self.assertIn("backup_daily_failed",
+                          {row[0] for row in uncertain["retained_prior_p1"]})
+            journal = directory / "events.jsonl"
+            def transitions():
+                return [json.loads(row)["event"] for row in journal.read_text().splitlines()
+                        if json.loads(row)["event"] in {"ALARM", "RECOVERY"}]
+            self.assertEqual(transitions(), ["ALARM"])
+            recovered = self.observe(self.sources(), previous=prior)
+            self.assertEqual(watch.record(recovered, directory), "RECOVERY")
+            self.assertEqual(transitions(), ["ALARM", "RECOVERY"])
+
+    def test_manager_restart_cannot_clear_failure_with_same_old_receipt(self):
+        import json
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            baseline = self.observe(self.sources())
+            watch.record(baseline, directory)
+            def prior():
+                return json.loads((directory / "state.json").read_text())["backup_success"]
+            failed = self.observe(self.sources(offhost_result="exit-code"), previous=prior())
+            self.assertEqual(watch.record(failed, directory), "ALARM")
+            original = prior()["backup_offhost"]
+            failure_at = prior()[watch.BACKUP_OFFHOST_FAILURE_AT]
+            self.assertEqual(failure_at, int(NOW.timestamp()))
+
+            later = NOW + timedelta(hours=1)
+            # Empty user-manager exit timestamp and same receipt as before failure.
+            restarted = self.observe(self.sources(), now=later, previous=prior())
+            self.assertIn("backup_offhost_failed", self.codes(restarted))
+            self.assertIsNone(watch.record(restarted, directory))
+            self.assertEqual(prior()[watch.BACKUP_OFFHOST_FAILURE_AT], failure_at)
+            self.assertEqual(prior()["backup_offhost"], original)
+
+            # A successful new transfer of the SAME still fresh dump is sufficient.
+            fresh = self.observe(self.sources(now=later, offhost_age=4, pulled_age=0.5),
+                                 now=later, previous=prior())
+            self.assertEqual(fresh["status"], "HEALTHY")
+            self.assertEqual(watch.record(fresh, directory), "RECOVERY")
+            self.assertNotIn(watch.BACKUP_OFFHOST_FAILURE_AT, prior())
+            self.assertEqual(prior()["backup_offhost"], original)
+            self.assertGreater(prior()[watch.BACKUP_OFFHOST_PULLED_AT], failure_at)
+            events = [json.loads(line)["event"] for line in
+                      (directory / "events.jsonl").read_text().splitlines()]
+            self.assertEqual(events, ["ALARM", "RECOVERY"])
+
+    def test_failure_watermark_survives_lost_evaluation_and_old_state(self):
+        import json
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            baseline = self.observe(self.sources())
+            watch.record(baseline, directory)
+            failed = self.observe(self.sources(offhost_result="exit-code"),
+                                  previous=baseline["backup_success"])
+            # Model the global deadline or persistence fallback after observing failure.
+            del failed["backup_success"]
+            self.assertEqual(watch.record(failed, directory), "ALARM")
+            path = directory / "state.json"
+            state = json.loads(path.read_text())
+            self.assertEqual(state["backup_success"][watch.BACKUP_OFFHOST_FAILURE_AT],
+                             int(NOW.timestamp()))
+
+            # Older/fallback snapshot omitted the marker but retained the incident.
+            del state["backup_success"][watch.BACKUP_OFFHOST_FAILURE_AT]
+            watch.write_json(path, state)
+            later = NOW + timedelta(minutes=10)
+            observed = self.observe(self.sources(), now=later, previous=state["backup_success"])
+            self.assertEqual(observed["status"], "HEALTHY")  # pure observation alone
+            watch.record(observed, directory)
+            self.assertEqual(observed["status"], "ALARM")
+            persisted = json.loads(path.read_text())
+            self.assertIn("backup_offhost_failed", {x[0] for x in persisted["severe"]})
+            self.assertIn(watch.BACKUP_OFFHOST_FAILURE_AT, persisted["backup_success"])
+            events = [json.loads(line)["event"] for line in
+                      (directory / "events.jsonl").read_text().splitlines()]
+            self.assertNotIn("RECOVERY", events)
+
+    def test_backward_clock_step_cannot_lower_transfer_failure_watermark(self):
+        import json
+        for legacy_snapshot in (False, True):
+            with self.subTest(legacy_snapshot=legacy_snapshot), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+
+                def state():
+                    return json.loads((directory / "state.json").read_text())
+
+                watch.record(self.observe(self.sources()), directory, serialized_poll=True)
+                old_pull = state()["backup_success"][watch.BACKUP_OFFHOST_PULLED_AT]
+                failed = self.observe(
+                    self.sources(offhost_result="exit-code"),
+                    previous=state()["backup_success"],
+                )
+                self.assertEqual(watch.record(failed, directory, serialized_poll=True), "ALARM")
+                failure_at = state()["backup_success"][watch.BACKUP_OFFHOST_FAILURE_AT]
+
+                if legacy_snapshot:
+                    # Exercise the fallback with neither persisted typed anchor.
+                    for name in ("state.json", "heartbeat.json"):
+                        path = directory / name
+                        snapshot = json.loads(path.read_text())
+                        snapshot["backup_success"].pop(watch.BACKUP_OFFHOST_FAILURE_AT, None)
+                        watch.write_json(path, snapshot)
+
+                # Same old receipt, now 120s in the future after an NTP step,
+                # within the tolerated skew for observed success timestamps.
+                earlier = NOW - timedelta(hours=1, minutes=2)
+                self.assertEqual(old_pull - int(earlier.timestamp()), 120)
+                observed = self.observe(
+                    self.sources(), now=earlier, previous=state()["backup_success"],
+                )
+                watch.record(observed, directory, serialized_poll=True)
+                self.assertEqual(observed["status"], "ALARM")
+                self.assertEqual(
+                    state()["backup_success"][watch.BACKUP_OFFHOST_FAILURE_AT],
+                    failure_at,
+                )
+                self.assertIn("backup_offhost_failed", {x[0] for x in state()["severe"]})
+
+                # A genuinely later pull of the still fresh dump can recover.
+                later = NOW + timedelta(hours=1)
+                fresh = self.observe(
+                    self.sources(now=later, offhost_age=4, pulled_age=0.5),
+                    now=later, previous=state()["backup_success"],
+                )
+                self.assertEqual(watch.record(fresh, directory, serialized_poll=True), "RECOVERY")
+                self.assertNotIn(watch.BACKUP_OFFHOST_FAILURE_AT, state()["backup_success"])
+                transitions = [
+                    json.loads(line)["event"]
+                    for line in (directory / "events.jsonl").read_text().splitlines()
+                    if json.loads(line)["event"] in {"ALARM", "RECOVERY"}
+                ]
+                self.assertEqual(transitions, ["ALARM", "RECOVERY"])
+
+    def test_new_transfer_of_overdue_dump_does_not_clear_freshness_alarm(self):
+        baseline = self.observe(self.sources(offhost_age=31))
+        failed = self.observe(self.sources(offhost_result="exit-code"),
+                              previous=baseline["backup_success"])
+        later = NOW + timedelta(hours=1)
+        fresh_pull_old_dump = self.observe(
+            self.sources(now=later, offhost_age=32, pulled_age=0.5),
+            now=later, previous=failed["backup_success"],
+        )
+        self.assertIn("backup_offhost_stale", self.codes(fresh_pull_old_dump))
+        self.assertNotIn("backup_offhost_failed", self.codes(fresh_pull_old_dump))
+        self.assertEqual(fresh_pull_old_dump["status"], "ALARM")
+
+    def test_backup_observation_never_suppresses_product_alarm(self):
+        result = self.observe(self.sources(), product=WatchTests().fixtures(
+            frontend=OLD, api=MAIN,
+        ))
+        self.assertIn("frontend_api_diverge", self.codes(result))
+        self.assertEqual(result["status"], "ALARM")
+
+    def test_future_or_inconsistent_receipt_is_unverified(self):
+        result = self.observe(self.sources(offhost_age=1, pulled_age=3))
+        self.assertIn("backup_offhost_unverified", self.codes(result))
+        self.assertNotIn("backup_offhost", result["backup_success"])
+
+    def test_ssh_command_is_fixed_and_strict_and_reader_is_opt_in(self):
+        from unittest.mock import patch
+        with patch.object(watch.subprocess, "run") as run:
+            with self.assertRaises(ValueError):
+                watch._fetch_backup("server", "-oProxyCommand=bad")
+            run.assert_not_called()
+            run.return_value.returncode = 0
+            run.return_value.stdout = "fixture"
+            self.assertEqual(watch._fetch_backup("server", "alex@reader.example"), "fixture")
+            argv = run.call_args.args[0]
+            self.assertIn("StrictHostKeyChecking=yes", argv)
+            self.assertIn("alex@reader.example", argv)
+            self.assertIn("systemctl show --timestamp=unix", argv[-1])
+            self.assertIn(watch.BACKUP_UNITS["backup_restore"], argv[-1])
+            self.assertEqual(run.call_args.kwargs["timeout"], 18)
+
 if __name__ == "__main__":
     unittest.main()
