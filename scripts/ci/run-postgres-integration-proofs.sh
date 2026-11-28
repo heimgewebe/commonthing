@@ -361,6 +361,7 @@ targets=(
   db_domain_backfill
   db_domain_edge_write_path
   db_domain_node_write_path
+  db_audience_circles
   db_node_circle_grants
   db_personal_events
   db_profile_tag_resource
@@ -381,6 +382,22 @@ targets=(
   db_semantic_search_owner_lifecycle
   sqlx_postgres_direct_session_crud
 )
+
+# Fail when a new ignored db_* PostgreSQL test is missing from the default suite.
+# db_node_conversations runs below; db_governance_conversation_target runs in api.yml.
+for source in "${SCRIPT_DIR}/../../apps/api/tests"/db_*.rs; do
+  if grep -Eq '^[[:space:]]*#\[ignore' "$source"; then
+    target="${source##*/}"
+    target="${target%.rs}"
+    case " ${targets[*]} " in
+      *" ${target} "*) ;;
+      *) if [[ "$target" != db_node_conversations && "$target" != db_governance_conversation_target ]]; then
+        echo "Ignored PostgreSQL test missing from CI: ${target}" >&2
+        exit 1
+      fi ;;
+    esac
+  fi
+done
 
 if [[ -n "${POSTGRES_PROOF_TARGETS:-}" ]]; then
   read -r -a targets <<< "$POSTGRES_PROOF_TARGETS"
