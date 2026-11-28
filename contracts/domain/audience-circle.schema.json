@@ -1,0 +1,102 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://weltgewebe.org/schemas/domain/audience-circle.schema.json",
+  "title": "AudienceCircle",
+  "description": "A consent-based, location-independent audience circle (household or community). It is an access-control scope for explicitly granted private nodes, not a map object. The top level describes the canonical PostgreSQL record (domain_audience_circles). A circle never becomes public: the only HTTP projection is own_circle, returned to an account that is itself invited to or an active member of the circle. No member of a forming circle gains content rights.",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "kind": {
+      "type": "string",
+      "enum": ["household", "community"]
+    },
+    "name": {
+      "description": "1 to 80 Unicode code points, trimmed with Rust Unicode White_Space semantics, without control characters (U+FEFF is not whitespace for Rust). The API defaults to 'Hausgemeinschaft' or 'Gemeinschaft'. The database CHECK enforces only the length bound; trimming and the control-character rule are enforced by the HTTP handler, the only writer.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80,
+      "pattern": "^[^\\u0020\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\u0000-\\u001f\\u007f-\\u009f](?:[^\\u0000-\\u001f\\u007f-\\u009f]*[^\\u0020\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\u0000-\\u001f\\u007f-\\u009f])?$"
+    },
+    "state": {
+      "description": "forming: founder active, founding invitation pending, nobody has content rights. active: became active when a second non-disabled member confirmed, and stays active while at least one active member remains (a circle can therefore be active with a single member). inactive: terminal; the founding proposal had no pending invitation left, or the last active member left. The API never moves a circle out of inactive.",
+      "type": "string",
+      "enum": ["forming", "active", "inactive"]
+    },
+    "created_by_account_id": {
+      "description": "Founder account. NULL after that account is deleted. Never part of an HTTP response.",
+      "type": ["string", "null"],
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "required": [
+    "id",
+    "kind",
+    "name",
+    "state",
+    "created_by_account_id",
+    "created_at"
+  ],
+  "additionalProperties": false,
+  "definitions": {
+    "own_circle": {
+      "description": "Response item of GET /api/circles/me and the body of POST /api/circles (201) and POST /api/circles/{id}/accept (200). Visible only to the account named by the membership row. It carries no member list, founder, inviter or creation time.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "format": "uuid" },
+        "kind": { "type": "string", "enum": ["household", "community"] },
+        "name": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "state": {
+          "type": "string",
+          "enum": ["forming", "active", "inactive"]
+        },
+        "membership_status": {
+          "description": "The reader's own membership. An invitation never grants content rights.",
+          "type": "string",
+          "enum": ["invited", "active"]
+        },
+        "invitation_created_at": {
+          "description": "Creation instant of the reader's pending membership row. Clients echo it as expected_invitation_created_at so a stale accept or decline cannot act on a later re-invitation. NULL unless membership_status is invited.",
+          "type": ["string", "null"],
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "name",
+        "state",
+        "membership_status",
+        "invitation_created_at"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": { "membership_status": { "const": "invited" } },
+            "required": ["membership_status"]
+          },
+          "then": {
+            "properties": { "invitation_created_at": { "type": "string" } }
+          },
+          "else": {
+            "properties": { "invitation_created_at": { "type": "null" } }
+          }
+        }
+      ]
+    },
+    "own_circle_page": {
+      "description": "GET /api/circles/me: newest first by (created_at, id), at most 100 items. The next page is requested with after=<id of the last item>. A shorter page is the last page.",
+      "type": "array",
+      "maxItems": 100,
+      "items": { "$ref": "#/definitions/own_circle" }
+    }
+  }
+}

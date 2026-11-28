@@ -724,8 +724,145 @@ pub async fn leave_circle(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{CreateCircleInput, ListCirclesQuery};
+pub(crate) mod tests {
+    use super::{CircleMemberView, CircleView, CreateCircleInput, ListCirclesQuery};
+    use serde_json::Value;
+    use std::collections::BTreeSet;
+
+    fn contract(name: &str) -> Value {
+        let path = format!(
+            "{}/../../contracts/domain/{name}.schema.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    fn keys(value: &Value) -> BTreeSet<String> {
+        value.as_object().unwrap().keys().cloned().collect()
+    }
+
+    fn strings(value: &Value) -> BTreeSet<String> {
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item.as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// Values of `CHECK (<column> IN ('a', 'b'))` in a migration.
+    pub(crate) fn sql_check_values(sql: &str, column: &str) -> BTreeSet<String> {
+        let marker = format!("CHECK ({column} IN (");
+        let start = sql.find(&marker).unwrap_or_else(|| panic!("{marker}")) + marker.len();
+        let end = start + sql[start..].find(')').unwrap();
+        sql[start..end]
+            .split(',')
+            .map(|value| value.trim().trim_matches('\'').to_owned())
+            .collect()
+    }
+
+    const CIRCLE_MIGRATION: &str =
+        include_str!("../../migrations/20261106000001_audience_circles.up.sql");
+
+    /// Every serialised field must be declared and required in the closed
+    /// contract, and the contract may not promise fields the API never sends.
+    #[test]
+    fn circle_views_match_the_domain_contract() {
+        let circle = contract("audience-circle");
+        let own = &circle["definitions"]["own_circle"];
+        let wire = serde_json::to_value(CircleView {
+            id: uuid::Uuid::nil(),
+            kind: "household".into(),
+            name: "Hausgemeinschaft".into(),
+            state: "forming".into(),
+            membership_status: "invited".into(),
+            invitation_created_at: Some(chrono::Utc::now()),
+        })
+        .unwrap();
+        assert_eq!(own["additionalProperties"], false);
+        assert_eq!(keys(&wire), keys(&own["properties"]));
+        assert_eq!(keys(&wire), strings(&own["required"]));
+
+        let membership = contract("audience-circle-membership");
+        let member = &membership["definitions"]["member"];
+        let wire = serde_json::to_value(CircleMemberView {
+            account_id: "account-a".into(),
+            title: "A".into(),
+        })
+        .unwrap();
+        assert_eq!(member["additionalProperties"], false);
+        assert_eq!(keys(&wire), keys(&member["properties"]));
+        assert_eq!(keys(&wire), strings(&member["required"]));
+    }
+
+    #[test]
+    fn circle_enums_match_postgres_checks_and_handlers() {
+        let circle = contract("audience-circle");
+        let membership = contract("audience-circle-membership");
+        for (schema, column) in [
+            (&circle["properties"]["kind"], "kind"),
+            (&circle["properties"]["state"], "state"),
+            (&membership["properties"]["status"], "status"),
+        ] {
+            assert_eq!(
+                strings(&schema["enum"]),
+                sql_check_values(CIRCLE_MIGRATION, column),
+                "{column}"
+            );
+        }
+        for (definition, field) in [
+            ("own_circle", "kind"),
+            ("own_circle", "state"),
+            ("own_circle", "membership_status"),
+        ] {
+            let source = if field == "membership_status" {
+                &membership["properties"]["status"]
+            } else {
+                &circle["properties"][field]
+            };
+            assert_eq!(
+                circle["definitions"][definition]["properties"][field]["enum"], source["enum"],
+                "{definition}.{field}"
+            );
+        }
+        let accepted = |kind: &str| {
+            CreateCircleInput {
+                kind: kind.into(),
+                name: None,
+                invitee_account_id: "account-b".into(),
+            }
+            .validate("account-a")
+            .is_ok()
+        };
+        for kind in strings(&circle["properties"]["kind"]["enum"]) {
+            assert!(accepted(&kind), "{kind} must be creatable");
+        }
+    }
+
+    #[test]
+    fn circle_name_bound_matches_contract_and_database() {
+        let circle = contract("audience-circle");
+        assert_eq!(circle["properties"]["name"]["maxLength"], 80);
+        assert!(CIRCLE_MIGRATION.contains("char_length(name) BETWEEN 1 AND 80"));
+        let named = |name: &str| CreateCircleInput {
+            kind: "community".into(),
+            name: Some(name.into()),
+            invitee_account_id: "account-b".into(),
+        };
+        assert!(named(&"ä".repeat(80)).validate("account-a").is_ok());
+        assert!(named(&"ä".repeat(81)).validate("account-a").is_err());
+        assert!(named("a\u{85}b").validate("account-a").is_err());
+        assert_eq!(
+            named("\u{feff}Haus").validate("account-a").unwrap().1,
+            "\u{feff}Haus",
+            "Rust trim preserves U+FEFF; the domain schema must accept the stored name"
+        );
+        assert_eq!(
+            named("  Haus  ").validate("account-a").unwrap().1,
+            "Haus",
+            "the stored name is trimmed"
+        );
+    }
 
     #[test]
     fn consent_requires_distinct_accounts() {

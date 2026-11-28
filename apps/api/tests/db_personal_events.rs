@@ -1060,7 +1060,27 @@ async fn personal_events_inbox(app: &Router, cookie: &str) -> Value {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{response}");
-    serde_json::from_str(&response).expect("personal inbox JSON")
+    let page: Value = serde_json::from_str(&response).expect("personal inbox JSON");
+    support::domain_contract::assert_valid(
+        &support::domain_contract::load("personal-event"),
+        "#/definitions/event_page",
+        &page,
+        "GET /personal-events",
+    );
+    page
+}
+
+/// Validates one real HTTP response body against a definition of a domain
+/// contract, so the router output itself is checked, not a hand-built struct.
+fn assert_contract(schema: &str, pointer: &str, body: &str, context: &str) -> Value {
+    let value: Value = serde_json::from_str(body).unwrap_or_else(|e| panic!("{context}: {e}"));
+    support::domain_contract::assert_valid(
+        &support::domain_contract::load(schema),
+        pointer,
+        &value,
+        context,
+    );
+    value
 }
 
 #[tokio::test]
@@ -1154,6 +1174,12 @@ async fn independent_http_cookies_deliver_private_circle_invites_answers_and_rea
     )
     .await;
     assert_eq!(created, StatusCode::CREATED, "{response}");
+    assert_contract(
+        "audience-circle",
+        "#/definitions/own_circle",
+        &response,
+        "POST /circles",
+    );
     let circle = serde_json::from_str::<Value>(&response).unwrap()["id"]
         .as_str()
         .expect("created household id")
@@ -1212,6 +1238,15 @@ async fn independent_http_cookies_deliver_private_circle_invites_answers_and_rea
     )
     .await;
     assert_eq!(accepted, StatusCode::OK, "{reply}");
+    let accepted_view = assert_contract(
+        "audience-circle",
+        "#/definitions/own_circle",
+        &reply,
+        "POST /circles/{id}/accept",
+    );
+    assert_eq!(accepted_view["state"], "active");
+    assert_eq!(accepted_view["membership_status"], "active");
+    assert!(accepted_view["invitation_created_at"].is_null());
     let (replayed, _) = personal_events_http(
         &app,
         Method::POST,
@@ -1270,6 +1305,67 @@ async fn independent_http_cookies_deliver_private_circle_invites_answers_and_rea
             .count(),
         1
     );
+    // Contract: /circles/me lists the reader's own pending invitation, and
+    // the member list is visible only to active members and lists only them.
+    let (status, mine) = personal_events_http(
+        &app,
+        Method::GET,
+        "/circles/me",
+        Some(&cookie_c),
+        None,
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{mine}");
+    let mine = assert_contract(
+        "audience-circle",
+        "#/definitions/own_circle_page",
+        &mine,
+        "GET /circles/me (invited)",
+    );
+    assert_eq!(mine[0]["membership_status"], "invited");
+    assert!(mine[0]["invitation_created_at"].is_string());
+    let members_path = format!("/circles/{circle}/members");
+    let (status, _) = personal_events_http(
+        &app,
+        Method::GET,
+        &members_path,
+        Some(&cookie_c),
+        None,
+        true,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "invited accounts see no members"
+    );
+    let (status, members) = personal_events_http(
+        &app,
+        Method::GET,
+        &members_path,
+        Some(&cookie_b),
+        None,
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{members}");
+    let members = assert_contract(
+        "audience-circle-membership",
+        "#/definitions/member_list",
+        &members,
+        "GET /circles/{id}/members",
+    );
+    let listed: Vec<&str> = members
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|member| member["account_id"].as_str().unwrap())
+        .collect();
+    let mut expected = vec![a.as_str(), b.as_str()];
+    expected.sort_unstable();
+    assert_eq!(listed, expected, "only active members, never the invitee");
+
     let c_round = c_inbox["items"][0]["invitation_created_at"]
         .as_str()
         .unwrap()
@@ -1343,8 +1439,46 @@ async fn independent_http_cookies_deliver_private_circle_invites_answers_and_rea
         );
     }
 
+    // Contract: the canonical PostgreSQL rows behind these responses.
+    let circle_uuid = Uuid::parse_str(&circle).unwrap();
+    let rows = |sql: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Value>(sql)
+                .bind(circle_uuid)
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    for (schema, sql, expected) in [
+        (
+            "audience-circle",
+            "SELECT to_jsonb(c) FROM domain_audience_circles c WHERE id=$1",
+            1,
+        ),
+        (
+            "audience-circle-membership",
+            "SELECT to_jsonb(m) FROM domain_audience_circle_members m WHERE circle_id=$1",
+            2,
+        ),
+        (
+            "personal-event",
+            "SELECT to_jsonb(e) FROM domain_personal_event_messages e WHERE circle_id=$1",
+            // invited+sent (B), joined (A), invited+sent (C), declined (A)
+            6,
+        ),
+    ] {
+        let records = rows(sql).await;
+        assert_eq!(records.len(), expected, "{schema} rows");
+        let contract = support::domain_contract::load(schema);
+        for record in &records {
+            support::domain_contract::assert_valid(&contract, "#", record, schema);
+        }
+    }
+
     sqlx::query("DELETE FROM domain_audience_circles WHERE id=$1")
-        .bind(Uuid::parse_str(&circle).unwrap())
+        .bind(circle_uuid)
         .execute(&pool)
         .await
         .unwrap();
@@ -1412,6 +1546,12 @@ async fn household_create_invite_and_full_member_list_regression() {
             .unwrap(),
     )
     .unwrap();
+    support::domain_contract::assert_valid(
+        &support::domain_contract::load("audience-circle"),
+        "#/definitions/own_circle",
+        &response,
+        "create_circle",
+    );
     let id = Uuid::parse_str(response["id"].as_str().unwrap()).unwrap();
     assert_eq!(kinds(&pool, &neighbor).await, vec!["circle_invited"]);
 
@@ -1527,6 +1667,12 @@ async fn household_create_invite_and_full_member_list_regression() {
     )
     .unwrap();
     assert_eq!(members_json.as_array().unwrap().len(), 102);
+    support::domain_contract::assert_valid(
+        &support::domain_contract::load("audience-circle-membership"),
+        "#/definitions/member_list",
+        &members_json,
+        "list_circle_members",
+    );
 }
 
 /// M2 (audit 2026-11-22): every invitation and every decline bumps the global

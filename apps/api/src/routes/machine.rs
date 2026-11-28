@@ -39,6 +39,14 @@ const DOMAIN_SCHEMAS: &[(&str, &str)] = &[
         include_str!("../../../../contracts/domain/account.schema.json"),
     ),
     (
+        "audience-circle",
+        include_str!("../../../../contracts/domain/audience-circle.schema.json"),
+    ),
+    (
+        "audience-circle-membership",
+        include_str!("../../../../contracts/domain/audience-circle-membership.schema.json"),
+    ),
+    (
         "conversation",
         include_str!("../../../../contracts/domain/conversation.schema.json"),
     ),
@@ -53,6 +61,10 @@ const DOMAIN_SCHEMAS: &[(&str, &str)] = &[
     (
         "node",
         include_str!("../../../../contracts/domain/node.schema.json"),
+    ),
+    (
+        "personal-event",
+        include_str!("../../../../contracts/domain/personal-event.schema.json"),
     ),
     (
         "role",
@@ -393,10 +405,15 @@ fn build_openapi_document(manifest: &MachineManifest) -> Result<Value, String> {
             },
             "schemas": {
                 "Account": { "$ref": "/schemas/domain/account" },
+                "AudienceCircle": { "$ref": "/schemas/domain/audience-circle" },
+                "AudienceCircleMembership": {
+                    "$ref": "/schemas/domain/audience-circle-membership"
+                },
                 "Conversation": { "$ref": "/schemas/domain/conversation" },
                 "Edge": { "$ref": "/schemas/domain/edge" },
                 "Message": { "$ref": "/schemas/domain/message" },
                 "Node": { "$ref": "/schemas/domain/node" },
+                "PersonalEvent": { "$ref": "/schemas/domain/personal-event" },
                 "Role": { "$ref": "/schemas/domain/role" },
                 "FederationCell": {
                     "$ref": "/schemas/federation/v1/cell-descriptor"
@@ -737,6 +754,38 @@ mod tests {
             serde_json::from_str::<Value>(schema).unwrap_or_else(|error| {
                 panic!("federation schema {name} is invalid JSON: {error}")
             });
+        }
+    }
+
+    /// A schema under contracts/domain that is not served at
+    /// /schemas/domain/{name} is invisible to machine clients.
+    #[test]
+    fn every_domain_contract_file_is_published() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../contracts/domain");
+        let on_disk: BTreeSet<String> = std::fs::read_dir(dir)
+            .expect("contracts/domain must be readable")
+            .filter_map(|entry| {
+                let name = entry.ok()?.file_name().into_string().ok()?;
+                name.strip_suffix(".schema.json").map(str::to_owned)
+            })
+            .collect();
+        let published: BTreeSet<String> = DOMAIN_SCHEMAS
+            .iter()
+            .map(|(name, _)| (*name).to_owned())
+            .collect();
+        assert_eq!(on_disk, published);
+        let document = openapi_document().expect("OpenAPI contract must build");
+        let components = document["components"]["schemas"]
+            .as_object()
+            .expect("OpenAPI components.schemas must be an object");
+        for name in &published {
+            let reference = format!("/schemas/domain/{name}");
+            assert!(
+                components
+                    .values()
+                    .any(|value| value["$ref"] == reference.as_str()),
+                "OpenAPI components must reference {reference}"
+            );
         }
     }
 
